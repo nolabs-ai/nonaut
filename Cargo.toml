@@ -14,6 +14,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 diffy = "0.5.2"
 directories = "6.0.0"
 futures-util = "0.3.34"
+nix = { version = "0.31.3", default-features = false, features = ["signal"] }
 nono = { version = "0.80.0", default-features = false }
 portable-pty = "0.9.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }

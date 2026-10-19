@@ -19,7 +19,6 @@ use crate::policy::Network;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command};
 
-const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
@@ -117,14 +116,14 @@ pub fn specs() -> Value {
         {
             "type": "function",
             "name": "run_command",
-            "description": "Attempt to run a program with explicit arguments under nono. Always make an explicitly requested attempt and report the actual result instead of predicting a policy denial. The sandbox normally has workspace read/write access, no network, and no inherited secrets.",
+            "description": "Attempt to run a program with explicit arguments under nono. Always make an explicitly requested attempt and report the actual result instead of predicting a policy denial. The sandbox has workspace read/write access, network as set by the user's policy, and no inherited secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Executable name, such as cargo, git, or sh." },
                     "args": { "type": "array", "items": { "type": "string" } },
                     "cwd": { "type": "string", "description": "Optional working directory inside the workspace. Relative and absolute workspace paths are accepted." },
-                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 120 }
+                    "timeout_seconds": { "type": "integer", "minimum": 1, "description": "Optional; capped by the user's tool timeout (default 120 seconds)." }
                 },
                 "required": ["program", "args"],
                 "additionalProperties": false
@@ -135,12 +134,13 @@ pub fn specs() -> Value {
 
 pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
     let arguments = normalize_tool_paths(workspace, tool, arguments)?;
+    let policy = crate::policy::load(workspace)?;
     if tool == "run_command" {
-        return run_command(workspace, &arguments).await;
+        return run_command(workspace, &arguments, &policy).await;
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_process(workspace, &executable)?;
+    let mut child = sandbox_process(workspace, &executable, &policy)?;
     child
         .arg("tool")
         .arg(workspace)
@@ -152,6 +152,7 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     let mut child = child
         .spawn()
         .context("could not start the sandboxed tool")?;
+    let mut group = ProcessGroup::new(child.id());
     let encoded = serde_json::to_vec(&arguments).context("could not encode tool arguments")?;
     let mut stdin = child
         .stdin
@@ -162,10 +163,12 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
         .await
         .context("could not send arguments to the tool worker")?;
     drop(stdin);
-    let output = tokio::time::timeout(TOOL_TIMEOUT, child.wait_with_output())
+    let limit = policy.tool_timeout_seconds;
+    let output = tokio::time::timeout(Duration::from_secs(limit), child.wait_with_output())
         .await
-        .context("tool timed out after 120 seconds")?
+        .with_context(|| format!("tool timed out after {limit} seconds"))?
         .context("could not wait for the sandboxed tool")?;
+    group.finished();
     output_result(tool, output)
 }
 
@@ -308,7 +311,11 @@ fn is_shell_word_start(previous: Option<char>) -> bool {
     })
 }
 
-async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
+async fn run_command(
+    workspace: &Path,
+    arguments: &Value,
+    policy: &crate::policy::Policy,
+) -> Result<String> {
     let program = required_string(arguments, "program")?;
     if program.trim().is_empty() {
         bail!("program may not be empty");
@@ -326,13 +333,15 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
         .collect::<Result<Vec<_>>>()?;
     let command_cwd = optional_string(arguments, "cwd")
         .map(|cwd| cwd.unwrap_or_else(|| workspace.to_str().unwrap_or(".")))?;
+    // The model may ask for less time than the policy allows, never more.
+    let limit = policy.tool_timeout_seconds;
     let timeout = arguments["timeout_seconds"]
         .as_u64()
-        .unwrap_or(120)
-        .clamp(1, 120);
+        .unwrap_or(limit)
+        .clamp(1, limit);
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut command = sandbox_process(workspace, &executable)?;
+    let mut command = sandbox_process(workspace, &executable, policy)?;
     command
         .arg("command")
         .arg(workspace)
@@ -345,11 +354,41 @@ async fn run_command(workspace: &Path, arguments: &Value) -> Result<String> {
     let child = command
         .spawn()
         .with_context(|| format!("could not start sandboxed command `{program}`"))?;
+    let mut group = ProcessGroup::new(child.id());
     let output = tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output())
         .await
         .with_context(|| format!("command timed out after {timeout} seconds"))?
         .context("could not wait for sandboxed command")?;
+    group.finished();
     output_result(program, output)
+}
+
+/// Kills a sandboxed tool's whole process group if the call is abandoned by
+/// a timeout or an interrupt. `kill_on_drop` alone only reaches the direct
+/// child, leaving anything it spawned (a build, `sleep`) running.
+struct ProcessGroup(Option<u32>);
+
+impl ProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    /// The tool exited normally; leave its group alone.
+    fn finished(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(|pid| i32::try_from(pid).ok()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
 
 // Set by the parent from the policy file; read by the sandbox child before
@@ -358,9 +397,16 @@ const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
 const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
 const READ_PATHS_ENV: &str = "NONAUT_READ_PATHS";
 
-fn sandbox_process(workspace: &Path, executable: &Path) -> Result<Command> {
-    let policy = crate::policy::load(workspace)?;
+fn sandbox_process(
+    workspace: &Path,
+    executable: &Path,
+    policy: &crate::policy::Policy,
+) -> Result<Command> {
     let mut command = Command::new(executable);
+    // Its own process group, so a timeout or interrupt can stop everything
+    // the tool started, not just the direct child.
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .arg("__nonaut_sandbox")
         .env_clear()

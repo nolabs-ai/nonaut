@@ -21,7 +21,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea};
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
@@ -99,6 +99,7 @@ const BRAND_MARK: &str = "⎔";
 // The prompt starts two lines tall and grows with newlines up to this many.
 const PROMPT_MIN_LINES: usize = 2;
 const PROMPT_MAX_LINES: usize = 10;
+const PROMPT_HISTORY_LIMIT: usize = 500;
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -295,6 +296,10 @@ pub struct App {
     request: Option<JoinHandle<()>>,
     request_uses_provider: bool,
     undo: Option<Arc<Mutex<Undo>>>,
+    prompt_history: Vec<String>,
+    /// Position while browsing history with Up/Down; None when not browsing.
+    history_index: Option<usize>,
+    history_draft: String,
     request_generation: u64,
     queued_request: Option<String>,
     streaming_message: Option<usize>,
@@ -355,6 +360,9 @@ impl App {
             request: None,
             request_uses_provider: false,
             undo: None,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             request_generation: 0,
             queued_request: None,
             streaming_message: None,
@@ -875,6 +883,14 @@ impl App {
             }
             return;
         }
+        if let Event::Paste(text) = &event {
+            // Terminals send CR or CRLF line ends; the prompt stores LF.
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.input.insert_str(text);
+            self.command_selection = 0;
+            self.history_index = None;
+            return;
+        }
         if let Event::Mouse(mouse) = event {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_conversation_up(3),
@@ -891,6 +907,7 @@ impl App {
         }
         self.input.input(event);
         self.command_selection = 0;
+        self.history_index = None;
     }
 
     fn handle_provider_picker_key(&mut self, key: KeyEvent) {
@@ -1068,7 +1085,17 @@ impl App {
                 self.input.insert_newline();
                 true
             }
+            // While browsing history Up/Down keep browsing, even if the
+            // recalled prompt is a slash command that would open the menu.
+            (KeyCode::Up | KeyCode::Down, KeyModifiers::NONE)
+                if self.history_index.is_some() && self.recall_history(key.code) =>
+            {
+                true
+            }
             _ if self.handle_command_key(key) => true,
+            (KeyCode::Up | KeyCode::Down, KeyModifiers::NONE) if self.recall_history(key.code) => {
+                true
+            }
             (KeyCode::Enter, modifiers) if !modifiers.contains(KeyModifiers::SHIFT) => {
                 self.submit();
                 true
@@ -1117,6 +1144,39 @@ impl App {
         }
     }
 
+    /// Up on the first line recalls older prompts; Down on the last line
+    /// moves forward and finally restores the unsent draft. Returns false
+    /// when the key should move the cursor inside the prompt instead.
+    fn recall_history(&mut self, key: KeyCode) -> bool {
+        let row = self.input.cursor().0;
+        let last_row = self.input.lines().len().saturating_sub(1);
+        let next = match (key, self.history_index) {
+            (KeyCode::Up, _) if row != 0 || self.prompt_history.is_empty() => return false,
+            (KeyCode::Up, None) => {
+                self.history_draft = self.input.lines().join("\n");
+                self.prompt_history.len() - 1
+            }
+            (KeyCode::Up, Some(index)) => index.saturating_sub(1),
+            (KeyCode::Down, Some(index)) if row == last_row => index + 1,
+            _ => return false,
+        };
+        let text = if next < self.prompt_history.len() {
+            self.history_index = Some(next);
+            self.prompt_history[next].clone()
+        } else {
+            self.history_index = None;
+            std::mem::take(&mut self.history_draft)
+        };
+        self.input = Self::new_input();
+        self.input.insert_str(text);
+        if key == KeyCode::Up {
+            // Keep the next Up browsing instead of walking up a multi-line recall.
+            self.input.move_cursor(CursorMove::Top);
+        }
+        self.command_selection = 0;
+        true
+    }
+
     fn matching_commands(&self) -> Vec<&'static SlashCommand> {
         let lines = self.input.lines();
         let Some(input) = lines.first().map(String::as_str) else {
@@ -1158,6 +1218,14 @@ impl App {
         }
         self.follow_latest_output();
         self.input = Self::new_input();
+        if self.prompt_history.last() != Some(&content) {
+            self.prompt_history.push(content.clone());
+            if self.prompt_history.len() > PROMPT_HISTORY_LIMIT {
+                self.prompt_history.remove(0);
+            }
+        }
+        self.history_index = None;
+        self.history_draft.clear();
         match content.as_str() {
             "/q" | "/quit" | "/exit" => self.should_quit = true,
             "/clear" => {
@@ -1823,6 +1891,56 @@ mod tests {
         assert_eq!(palette().background, Color::Rgb(255, 255, 255));
         LIGHT_THEME.store(false, Ordering::Relaxed);
         assert_eq!(palette().background, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn pasted_newlines_stay_in_the_prompt_instead_of_submitting() {
+        let mut app = app_with_input("");
+        app.handle_terminal_event(Event::Paste("first\r\nsecond\rthird".to_owned()));
+        assert!(app.messages.is_empty());
+        assert!(app.request.is_none());
+        assert_eq!(app.input.lines(), ["first", "second", "third"]);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn up_and_down_browse_prompt_history_and_restore_the_draft() {
+        let mut app = app_with_input("");
+        for prompt in ["first prompt", "/theme", "third\nprompt"] {
+            app.input.insert_str(prompt);
+            app.submit();
+        }
+        app.input.insert_str("unsent draft");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["third", "prompt"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["/theme"]);
+        // A recalled slash command must not swallow the next Up.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["first prompt"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["first prompt"]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input.lines(), ["third", "prompt"]);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input.lines(), ["unsent draft"]);
+    }
+
+    #[test]
+    fn up_moves_inside_a_multi_line_prompt_before_recalling() {
+        let mut app = app_with_input("");
+        app.input.insert_str("old prompt");
+        app.submit();
+        app.input.insert_str("line one\nline two");
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["line one", "line two"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input.lines(), ["old prompt"]);
     }
 
     #[test]

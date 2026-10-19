@@ -21,7 +21,7 @@ use tokio::{
 
 use crate::tools;
 
-use super::{BASE_INSTRUCTIONS, DEVELOPER_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption};
+use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
 
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 /// Omits `output_config.effort` so the model's own default applies.
@@ -189,7 +189,8 @@ impl ClaudeApi {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let system = format!(
-            "{BASE_INSTRUCTIONS}\n\n{DEVELOPER_INSTRUCTIONS}\n\nWorkspace: {}",
+            "{BASE_INSTRUCTIONS}\n\n{}\n\nWorkspace: {}",
+            developer_instructions(&self.cwd),
             self.cwd.display()
         );
         let tools = tools::specs()

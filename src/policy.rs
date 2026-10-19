@@ -49,6 +49,8 @@ struct Rules {
     #[serde(default)]
     network: Option<Network>,
     #[serde(default)]
+    tool_timeout_seconds: Option<u64>,
+    #[serde(default)]
     allow_hosts: Vec<String>,
     #[serde(default)]
     read_paths: Vec<String>,
@@ -60,6 +62,8 @@ struct File {
     #[serde(default)]
     network: Option<Network>,
     #[serde(default)]
+    tool_timeout_seconds: Option<u64>,
+    #[serde(default)]
     allow_hosts: Vec<String>,
     #[serde(default)]
     read_paths: Vec<String>,
@@ -67,11 +71,27 @@ struct File {
     workspaces: HashMap<PathBuf, Rules>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
     pub network: Network,
+    /// Upper bound for any tool call, `run_command` and `/exec`.
+    pub tool_timeout_seconds: u64,
     pub allow_hosts: Vec<String>,
     pub read_paths: Vec<PathBuf>,
+}
+
+pub(crate) const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 120;
+const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3600;
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            network: Network::Open,
+            tool_timeout_seconds: DEFAULT_TOOL_TIMEOUT_SECONDS,
+            allow_hosts: Vec::new(),
+            read_paths: Vec::new(),
+        }
+    }
 }
 
 pub(crate) fn path() -> Result<PathBuf> {
@@ -99,6 +119,7 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
     let workspace = fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let mut rules = Rules {
         network: file.network,
+        tool_timeout_seconds: file.tool_timeout_seconds,
         allow_hosts: file.allow_hosts,
         read_paths: file.read_paths,
     };
@@ -107,6 +128,7 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
         (fs::canonicalize(&path).unwrap_or(path) == workspace).then_some(rules)
     }) {
         rules.network = extra.network.or(rules.network);
+        rules.tool_timeout_seconds = extra.tool_timeout_seconds.or(rules.tool_timeout_seconds);
         rules.allow_hosts.extend(extra.allow_hosts.iter().cloned());
         rules.read_paths.extend(extra.read_paths.iter().cloned());
     }
@@ -127,6 +149,12 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
         }
         (Some(mode), true) => mode,
     };
+    let tool_timeout_seconds = rules
+        .tool_timeout_seconds
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECONDS);
+    if !(1..=MAX_TOOL_TIMEOUT_SECONDS).contains(&tool_timeout_seconds) {
+        bail!("tool_timeout_seconds must be between 1 and {MAX_TOOL_TIMEOUT_SECONDS}");
+    }
     for host in &rules.allow_hosts {
         if host == "*" {
             bail!("allow_hosts may not contain \"*\"; list the hosts the sandbox needs");
@@ -147,6 +175,7 @@ fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
         .collect::<Result<Vec<_>>>()?;
     Ok(Policy {
         network,
+        tool_timeout_seconds,
         allow_hosts: rules.allow_hosts,
         read_paths,
     })
@@ -205,6 +234,22 @@ mod tests {
             .is_err()
         );
         assert!(parse(r#"{"network": "offline"}"#, workspace, home).is_err());
+    }
+
+    #[test]
+    fn tool_timeout_defaults_validates_and_can_be_overridden_per_workspace() {
+        let home = Path::new("/home/me");
+        let work = Path::new("/work");
+        assert_eq!(parse("{}", work, home).unwrap().tool_timeout_seconds, 120);
+        let policy = parse(
+            r#"{"tool_timeout_seconds": 600, "workspaces": {"/work": {"tool_timeout_seconds": 900}}}"#,
+            work,
+            home,
+        )
+        .unwrap();
+        assert_eq!(policy.tool_timeout_seconds, 900);
+        assert!(parse(r#"{"tool_timeout_seconds": 0}"#, work, home).is_err());
+        assert!(parse(r#"{"tool_timeout_seconds": 3601}"#, work, home).is_err());
     }
 
     #[test]

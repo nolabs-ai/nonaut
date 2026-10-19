@@ -21,7 +21,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{BASE_INSTRUCTIONS, DEVELOPER_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption};
+use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_EFFORT: &str = "default";
@@ -166,7 +166,8 @@ impl ClaudeCode {
             }
         });
         let system = format!(
-            "{BASE_INSTRUCTIONS}\n\n{DEVELOPER_INSTRUCTIONS}\n\nWorkspace: {}",
+            "{BASE_INSTRUCTIONS}\n\n{}\n\nWorkspace: {}",
+            developer_instructions(&self.cwd),
             self.cwd.display()
         );
         let allowed_tools = TOOL_NAMES

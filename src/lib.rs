@@ -12,8 +12,8 @@ mod undo;
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -81,7 +81,13 @@ pub async fn run_tui() -> Result<()> {
     )
     .is_ok();
     let mouse_capture = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    // Without bracketed paste every newline in a paste arrives as Enter and
+    // submits a fragment of it.
+    let bracketed_paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
     let result = app.run(&mut terminal).await;
+    if bracketed_paste {
+        let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    }
     if mouse_capture {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
     }

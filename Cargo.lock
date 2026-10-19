@@ -1501,6 +1501,7 @@ dependencies = [
  "diffy",
  "directories",
  "futures-util",
+ "nix 0.31.3",
  "nono",
  "portable-pty",
  "ratatui",

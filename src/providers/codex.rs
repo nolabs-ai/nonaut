@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::tools;
 
-use super::{BASE_INSTRUCTIONS, DEVELOPER_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption};
+use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -587,7 +587,7 @@ async fn start_thread(rpc: &Rpc, cwd: &Path, model: &str) -> Result<String> {
                 "approvalsReviewer": "user",
                 "dynamicTools": tools::specs(),
                 "baseInstructions": BASE_INSTRUCTIONS,
-                "developerInstructions": DEVELOPER_INSTRUCTIONS
+                "developerInstructions": developer_instructions(cwd)
             }),
         )
         .await
