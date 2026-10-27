@@ -316,6 +316,34 @@ fn tui_exec_interrupts_and_restores_terminal_modes() {
 
 #[test]
 #[ignore = "provider-free PTY integration test"]
+fn tui_changes_view_shows_untracked_work_and_returns_to_agent() {
+    let root = TestRoot::new("tui-changes");
+    let workspace = root.workspace();
+    let initialized = Command::new("git")
+        .arg("init")
+        .arg("--quiet")
+        .current_dir(&workspace)
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    fs::write(
+        workspace.join("review-me.txt"),
+        "visible in the changes workspace\n",
+    )
+    .unwrap();
+
+    let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
+    wait_for(&run.output, "2. Review (1)");
+    run.writer.write_all(b"\x1b2").unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "visible in the changes workspace");
+    run.writer.write_all(b"\x1b1/q\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
 fn detached_session_can_be_listed_attached_and_killed() {
     let root = TestRoot::new("session-lifecycle");
     let workspace = root.workspace();

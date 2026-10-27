@@ -29,6 +29,8 @@ use tokio::{
 };
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
+mod changes;
+
 use crate::{
     config::{
         load_model, load_reasoning, load_theme, save_default_provider, save_model, save_reasoning,
@@ -145,6 +147,13 @@ const BRAND_MARK: &str = "⎔";
 const PROMPT_MIN_LINES: usize = 2;
 const PROMPT_MAX_LINES: usize = 10;
 const PROMPT_HISTORY_LIMIT: usize = 500;
+const CHANGES_REFRESH: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceView {
+    Agent,
+    Changes,
+}
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -359,6 +368,19 @@ pub struct App {
     conversation_max_scroll: u16,
     follow_output: bool,
     command_selection: usize,
+    workspace_view: WorkspaceView,
+    changes_diff: String,
+    changes_file_count: usize,
+    changes_error: Option<String>,
+    changes_scroll: u16,
+    changes_horizontal_scroll: u16,
+    changes_max_scroll: u16,
+    changes_query: String,
+    changes_searching: bool,
+    changes_match: Option<usize>,
+    changes_refreshing: bool,
+    changes_tx: mpsc::UnboundedSender<changes::Snapshot>,
+    changes_rx: mpsc::UnboundedReceiver<changes::Snapshot>,
     force_redraw: bool,
     cursor_visible: bool,
     should_quit: bool,
@@ -386,6 +408,7 @@ impl App {
     pub(crate) fn new_shell(cwd: PathBuf) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = mpsc::unbounded_channel();
+        let (changes_tx, changes_rx) = mpsc::unbounded_channel();
         Self {
             input: Self::new_input(),
             messages: Vec::new(),
@@ -423,6 +446,19 @@ impl App {
             conversation_max_scroll: 0,
             follow_output: true,
             command_selection: 0,
+            workspace_view: WorkspaceView::Agent,
+            changes_diff: String::new(),
+            changes_file_count: 0,
+            changes_error: None,
+            changes_scroll: 0,
+            changes_horizontal_scroll: 0,
+            changes_max_scroll: 0,
+            changes_query: String::new(),
+            changes_searching: false,
+            changes_match: None,
+            changes_refreshing: false,
+            changes_tx,
+            changes_rx,
             force_redraw: false,
             cursor_visible: true,
             should_quit: false,
@@ -433,6 +469,9 @@ impl App {
         let mut terminal_events = EventStream::new();
         let mut blink = time::interval(CURSOR_BLINK);
         blink.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut changes_refresh = time::interval(CHANGES_REFRESH);
+        changes_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        self.begin_changes_refresh();
         while !self.should_quit {
             if self.force_redraw {
                 terminal.clear()?;
@@ -441,6 +480,11 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
                 _ = blink.tick() => self.cursor_visible = !self.cursor_visible,
+                _ = changes_refresh.tick() => {
+                    if self.workspace_view == WorkspaceView::Changes {
+                        self.begin_changes_refresh();
+                    }
+                },
                 terminal_event = terminal_events.next() => match terminal_event {
                     Some(Ok(event)) => {
                         // Keep the cursor solid while the user is typing.
@@ -459,6 +503,9 @@ impl App {
                 connection_event = self.connection_rx.recv() => {
                     if let Some(event) = connection_event { self.handle_connection_event(event); }
                 }
+                snapshot = self.changes_rx.recv() => {
+                    if let Some(snapshot) = snapshot { self.apply_changes_snapshot(snapshot); }
+                }
             }
         }
         if let Some(request) = self.request.take() {
@@ -475,7 +522,7 @@ impl App {
 
     fn new_input() -> TextArea<'static> {
         let mut input = TextArea::default();
-        input.set_block(Self::prompt_block(0));
+        input.set_block(Self::prompt_block(0, false));
         input.set_style(
             Style::new()
                 .fg(palette().foreground)
@@ -490,9 +537,22 @@ impl App {
 
     /// Rounded prompt with the token count in the top border and the key
     /// hints in the bottom border, so no separate footer row is needed.
-    fn prompt_block(tokens: u64) -> Block<'static> {
+    fn prompt_block(tokens: u64, has_changes: bool) -> Block<'static> {
         let key = Style::new().fg(palette().foreground);
         let label = Style::new().fg(palette().muted);
+        let mut hints = vec![
+            Span::styled(" Enter", key),
+            Span::styled(" send · ", label),
+            Span::styled("Shift+Enter", key),
+            Span::styled(" newline · ", label),
+        ];
+        if has_changes {
+            hints.extend([
+                Span::styled("Alt+2", key),
+                Span::styled(" review · ", label),
+            ]);
+        }
+        hints.extend([Span::styled("/q", key), Span::styled(" quit ", label)]);
         Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -503,14 +563,7 @@ impl App {
                 Style::new().fg(palette().accent).bold(),
             ))
             .title_top(Line::styled(format!(" {tokens} tokens "), label).right_aligned())
-            .title_bottom(Line::from(vec![
-                Span::styled(" Enter", key),
-                Span::styled(" send · ", label),
-                Span::styled("Shift+Enter", key),
-                Span::styled(" newline · ", label),
-                Span::styled("/q", key),
-                Span::styled(" quit ", label),
-            ]))
+            .title_bottom(Line::from(hints))
             // Border plus padding puts typed text in the same column as message text.
             .padding(Padding::new(4, 1, 0, 0))
     }
@@ -525,10 +578,15 @@ impl App {
             .lines()
             .len()
             .clamp(PROMPT_MIN_LINES, PROMPT_MAX_LINES);
-        let [header, conversation, prompt] = Layout::vertical([
+        let prompt_height = if self.workspace_view == WorkspaceView::Agent {
+            u16::try_from(prompt_lines + 2).unwrap_or(u16::MAX)
+        } else {
+            2
+        };
+        let [header, content, footer] = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(u16::try_from(prompt_lines + 2).unwrap_or(u16::MAX)),
+            Constraint::Length(prompt_height),
         ])
         .areas(frame.area());
         frame.render_widget(
@@ -544,8 +602,12 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(header);
-        let [brand, status] =
-            Layout::horizontal([Constraint::Length(46), Constraint::Min(1)]).areas(header_content);
+        let [brand, tabs, status] = Layout::horizontal([
+            Constraint::Length(18),
+            Constraint::Length(40),
+            Constraint::Min(1),
+        ])
+        .areas(header_content);
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
                 format!("  {BRAND_MARK}  nonaut"),
@@ -554,6 +616,7 @@ impl App {
             .style(Style::new().bg(palette().background)),
             brand,
         );
+        self.render_workspace_tabs(frame, tabs);
         frame.render_widget(
             Paragraph::new(format!(
                 "{}   {}   reasoning {}   sandboxed  ",
@@ -563,6 +626,14 @@ impl App {
             .style(Style::new().fg(palette().muted).bg(palette().background)),
             status,
         );
+
+        if self.workspace_view == WorkspaceView::Changes {
+            self.render_changes(frame, content, footer);
+            return;
+        }
+
+        let conversation = content;
+        let prompt = footer;
 
         let mut lines = Vec::new();
         for message in &self.messages {
@@ -654,8 +725,10 @@ impl App {
                 .fg(palette().foreground)
                 .bg(palette().background)
         });
-        self.input
-            .set_block(Self::prompt_block(self.session_tokens));
+        self.input.set_block(Self::prompt_block(
+            self.session_tokens,
+            self.changes_file_count > 0,
+        ));
         frame.render_widget(&self.input, prompt);
         if self.model_picker.is_none()
             && self.reasoning_picker.is_none()
@@ -676,6 +749,222 @@ impl App {
         if let Some(picker) = &self.theme_picker {
             self.render_theme_picker(frame, picker);
         }
+    }
+
+    fn render_workspace_tabs(&self, frame: &mut Frame, area: Rect) {
+        let active = Style::new().fg(palette().accent).bold();
+        let inactive = Style::new().fg(palette().muted);
+        let agent_style = if self.workspace_view == WorkspaceView::Agent {
+            active
+        } else {
+            inactive
+        };
+        let changes_style = if self.workspace_view == WorkspaceView::Changes {
+            active
+        } else {
+            inactive
+        };
+        let mut tabs = vec![Span::styled("1. Agent", agent_style)];
+        if self.changes_file_count > 0 {
+            tabs.extend([
+                Span::raw("    "),
+                Span::styled(
+                    format!("2. Review ({})", self.changes_file_count),
+                    changes_style,
+                ),
+            ]);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(tabs)).style(Style::new().bg(palette().background)),
+            area,
+        );
+    }
+
+    fn render_changes(&mut self, frame: &mut Frame, content: Rect, footer: Rect) {
+        let body = if let Some(error) = &self.changes_error {
+            vec![
+                Line::styled(
+                    "Git diff is unavailable",
+                    Style::new().fg(palette().removed).bold(),
+                ),
+                Line::default(),
+                Line::styled(error, Style::new().fg(palette().muted)),
+            ]
+        } else if self.changes_diff.is_empty() {
+            vec![
+                Line::styled(
+                    "No working tree changes",
+                    Style::new().fg(palette().foreground),
+                ),
+                Line::default(),
+                Line::styled(
+                    "This view refreshes automatically when files change.",
+                    Style::new().fg(palette().muted),
+                ),
+            ]
+        } else {
+            let query = self.changes_query.to_lowercase();
+            let mut rendered = Vec::new();
+            for (index, line) in self.changes_diff.lines().enumerate() {
+                let selected = self.changes_match == Some(index);
+                if line.starts_with("diff --git ") {
+                    rendered.push(Line::default());
+                    let path = line
+                        .rsplit_once(" b/")
+                        .map_or(line, |(_, path)| path.trim_matches('"'));
+                    let style = if selected {
+                        Style::new()
+                            .fg(palette().background)
+                            .bg(palette().accent)
+                            .bold()
+                    } else {
+                        Style::new()
+                            .fg(palette().foreground)
+                            .bg(palette().surface)
+                            .bold()
+                    };
+                    rendered.push(Line::styled(
+                        format!("{} FILE  {path} ", if selected { "›" } else { " " }),
+                        style,
+                    ));
+                    continue;
+                }
+                let mut style = if line.starts_with('+') && !line.starts_with("+++") {
+                    Style::new().fg(palette().added)
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Style::new().fg(palette().removed)
+                } else if line.starts_with("@@") {
+                    Style::new().fg(palette().accent)
+                } else {
+                    Style::new().fg(palette().muted)
+                };
+                if !query.is_empty() && line.to_lowercase().contains(&query) {
+                    style = style.bg(palette().surface);
+                }
+                if selected {
+                    style = Style::new()
+                        .fg(palette().background)
+                        .bg(palette().accent)
+                        .bold();
+                }
+                let marker = if selected { "› " } else { "  " };
+                rendered.push(Line::styled(format!("{marker}{line}"), style));
+            }
+            rendered
+        };
+
+        self.changes_max_scroll = u16::try_from(body.len())
+            .unwrap_or(u16::MAX)
+            .saturating_sub(content.height.saturating_sub(2));
+        self.changes_scroll = self.changes_scroll.min(self.changes_max_scroll);
+        frame.render_widget(
+            Paragraph::new(body)
+                .style(Style::new().bg(palette().background))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(palette().border))
+                        .title(" changes vs HEAD ")
+                        .padding(Padding::horizontal(1)),
+                )
+                .scroll((self.changes_scroll, self.changes_horizontal_scroll)),
+            content,
+        );
+
+        let search_status = self.change_match_status();
+        let footer_line = if self.changes_searching {
+            Line::from(vec![
+                Span::styled(" /", Style::new().fg(palette().accent).bold()),
+                Span::styled(&self.changes_query, Style::new().fg(palette().foreground)),
+                Span::styled("█", Style::new().fg(palette().accent)),
+                Span::styled(
+                    format!("  {search_status} · Enter select · Esc cancel"),
+                    Style::new().fg(palette().muted),
+                ),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" Alt+1", Style::new().fg(palette().foreground)),
+                Span::styled(" agent · ", Style::new().fg(palette().muted)),
+                Span::styled("↑/↓ PgUp/PgDn", Style::new().fg(palette().foreground)),
+                Span::styled(" scroll · ", Style::new().fg(palette().muted)),
+                Span::styled("←/→", Style::new().fg(palette().foreground)),
+                Span::styled(" pan · ", Style::new().fg(palette().muted)),
+                Span::styled("Tab/Shift+Tab", Style::new().fg(palette().foreground)),
+                Span::styled(" files · ", Style::new().fg(palette().muted)),
+                Span::styled("/", Style::new().fg(palette().foreground)),
+                Span::styled(" search · ", Style::new().fg(palette().muted)),
+                Span::styled("n/N", Style::new().fg(palette().foreground)),
+                Span::styled(" next/previous ", Style::new().fg(palette().muted)),
+                Span::styled(search_status, Style::new().fg(palette().accent).bold()),
+            ])
+        };
+        frame.render_widget(
+            Paragraph::new(footer_line)
+                .style(Style::new().bg(palette().background))
+                .block(
+                    Block::new()
+                        .borders(Borders::TOP)
+                        .border_style(palette().border),
+                ),
+            footer,
+        );
+    }
+
+    fn begin_changes_refresh(&mut self) {
+        if self.changes_refreshing {
+            return;
+        }
+        self.changes_refreshing = true;
+        let workspace = self.cwd.clone();
+        let sender = self.changes_tx.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(changes::load(&workspace).await);
+        });
+    }
+
+    fn apply_changes_snapshot(&mut self, snapshot: changes::Snapshot) {
+        self.changes_refreshing = false;
+        self.changes_diff = snapshot.diff;
+        self.changes_file_count = snapshot.file_count;
+        self.changes_error = snapshot.error;
+        if self.changes_file_count == 0 && self.workspace_view == WorkspaceView::Changes {
+            self.workspace_view = WorkspaceView::Agent;
+            self.changes_searching = false;
+            self.changes_match = None;
+        }
+    }
+
+    fn change_match_status(&self) -> String {
+        if self.changes_query.is_empty() {
+            return String::new();
+        }
+        let query = self.changes_query.to_lowercase();
+        let matches = self
+            .changes_diff
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.to_lowercase().contains(&query).then_some(index))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return "no matches".to_owned();
+        }
+        if let Some(selected) = self.changes_match
+            && let Some(position) = matches.iter().position(|index| *index == selected)
+        {
+            return format!("match {}/{}", position + 1, matches.len());
+        }
+        format!("{} matches", matches.len())
+    }
+
+    fn rendered_change_index(&self, raw_index: usize) -> usize {
+        raw_index
+            + self
+                .changes_diff
+                .lines()
+                .take(raw_index + 1)
+                .filter(|line| line.starts_with("diff --git "))
+                .count()
     }
 
     fn render_theme_picker(&self, frame: &mut Frame, picker: &ThemePicker) {
@@ -971,6 +1260,16 @@ impl App {
     }
 
     fn handle_terminal_event(&mut self, event: Event) {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && self.handle_workspace_shortcut(key)
+        {
+            return;
+        }
+        if self.workspace_view == WorkspaceView::Changes {
+            self.handle_changes_event(event);
+            return;
+        }
         if self.theme_picker.is_some() {
             if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
@@ -1028,6 +1327,173 @@ impl App {
         self.input.input(event);
         self.command_selection = 0;
         self.history_index = None;
+    }
+
+    fn handle_workspace_shortcut(&mut self, key: KeyEvent) -> bool {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('1'), KeyModifiers::ALT) => {
+                self.workspace_view = WorkspaceView::Agent;
+                self.changes_searching = false;
+                true
+            }
+            (KeyCode::Char('2'), KeyModifiers::ALT) => {
+                if self.changes_file_count == 0 {
+                    return false;
+                }
+                self.workspace_view = WorkspaceView::Changes;
+                self.model_picker = None;
+                self.reasoning_picker = None;
+                self.provider_picker = None;
+                self.theme_picker = None;
+                self.begin_changes_refresh();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_changes_event(&mut self, event: Event) {
+        if let Event::Mouse(mouse) = event {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.changes_scroll = self.changes_scroll.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.changes_scroll = self
+                        .changes_scroll
+                        .saturating_add(3)
+                        .min(self.changes_max_scroll);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Event::Key(key) = event else {
+            return;
+        };
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.changes_searching {
+            match key.code {
+                KeyCode::Enter => {
+                    self.changes_searching = false;
+                    self.find_change_match(true);
+                }
+                KeyCode::Esc => self.changes_searching = false,
+                KeyCode::Backspace => {
+                    self.changes_query.pop();
+                    self.changes_match = None;
+                }
+                KeyCode::Char(character)
+                    if key.modifiers == KeyModifiers::NONE
+                        || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.changes_query.push(character);
+                    self.changes_match = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.should_quit = true,
+            (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                self.workspace_view = WorkspaceView::Agent;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                self.changes_scroll = self.changes_scroll.saturating_sub(1);
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                self.changes_scroll = self
+                    .changes_scroll
+                    .saturating_add(1)
+                    .min(self.changes_max_scroll);
+            }
+            (KeyCode::PageUp, _) => {
+                self.changes_scroll = self.changes_scroll.saturating_sub(10);
+            }
+            (KeyCode::PageDown, _) => {
+                self.changes_scroll = self
+                    .changes_scroll
+                    .saturating_add(10)
+                    .min(self.changes_max_scroll);
+            }
+            (KeyCode::Home, _) => self.changes_scroll = 0,
+            (KeyCode::End, _) => self.changes_scroll = self.changes_max_scroll,
+            (KeyCode::Tab, KeyModifiers::NONE) => self.jump_change_file(true),
+            (KeyCode::BackTab, _) | (KeyCode::Tab, KeyModifiers::SHIFT) => {
+                self.jump_change_file(false);
+            }
+            (KeyCode::Left, _) | (KeyCode::Char('h'), KeyModifiers::NONE) => {
+                self.changes_horizontal_scroll = self.changes_horizontal_scroll.saturating_sub(4);
+            }
+            (KeyCode::Right, _) | (KeyCode::Char('l'), KeyModifiers::NONE) => {
+                self.changes_horizontal_scroll = self.changes_horizontal_scroll.saturating_add(4);
+            }
+            (KeyCode::Char('/'), KeyModifiers::NONE) => {
+                self.changes_searching = true;
+                self.changes_query.clear();
+                self.changes_match = None;
+            }
+            (KeyCode::Char('n'), KeyModifiers::NONE) => self.find_change_match(true),
+            (KeyCode::Char('N'), KeyModifiers::SHIFT) => self.find_change_match(false),
+            _ => {}
+        }
+    }
+
+    fn find_change_match(&mut self, forward: bool) {
+        if self.changes_query.is_empty() {
+            return;
+        }
+        let query = self.changes_query.to_lowercase();
+        let lines = self.changes_diff.lines().collect::<Vec<_>>();
+        if lines.is_empty() {
+            return;
+        }
+        let origin = self
+            .changes_match
+            .unwrap_or_else(|| usize::from(self.changes_scroll));
+        let found = if forward {
+            (0..lines.len())
+                .map(|offset| {
+                    (origin + usize::from(self.changes_match.is_some()) + offset) % lines.len()
+                })
+                .find(|index| lines[*index].to_lowercase().contains(&query))
+        } else {
+            (0..lines.len())
+                .map(|offset| (origin + lines.len() - 1 - offset) % lines.len())
+                .find(|index| lines[*index].to_lowercase().contains(&query))
+        };
+        if let Some(index) = found {
+            self.changes_match = Some(index);
+            self.changes_scroll =
+                u16::try_from(self.rendered_change_index(index)).unwrap_or(u16::MAX);
+        }
+    }
+
+    fn jump_change_file(&mut self, forward: bool) {
+        let headers = self
+            .changes_diff
+            .lines()
+            .enumerate()
+            .filter_map(|(index, line)| line.starts_with("diff --git ").then_some(index))
+            .collect::<Vec<_>>();
+        if headers.is_empty() {
+            return;
+        }
+        let current_scroll = usize::from(self.changes_scroll).saturating_add(1);
+        let current = headers
+            .iter()
+            .rposition(|index| self.rendered_change_index(*index) <= current_scroll)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % headers.len()
+        } else {
+            (current + headers.len() - 1) % headers.len()
+        };
+        self.changes_scroll =
+            u16::try_from(self.rendered_change_index(headers[next])).unwrap_or(u16::MAX);
     }
 
     fn handle_provider_picker_key(&mut self, key: KeyEvent) {
@@ -1460,6 +1926,7 @@ impl App {
                     lines.push(format!("…and {} more", changes.len() - 20));
                 }
                 self.push(Role::Success, lines.join("\n"));
+                self.begin_changes_refresh();
             }
             Err(error) => self.push(Role::Error, format!("Undo failed\n{error:#}")),
         }
@@ -1854,11 +2321,20 @@ impl App {
                     };
                     self.push(Role::Error, format!("{label}\n{}", output.trim_end()));
                 }
+                if success
+                    && matches!(
+                        tool.as_str(),
+                        "write_file" | "edit_file" | "delete_file" | "exec"
+                    )
+                {
+                    self.begin_changes_refresh();
+                }
             }
             ProviderEvent::Completed => {
                 self.streaming_message = None;
                 self.request = None;
                 self.request_uses_provider = false;
+                self.begin_changes_refresh();
                 self.start_queued_request();
             }
             ProviderEvent::Interrupted => {
@@ -2153,6 +2629,111 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         }
         assert_eq!(app.command_selection, 0);
+    }
+
+    #[tokio::test]
+    async fn alt_number_switches_between_agent_and_changes_views() {
+        let mut app = app_with_input("draft");
+        app.changes_file_count = 1;
+
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('2'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(app.workspace_view, WorkspaceView::Changes);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.input.lines(), ["draft"]);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(app.workspace_view, WorkspaceView::Agent);
+        assert_eq!(app.input.lines(), ["draft"]);
+    }
+
+    #[test]
+    fn changes_search_moves_to_matching_diff_lines() {
+        let mut app = app_with_input("");
+        app.changes_diff = "first\nneedle one\nmiddle\nneedle two\n".to_owned();
+        app.changes_query = "needle".to_owned();
+
+        app.find_change_match(true);
+        assert_eq!(app.changes_match, Some(1));
+        assert_eq!(app.changes_scroll, 1);
+        app.find_change_match(true);
+        assert_eq!(app.changes_match, Some(3));
+        app.find_change_match(false);
+        assert_eq!(app.changes_match, Some(1));
+    }
+
+    #[test]
+    fn header_shows_both_workspaces_and_change_count() {
+        let mut app = app_with_input("");
+        app.changes_file_count = 4;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let visible = terminal.backend().buffer().content().iter().fold(
+            String::new(),
+            |mut rendered, cell| {
+                rendered.push_str(cell.symbol());
+                rendered
+            },
+        );
+        assert!(visible.contains("1. Agent"));
+        assert!(visible.contains("2. Review (4)"));
+    }
+
+    #[test]
+    fn clean_workspace_hides_changes_tab() {
+        let mut app = app_with_input("");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let visible = terminal.backend().buffer().content().iter().fold(
+            String::new(),
+            |mut rendered, cell| {
+                rendered.push_str(cell.symbol());
+                rendered
+            },
+        );
+        assert!(visible.contains("1. Agent"));
+        assert!(!visible.contains("2. Review"));
+    }
+
+    #[test]
+    fn tab_and_backtab_jump_between_changed_files() {
+        let mut app = app_with_input("");
+        app.changes_diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1 +1 @@\n",
+            "-old\n",
+            "+new\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "--- a/two.rs\n",
+            "+++ b/two.rs\n",
+            "@@ -1 +1 @@\n",
+            "-before\n",
+            "+after\n",
+        )
+        .to_owned();
+
+        app.jump_change_file(true);
+        assert_eq!(app.changes_scroll, 8);
+        app.jump_change_file(true);
+        assert_eq!(app.changes_scroll, 1);
+        app.jump_change_file(false);
+        assert_eq!(app.changes_scroll, 8);
     }
 
     #[test]

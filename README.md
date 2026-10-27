@@ -15,15 +15,14 @@
 
 ## Usage
 
-Nono 0.80 is embedded directly, so no separate `nono` installation is needed.
+Nonaut embeds Nono 0.80, so you do not need to install `nono` separately.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh
 ```
 
 The installer selects the correct Linux or macOS binary, verifies its SHA-256
-checksum, and installs it to `~/.local/bin`. Run it again at any time to install
-the latest release. Set `NONAUT_INSTALL_DIR` to choose another directory.
+checksum, and installs it to `~/.local/bin`. Run the installer again whenever you want to upgrade to the latest release. Set `NONAUT_INSTALL_DIR` to choose another directory.
 
 ```sh
 nonaut
@@ -38,13 +37,13 @@ nonaut
 ## Security model
 
 - Workspace access is read/write; everything outside it is denied.
-- Network access is open by default and can be blocked or limited to an
-  allowlist in the [sandbox policy](#sandbox-policy).
+- Network access is open by default, but the [sandbox policy](#sandbox-policy)
+  can block it or restrict it to an allowlist.
 - Provider credentials and ambient environment variables are not inherited.
 - Tool results include concise diffs and sandbox denials.
 
-The TUI and provider connection run normally. Only model-requested execution
-crosses the nono boundary.
+The TUI and provider connections run outside the sandbox; only execution
+requested by the model crosses the nono boundary.
 
 ## Sandbox policy
 
@@ -129,6 +128,12 @@ provider, model, and reasoning effort.
 
 `Up` and `Down` recall earlier prompts in this session. `Shift+Enter` inserts a newline. `Esc` interrupts an active response. Sending a
 new prompt while streaming interrupts the current response first.
+
+Press `Alt+2` to open the live Review view and inspect the complete working-tree
+diff, including staged and untracked files. Press `Alt+1`, `Esc`, or `q` to return
+to the agent. The view refreshes automatically; use the arrow keys or
+`PageUp`/`PageDown` to scroll, `Tab`/`Shift+Tab` to move between changed files,
+and `/` to search.
 
 `/exec` does not require a connected provider. It runs through the same fresh,
 workspace-only nono sandbox used for agent tool calls, which makes policy and
