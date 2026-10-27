@@ -1,0 +1,47 @@
+# Development and releases
+
+## Build from source
+
+Nonaut requires Rust 1.99.1.
+
+```sh
+git clone git@github.com:nolabs-ai/nonaut.git
+cd nonaut
+make run
+```
+
+## Development commands
+
+| Command | Action |
+| --- | --- |
+| `make ci` | Run the complete local CI suite |
+| `make run` | Build an optimized binary and launch Nonaut |
+| `make build` | Build the optimized binary |
+| `make check` | Check formatting, lint, installer syntax, and unit tests |
+| `make integration` | Run provider-free sandbox and TUI integration tests |
+| `make smoke` | Exercise the release binary through `nonaut exec` |
+| `make fmt` | Format the Rust workspace |
+| `make lint` | Run Clippy with warnings denied |
+| `make test` | Run the Rust test suite |
+| `make clean` | Remove Cargo build artifacts |
+
+Run `make ci` before opening a pull request. Integration tests do not connect
+to a provider or consume model tokens.
+
+## Install from main
+
+Build and install the current `main` branch with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --from-main
+```
+
+This requires Cargo. Running it again downloads and rebuilds the latest main
+branch. The regular installer can replace a main build with a release, and
+`--from-main` can replace a release with a development build.
+
+## Releases
+
+Push a version tag matching `Cargo.toml`, such as `v0.0.2`, to publish release
+binaries, checksums, and signed build provenance for supported Linux and macOS
+targets.
