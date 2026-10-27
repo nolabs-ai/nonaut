@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -74,24 +74,69 @@ const LIGHT: Palette = Palette {
     removed: Color::Rgb(217, 0, 27),
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum Theme {
+    Dark,
+    Light,
+}
+
+impl Theme {
+    const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Dark => "dark background with light text",
+            Self::Light => "light background with dark text",
+        }
+    }
+
+    const fn palette(self) -> &'static Palette {
+        match self {
+            Self::Dark => &DARK,
+            Self::Light => &LIGHT,
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|theme| theme.name().eq_ignore_ascii_case(name))
+    }
+}
+
+const DEFAULT_THEME: Theme = Theme::Dark;
+
 // Chosen at startup from NONAUT_THEME or the saved setting, then by /theme.
-static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
+static THEME: AtomicU8 = AtomicU8::new(DEFAULT_THEME as u8);
+
+fn theme() -> Theme {
+    match THEME.load(Ordering::Relaxed) {
+        value if value == Theme::Light as u8 => Theme::Light,
+        _ => DEFAULT_THEME,
+    }
+}
 
 fn palette() -> &'static Palette {
-    if LIGHT_THEME.load(Ordering::Relaxed) {
-        &LIGHT
-    } else {
-        &DARK
-    }
+    theme().palette()
 }
 
 /// NONAUT_THEME wins over the saved /theme choice; dark is the default.
 pub(crate) fn init_theme() {
-    let light = match std::env::var("NONAUT_THEME") {
-        Ok(theme) => theme.eq_ignore_ascii_case("light"),
-        Err(_) => load_theme().ok().flatten().as_deref() == Some("light"),
-    };
-    LIGHT_THEME.store(light, Ordering::Relaxed);
+    let selected = std::env::var("NONAUT_THEME")
+        .ok()
+        .or_else(|| load_theme().ok().flatten())
+        .as_deref()
+        .and_then(Theme::from_name)
+        .unwrap_or(DEFAULT_THEME);
+    THEME.store(selected as u8, Ordering::Relaxed);
 }
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
@@ -146,7 +191,7 @@ const SLASH_COMMANDS: [SlashCommand; 13] = [
     },
     SlashCommand {
         name: "/theme",
-        description: "switch between dark and light",
+        description: "choose the interface theme",
         visible: true,
     },
     SlashCommand {
@@ -267,6 +312,10 @@ struct ProviderPicker {
     selected: usize,
 }
 
+struct ThemePicker {
+    selected: usize,
+}
+
 enum ConnectionEvent {
     Connected(u64, Provider, Option<String>),
     Failed(u64, String),
@@ -287,6 +336,7 @@ pub struct App {
     model_picker: Option<ModelPicker>,
     reasoning_picker: Option<ReasoningPicker>,
     provider_picker: Option<ProviderPicker>,
+    theme_picker: Option<ThemePicker>,
     events_tx: mpsc::UnboundedSender<(u64, ProviderEvent)>,
     events_rx: mpsc::UnboundedReceiver<(u64, ProviderEvent)>,
     connection_tx: mpsc::UnboundedSender<ConnectionEvent>,
@@ -351,6 +401,7 @@ impl App {
             model_picker: None,
             reasoning_picker: None,
             provider_picker: None,
+            theme_picker: None,
             events_tx,
             events_rx,
             connection_tx,
@@ -609,6 +660,7 @@ impl App {
         if self.model_picker.is_none()
             && self.reasoning_picker.is_none()
             && self.provider_picker.is_none()
+            && self.theme_picker.is_none()
         {
             self.render_command_menu(frame, prompt);
         }
@@ -621,6 +673,66 @@ impl App {
         if let Some(picker) = &self.provider_picker {
             self.render_provider_picker(frame, picker);
         }
+        if let Some(picker) = &self.theme_picker {
+            self.render_theme_picker(frame, picker);
+        }
+    }
+
+    fn render_theme_picker(&self, frame: &mut Frame, picker: &ThemePicker) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(4).min(52);
+        let height = area.height.saturating_sub(4).min(
+            u16::try_from(Theme::ALL.len())
+                .unwrap_or(u16::MAX)
+                .saturating_mul(2)
+                .saturating_add(2),
+        );
+        let popup = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+
+        let current_theme = theme();
+        let lines = Theme::ALL
+            .iter()
+            .enumerate()
+            .flat_map(|(index, option)| {
+                let current = if *option == current_theme { "●" } else { " " };
+                let marker = if index == picker.selected { "›" } else { " " };
+                let selected_style = if index == picker.selected {
+                    Style::new()
+                        .fg(palette().background)
+                        .bg(palette().accent)
+                        .bold()
+                } else {
+                    Style::new().fg(palette().foreground).bg(palette().surface)
+                };
+                [
+                    Line::styled(
+                        format!(" {marker} {current} {}", option.name()),
+                        selected_style,
+                    ),
+                    Line::styled(
+                        format!("       {}", option.description()),
+                        Style::new().fg(palette().muted).bg(palette().surface),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(lines)
+                .style(Style::new().bg(palette().surface))
+                .block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::new().fg(palette().accent))
+                        .title(" theme · ↑/↓ select · Enter apply · Esc close "),
+                ),
+            popup,
+        );
     }
 
     fn render_command_menu(&self, frame: &mut Frame, prompt: Rect) {
@@ -859,6 +971,14 @@ impl App {
     }
 
     fn handle_terminal_event(&mut self, event: Event) {
+        if self.theme_picker.is_some() {
+            if let Event::Key(key) = event
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_theme_picker_key(key);
+            }
+            return;
+        }
         if self.provider_picker.is_some() {
             if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
@@ -943,6 +1063,36 @@ impl App {
                             format!("Could not save the default provider: {error:#}"),
                         ),
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_theme_picker_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.theme_picker = None;
+            }
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.theme_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                if let Some(picker) = &mut self.theme_picker {
+                    picker.selected = (picker.selected + 1).min(Theme::ALL.len().saturating_sub(1));
+                }
+            }
+            (KeyCode::Enter, _) => {
+                let selected = self
+                    .theme_picker
+                    .as_ref()
+                    .and_then(|picker| Theme::ALL.get(picker.selected))
+                    .copied();
+                self.theme_picker = None;
+                if let Some(selected) = selected {
+                    self.apply_theme(selected);
                 }
             }
             _ => {}
@@ -1244,7 +1394,7 @@ impl App {
                 Ok(()) => self.push(Role::System, "Session detached."),
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
             },
-            "/theme" => self.toggle_theme(),
+            "/theme" => self.open_theme_picker(),
             "/undo" => self.undo_last(),
             "/help" => self.push(Role::System, Self::command_help()),
             _ if content.starts_with("/exec ") => {
@@ -1315,12 +1465,22 @@ impl App {
         }
     }
 
-    fn toggle_theme(&mut self) {
-        let light = !LIGHT_THEME.load(Ordering::Relaxed);
-        LIGHT_THEME.store(light, Ordering::Relaxed);
+    fn open_theme_picker(&mut self) {
+        let selected = Theme::ALL
+            .iter()
+            .position(|option| *option == theme())
+            .unwrap_or(0);
+        self.provider_picker = None;
+        self.model_picker = None;
+        self.reasoning_picker = None;
+        self.theme_picker = Some(ThemePicker { selected });
+    }
+
+    fn apply_theme(&mut self, selected: Theme) {
+        THEME.store(selected as u8, Ordering::Relaxed);
         // The prompt caches its styles, so rebuild it with the new palette.
         self.input = Self::new_input();
-        let name = if light { "light" } else { "dark" };
+        let name = selected.name();
         match save_theme(name) {
             Ok(()) => self.push(Role::System, format!("Theme: {name}.")),
             Err(error) => self.push(
@@ -1371,6 +1531,7 @@ impl App {
             .unwrap_or(0);
         self.model_picker = None;
         self.reasoning_picker = None;
+        self.theme_picker = None;
         self.provider_picker = Some(ProviderPicker {
             providers,
             selected,
@@ -1389,6 +1550,7 @@ impl App {
             .unwrap_or(0);
         self.provider_picker = None;
         self.reasoning_picker = None;
+        self.theme_picker = None;
         self.model_picker = Some(ModelPicker { models, selected });
     }
 
@@ -1407,6 +1569,7 @@ impl App {
             .unwrap_or(0);
         self.provider_picker = None;
         self.model_picker = None;
+        self.theme_picker = None;
         self.reasoning_picker = Some(ReasoningPicker { options, selected });
     }
 
@@ -1887,10 +2050,23 @@ mod tests {
 
     #[test]
     fn theme_flag_selects_the_palette() {
-        LIGHT_THEME.store(true, Ordering::Relaxed);
+        THEME.store(Theme::Light as u8, Ordering::Relaxed);
         assert_eq!(palette().background, Color::Rgb(255, 255, 255));
-        LIGHT_THEME.store(false, Ordering::Relaxed);
+        THEME.store(Theme::Dark as u8, Ordering::Relaxed);
         assert_eq!(palette().background, Color::Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn theme_command_opens_picker_on_the_current_selection() {
+        let mut app = app_with_input("/theme");
+
+        app.submit();
+        let picker = app.theme_picker.as_ref().unwrap();
+        assert_eq!(Theme::ALL[picker.selected], theme());
+
+        app.handle_theme_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(app.theme_picker.is_none());
     }
 
     #[test]
@@ -1909,7 +2085,7 @@ mod tests {
     #[test]
     fn up_and_down_browse_prompt_history_and_restore_the_draft() {
         let mut app = app_with_input("");
-        for prompt in ["first prompt", "/theme", "third\nprompt"] {
+        for prompt in ["first prompt", "/help", "third\nprompt"] {
             app.input.insert_str(prompt);
             app.submit();
         }
@@ -1917,7 +2093,7 @@ mod tests {
         press(&mut app, KeyCode::Up);
         assert_eq!(app.input.lines(), ["third", "prompt"]);
         press(&mut app, KeyCode::Up);
-        assert_eq!(app.input.lines(), ["/theme"]);
+        assert_eq!(app.input.lines(), ["/help"]);
         // A recalled slash command must not swallow the next Up.
         press(&mut app, KeyCode::Up);
         assert_eq!(app.input.lines(), ["first prompt"]);

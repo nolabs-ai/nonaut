@@ -122,7 +122,7 @@ provider, model, and reasoning effort.
 | `/new` | Start a fresh session |
 | `/exec <command>` | Run a command directly inside nono |
 | `/undo` | Restore files to before the last turn |
-| `/theme` | Switch between dark and light |
+| `/theme` | Choose the interface theme |
 | `/clear` | Clear the screen |
 | `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |
