@@ -4,10 +4,8 @@
 //! timeout policy remain owned by `policy` and are layered around this plan.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet},
     env, fs,
-    hash::{Hash, Hasher},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -38,15 +36,29 @@ const PROFILES: &[ProfileDefinition] = &[
         name: "python",
         resolve: python,
     },
+    ProfileDefinition {
+        name: "node",
+        resolve: node,
+    },
+    ProfileDefinition {
+        name: "go",
+        resolve: go,
+    },
+    ProfileDefinition {
+        name: "bun",
+        resolve: bun,
+    },
 ];
 
 pub(crate) fn resolve(names: &[String], home: &Path, workspace: &Path) -> Result<ProfilePlan> {
-    let mut combined = ProfilePlan::default();
     let mut selected = BTreeSet::new();
     for name in names {
         if !selected.insert(name.as_str()) {
             bail!("workspace profile `{name}` is listed more than once");
         }
+    }
+    let mut combined = ProfilePlan::default();
+    for name in names {
         combined.merge(name, resolve_one(name, home, workspace)?)?;
     }
     Ok(combined)
@@ -95,7 +107,7 @@ fn extend_unique(target: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
 
 fn rust(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
     let cargo = home.join(".cargo");
-    let cache = profile_cache("rust", workspace)?;
+    let cache = profile_cache(home, "rust", workspace)?;
     let mut plan = ProfilePlan::default();
     add_existing(&mut plan.read_paths, cargo.join("bin"));
     add_existing(&mut plan.read_paths, home.join(".rustup"));
@@ -113,7 +125,7 @@ fn rust(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
 }
 
 fn python(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
-    let cache = profile_cache("python", workspace)?;
+    let cache = profile_cache(home, "python", workspace)?;
     let mut plan = ProfilePlan::default();
     for path in [
         home.join(".pyenv"),
@@ -141,6 +153,107 @@ fn python(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
     Ok(plan)
 }
 
+fn node(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
+    let cache = profile_cache(home, "node", workspace)?;
+    let nvm = home.join(".nvm");
+    let fnm = home.join(".fnm");
+    let fnm_data = home.join(".local/share/fnm");
+    let mut plan = ProfilePlan::default();
+    for path in [
+        &nvm,
+        &fnm,
+        &fnm_data,
+        &home.join(".node"),
+        &home.join(".npm-global"),
+        &home.join("Library/pnpm"),
+        &home.join(".local/share/pnpm"),
+    ] {
+        add_existing(&mut plan.read_paths, path.to_path_buf());
+    }
+
+    // Prefer the version already active in the trusted parent shell, then
+    // expose installed versions as a fallback for GUI and minimal shells.
+    add_active_path_entries(&mut plan, &[&nvm, &fnm, &fnm_data]);
+    add_child_bins(&mut plan, &nvm.join("versions/node"), Path::new("bin"));
+    add_child_bins(
+        &mut plan,
+        &fnm.join("node-versions"),
+        Path::new("installation/bin"),
+    );
+    add_child_bins(
+        &mut plan,
+        &fnm_data.join("node-versions"),
+        Path::new("installation/bin"),
+    );
+    for path in [
+        home.join(".node/bin"),
+        home.join(".npm-global/bin"),
+        home.join("Library/pnpm"),
+        home.join(".local/share/pnpm"),
+    ] {
+        add_path_entry(&mut plan, path);
+    }
+
+    plan.write_paths.push(cache.clone());
+    for (name, directory) in [
+        ("npm_config_cache", "npm"),
+        ("YARN_CACHE_FOLDER", "yarn"),
+        ("COREPACK_HOME", "corepack"),
+        ("npm_config_store_dir", "pnpm-store"),
+    ] {
+        let path = cache_directory(&cache, directory)?;
+        plan.environment
+            .insert(name.to_owned(), path.to_string_lossy().into_owned());
+    }
+    if nvm.is_dir() {
+        plan.environment
+            .insert("NVM_DIR".to_owned(), nvm.to_string_lossy().into_owned());
+    }
+    Ok(plan)
+}
+
+fn go(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
+    let cache = profile_cache(home, "go", workspace)?;
+    let private_gopath = cache_directory(&cache, "gopath")?;
+    let mut plan = ProfilePlan::default();
+    for path in [home.join("go/bin"), PathBuf::from("/usr/local/go")] {
+        add_existing(&mut plan.read_paths, path);
+    }
+    for path in [
+        home.join("go/bin"),
+        PathBuf::from("/usr/local/go/bin"),
+        cache_directory(&private_gopath, "bin")?,
+    ] {
+        add_path_entry(&mut plan, path);
+    }
+    plan.write_paths.push(cache.clone());
+    for (name, path) in [
+        ("GOPATH", private_gopath),
+        ("GOCACHE", cache_directory(&cache, "build")?),
+        ("GOMODCACHE", cache_directory(&cache, "mod")?),
+    ] {
+        plan.environment
+            .insert(name.to_owned(), path.to_string_lossy().into_owned());
+    }
+    plan.environment
+        .insert("GOENV".to_owned(), "off".to_owned());
+    Ok(plan)
+}
+
+fn bun(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
+    let cache = profile_cache(home, "bun", workspace)?;
+    let install = home.join(".bun");
+    let mut plan = ProfilePlan::default();
+    add_existing(&mut plan.read_paths, install.clone());
+    add_path_entry(&mut plan, install.join("bin"));
+    plan.write_paths.push(cache.clone());
+    plan.environment.insert(
+        "BUN_INSTALL_CACHE_DIR".to_owned(),
+        cache.to_string_lossy().into_owned(),
+    );
+    Ok(plan)
+}
+
 fn add_existing(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if path.exists() {
         paths.push(path);
@@ -148,36 +261,63 @@ fn add_existing(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn add_path_entry(plan: &mut ProfilePlan, path: PathBuf) {
-    if path.is_dir() {
+    if path.is_dir() && !plan.path_entries.contains(&path) {
         plan.path_entries.push(path);
     }
 }
 
-fn profile_cache(profile: &str, workspace: &Path) -> Result<PathBuf> {
-    let root = env::var_os("XDG_CACHE_HOME").map_or_else(
-        || home_dir().map(|home| home.join(".cache")),
-        |path| Ok(PathBuf::from(path)),
-    )?;
-    if !root.is_absolute() {
-        bail!("XDG_CACHE_HOME must be an absolute path");
+fn add_active_path_entries(plan: &mut ProfilePlan, roots: &[&Path]) {
+    let canonical_roots = roots
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
+    let Some(path) = env::var_os("PATH") else {
+        return;
+    };
+    for entry in env::split_paths(&path) {
+        let Ok(canonical) = fs::canonicalize(&entry) else {
+            continue;
+        };
+        if canonical_roots
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
+            add_path_entry(plan, canonical);
+        }
     }
-    let mut hasher = DefaultHasher::new();
-    workspace.hash(&mut hasher);
-    let cache = root
-        .join("nonaut")
-        .join("profiles")
-        .join(profile)
-        .join(format!("{:016x}", hasher.finish()));
-    fs::create_dir_all(&cache).with_context(|| format!("could not create {}", cache.display()))?;
-    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("could not protect {}", cache.display()))?;
-    Ok(cache)
 }
 
-fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set; cannot place profile cache")
+/// Add one executable directory below each immediate child of `parent`.
+/// Canonical containment prevents a version-directory symlink escaping the
+/// profile's already-approved toolchain root.
+fn add_child_bins(plan: &mut ProfilePlan, parent: &Path, suffix: &Path) {
+    let Ok(canonical_parent) = fs::canonicalize(parent) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut bins = entries
+        .flatten()
+        .filter_map(|entry| fs::canonicalize(entry.path().join(suffix)).ok())
+        .filter(|path| path.is_dir() && path.starts_with(&canonical_parent))
+        .collect::<Vec<_>>();
+    bins.sort_unstable_by(|left, right| right.cmp(left));
+    for bin in bins {
+        add_path_entry(plan, bin);
+    }
+}
+
+fn cache_directory(parent: &Path, name: &str) -> Result<PathBuf> {
+    let path = parent.join(name);
+    fs::create_dir_all(&path).with_context(|| format!("could not create {}", path.display()))?;
+    Ok(path)
+}
+
+fn profile_cache(home: &Path, profile: &str, workspace: &Path) -> Result<PathBuf> {
+    let cache = crate::runtime_paths::workspace_cache(home, &["profiles", profile], workspace)?;
+    crate::runtime_paths::prepare_private_directory(&cache)?;
+    Ok(cache)
 }
 
 #[cfg(test)]
@@ -190,7 +330,7 @@ mod tests {
             .iter()
             .map(|profile| profile.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, ["rust", "python"]);
+        assert_eq!(names, ["rust", "python", "node", "go", "bun"]);
         let mut unique = names.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -220,5 +360,31 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("listed more than once"));
+    }
+
+    #[test]
+    fn version_discovery_does_not_follow_bins_outside_its_root() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/profile-tests")
+            .join(format!("{}-{unique}", std::process::id()));
+        let versions = directory.join("versions");
+        let inside = versions.join("v2/bin");
+        let outside = directory.join("outside/bin");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(directory.join("outside"), versions.join("v1")).unwrap();
+
+        let mut plan = ProfilePlan::default();
+        add_child_bins(&mut plan, &versions, Path::new("bin"));
+
+        assert_eq!(plan.path_entries, [fs::canonicalize(inside).unwrap()]);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

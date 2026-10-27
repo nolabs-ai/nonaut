@@ -135,6 +135,10 @@ allowlist, or grant additional read-only paths. For example:
   denied.
 - `sandbox.filesystem.read` adds read-only paths and
   `sandbox.filesystem.write` adds explicit writable paths outside a workspace.
+- Sandboxed commands receive a private writable `HOME` under
+  `$XDG_CACHE_HOME/nonaut/homes`. It is scoped per workspace, keeping real home
+  credentials hidden while allowing tools such as Cargo and Git to store
+  ordinary user state.
 - `tools.timeout_seconds` (default 120, up to 3600) caps every tool call,
   command and `/exec`; raise it for long builds or test suites. When a call
   times out or is interrupted, everything it started is stopped.
@@ -144,11 +148,20 @@ allowlist, or grant additional read-only paths. For example:
 - Workspace selection uses the canonical operation path and the most specific
   configured ancestor. Commands must provide a working directory; use
   `/exec --cwd DIR COMMAND` or `nonaut exec --cwd DIR -- COMMAND`.
-- A workspace entry may combine the built-in `rust` and `python` profiles,
+- A workspace entry may combine the built-in `rust`, `python`, `node`, `go`,
+  and `bun` profiles,
   replace the global network policy, add read-only paths, and override the
   tool timeout. Development profiles expose installed user toolchains without
   inheriting ambient credentials and keep writable package caches in a
   private per-workspace directory under `$XDG_CACHE_HOME/nonaut`.
+
+  | Profile | Toolchains and package managers |
+  | --- | --- |
+  | `rust` | Cargo and rustup |
+  | `python` | Python, pyenv, uv, and pip |
+  | `node` | Node.js, NVM, FNM, npm, pnpm, Yarn, and Corepack |
+  | `go` | Go SDK, GOPATH tools, modules, and build cache |
+  | `bun` | Bun runtime and package cache |
 - On Linux, `allow_domains` needs Landlock network rules (Linux 6.7+); older
   kernels keep network fully blocked. Landlock limits connections by port
   rather than address, so the proxy's port is reachable on any host; a

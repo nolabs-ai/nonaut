@@ -106,11 +106,43 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     .unwrap();
     fs::set_permissions(&python_executable, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let node_bin = root.path.join(".nvm/versions/node/v24.0.0/bin");
+    fs::create_dir_all(&node_bin).unwrap();
+    let node = node_bin.join("node");
+    fs::write(
+        &node,
+        "#!/bin/sh\ntest -n \"$npm_config_cache\" && printf node-profile-ok > \"$npm_config_cache/probe\" && printf node-profile-ok\n",
+    )
+    .unwrap();
+    fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let go_bin = root.path.join("go/bin");
+    fs::create_dir_all(&go_bin).unwrap();
+    let go = go_bin.join("go");
+    fs::write(
+        &go,
+        "#!/bin/sh\ntest -n \"$GOCACHE\" && printf go-profile-ok > \"$GOCACHE/probe\" && printf go-profile-ok\n",
+    )
+    .unwrap();
+    fs::set_permissions(&go, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bun_bin = root.path.join(".bun/bin");
+    fs::create_dir_all(&bun_bin).unwrap();
+    let bun = bun_bin.join("bun");
+    fs::write(
+        &bun,
+        "#!/bin/sh\ntest -n \"$BUN_INSTALL_CACHE_DIR\" && printf bun-profile-ok > \"$BUN_INSTALL_CACHE_DIR/probe\" && printf bun-profile-ok\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).unwrap();
+
     let config = serde_json::json!({
         "sandbox": {
             "unconfigured_workspaces": "deny",
             "workspaces": {
-                (mixed.to_string_lossy().to_string()): {"profiles": ["rust", "python"]}
+                (mixed.to_string_lossy().to_string()): {
+                    "profiles": ["rust", "python", "node", "go", "bun"]
+                }
             }
         }
     });
@@ -119,11 +151,14 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     let allowed = exec_in(
         &session,
         &mixed,
-        "cargo --version && printf ':' && python --version",
+        "cargo --version && printf ':' && python --version && printf ':' && node --version && printf ':' && go version && printf ':' && bun --version",
     );
     assert!(allowed.status.success(), "{}", combined(&allowed));
     assert!(combined(&allowed).contains("rust-profile-ok"));
     assert!(combined(&allowed).contains("python-profile-ok"));
+    assert!(combined(&allowed).contains("node-profile-ok"));
+    assert!(combined(&allowed).contains("go-profile-ok"));
+    assert!(combined(&allowed).contains("bun-profile-ok"));
 
     let denied = exec_in(&session, &other, "printf should-not-run");
     assert!(
@@ -160,6 +195,18 @@ fn headless_exec_runs_and_writes_inside_the_workspace() {
         fs::read_to_string(workspace.join("created.txt")).unwrap(),
         "sandboxed write"
     );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn headless_exec_uses_a_private_writable_home_outside_the_workspace() {
+    let root = TestRoot::new("exec-private-home");
+    let workspace = root.workspace();
+    let output = exec(
+        &workspace,
+        r#"test "$HOME" != "$PWD" && printf private > "$HOME/state" && test ! -e state"#,
+    );
+    assert!(output.status.success(), "{}", combined(&output));
 }
 
 #[test]
@@ -217,6 +264,16 @@ fn headless_exec_allows_network_when_explicitly_opened() {
         curl_reaches_listener(&workspace),
         "sandboxed command could not reach the listener with explicitly open network"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn headless_exec_can_read_the_macos_tls_certificate_bundle() {
+    let root = TestRoot::new("exec-macos-certificates");
+    let workspace = root.workspace();
+    let output = exec(&workspace, "test -r /etc/ssl/cert.pem");
+    assert!(output.status.success(), "{}", combined(&output));
 }
 
 #[test]

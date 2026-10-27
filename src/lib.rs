@@ -5,6 +5,7 @@ mod policy;
 mod profiles;
 mod providers;
 mod proxy;
+mod runtime_paths;
 mod sandbox;
 mod sessions;
 mod tools;

@@ -53,7 +53,7 @@ pub(crate) fn load(
         .context("could not determine the home directory")?
         .home_dir()
         .to_path_buf();
-    resolve(
+    let policy = resolve(
         config,
         session_root,
         operation,
@@ -66,7 +66,10 @@ pub(crate) fn load(
             |_| "invalid Nonaut configuration".to_owned(),
             |path| format!("invalid {}", path.display()),
         )
-    })
+    })?;
+    crate::runtime_paths::prepare_private_directory(&policy.command_home)
+        .context("could not prepare the private command home")?;
+    Ok(policy)
 }
 
 fn resolve(
@@ -206,11 +209,13 @@ fn validate(
     }
     let mut read_paths = resolve_read_paths(&filesystem, home)?;
     let mut write_paths = resolve_write_paths(&filesystem, home)?;
+    let command_home = crate::runtime_paths::workspace_cache(home, &["homes"], &workspace)?;
+    write_paths.push(command_home.clone());
     let profile = crate::profiles::resolve(profiles, home, &workspace)?;
     read_paths.extend(profile.read_paths);
     write_paths.extend(profile.write_paths);
     Ok(Policy {
-        command_home: workspace.clone(),
+        command_home,
         workspace,
         network: network_mode,
         tool_timeout_seconds,
@@ -406,6 +411,8 @@ mod tests {
         assert_eq!(policy.tool_timeout_seconds, 120);
         assert!(policy.allow_hosts.is_empty());
         assert!(policy.read_paths.is_empty());
+        assert_ne!(policy.command_home, policy.workspace);
+        assert!(policy.write_paths.contains(&policy.command_home));
         let policy = parse(
             r#"{
                 "sandbox": {
@@ -518,7 +525,8 @@ mod tests {
             Path::new("/home/me"),
         )
         .unwrap();
-        assert_eq!(write.write_paths, [PathBuf::from("/outside")]);
+        assert!(write.write_paths.contains(&PathBuf::from("/outside")));
+        assert!(write.write_paths.contains(&write.command_home));
     }
 
     #[test]
