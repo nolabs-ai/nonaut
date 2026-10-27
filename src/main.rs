@@ -61,22 +61,44 @@ fn run() -> anyhow::Result<()> {
         ) {
             nonaut::print_command_help(
                 "exec",
-                "nonaut exec [--] <command>",
+                "nonaut exec [--cwd DIR] [--] <command>",
                 "Run a shell command in a fresh nono sandbox.",
             );
             return Ok(());
         }
-        let command = args
-            .iter()
-            .skip(1)
-            .skip_while(|argument| argument.as_str() == "--")
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if command.trim().is_empty() {
-            anyhow::bail!("missing command\n\nUsage: nonaut exec [--] <command>");
+        let session_root = std::env::current_dir()?;
+        let mut cwd = session_root.clone();
+        let mut command_args = Vec::new();
+        let mut arguments = args.iter().skip(1);
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--cwd" => {
+                    let value = arguments
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--cwd needs a directory"))?;
+                    let path = std::path::PathBuf::from(value);
+                    cwd = if path.is_absolute() {
+                        path
+                    } else {
+                        session_root.join(path)
+                    };
+                }
+                "--" => {
+                    command_args.extend(arguments.by_ref().cloned());
+                    break;
+                }
+                _ => {
+                    command_args.push(argument.clone());
+                    command_args.extend(arguments.by_ref().cloned());
+                    break;
+                }
+            }
         }
-        let output = runtime.block_on(nonaut::run_exec(command))?;
+        let command = command_args.join(" ");
+        if command.trim().is_empty() {
+            anyhow::bail!("missing command\n\nUsage: nonaut exec [--cwd DIR] [--] <command>");
+        }
+        let output = runtime.block_on(nonaut::run_exec(cwd, command))?;
         print!("{output}");
         if !output.ends_with('\n') {
             println!();

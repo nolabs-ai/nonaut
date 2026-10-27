@@ -70,7 +70,10 @@ pub(crate) fn render_help(color: bool) -> String {
     let command = |value| styled(value, ACCENT, false, color);
 
     let commands = [
-        ("exec -- <command>", "Run a command in the nono sandbox"),
+        (
+            "exec [--cwd DIR] -- <command>",
+            "Run a command in the nono sandbox",
+        ),
         ("ps", "List persistent sessions"),
         ("attach <session>", "Attach to a persistent session"),
         ("kill <session>", "Stop a persistent session"),

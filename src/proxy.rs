@@ -88,7 +88,7 @@ async fn handle(mut client: TcpStream, filter: &RwLock<HostFilter>) -> Result<()
     if !verdict.is_allowed() {
         return refuse(
             &mut client,
-            &format!("{} (edit nonaut policy.json)", verdict.reason()),
+            &format!("{} (edit nonaut config.json)", verdict.reason()),
         )
         .await;
     }

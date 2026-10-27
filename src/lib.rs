@@ -48,9 +48,10 @@ pub fn print_error(error: &anyhow::Error) {
     cli::print_error(error);
 }
 
-pub async fn run_exec(command: String) -> Result<String> {
-    let workspace = std::env::current_dir().context("could not determine the working directory")?;
-    tools::execute_shell(&workspace, command).await
+pub async fn run_exec(cwd: std::path::PathBuf, command: String) -> Result<String> {
+    let session_root =
+        std::env::current_dir().context("could not determine the working directory")?;
+    tools::execute_shell(&session_root, &cwd, command).await
 }
 
 pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Result<()> {

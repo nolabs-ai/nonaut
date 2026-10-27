@@ -116,16 +116,16 @@ pub fn specs() -> Value {
         {
             "type": "function",
             "name": "run_command",
-            "description": "Attempt to run a program with explicit arguments under nono. Always make an explicitly requested attempt and report the actual result instead of predicting a policy denial. The sandbox has workspace read/write access, network as set by the user's policy, and no inherited secrets.",
+            "description": "Run a program under the policy selected by its explicit working directory. Always make an explicitly requested attempt and report the actual result instead of predicting a denial. The fresh nono sandbox grants only the matching workspace, its network policy, and no inherited secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "program": { "type": "string", "description": "Executable name, such as cargo, git, or sh." },
                     "args": { "type": "array", "items": { "type": "string" } },
-                    "cwd": { "type": "string", "description": "Optional working directory inside the workspace. Relative and absolute workspace paths are accepted." },
+                    "cwd": { "type": "string", "description": "Working directory used to select the operation's workspace policy. Relative paths start at the session directory." },
                     "timeout_seconds": { "type": "integer", "minimum": 1, "description": "Optional; capped by the user's tool timeout (default 120 seconds)." }
                 },
-                "required": ["program", "args"],
+                "required": ["program", "args", "cwd"],
                 "additionalProperties": false
             }
         }
@@ -134,16 +134,18 @@ pub fn specs() -> Value {
 
 pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
     let arguments = normalize_tool_paths(workspace, tool, arguments)?;
-    let policy = crate::policy::load(workspace)?;
+    let (operation, fallback_root) = operation_location(workspace, tool, &arguments)?;
+    let policy = crate::policy::load(workspace, &operation, &fallback_root)?;
+    let operation_workspace = policy.workspace.clone();
     if tool == "run_command" {
-        return run_command(workspace, &arguments, &policy).await;
+        return run_command(&operation_workspace, &arguments, &policy).await;
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_process(workspace, &executable, &policy)?;
+    let mut child = sandbox_process(&operation_workspace, &executable, &policy)?;
     child
         .arg("tool")
-        .arg(workspace)
+        .arg(&operation_workspace)
         .arg(tool)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -172,16 +174,43 @@ pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<
     output_result(tool, output)
 }
 
-pub(crate) async fn execute_shell(workspace: &Path, command: String) -> Result<String> {
+pub(crate) async fn execute_shell(
+    session_root: &Path,
+    cwd: &Path,
+    command: String,
+) -> Result<String> {
     execute(
-        workspace,
+        session_root,
         "run_command",
         &json!({
             "program": "sh",
             "args": ["-c", command],
+            "cwd": cwd,
         }),
     )
     .await
+}
+
+fn operation_location(
+    session_root: &Path,
+    tool: &str,
+    arguments: &Value,
+) -> Result<(PathBuf, PathBuf)> {
+    if tool == "run_command" {
+        let cwd = PathBuf::from(required_string(arguments, "cwd")?);
+        return Ok((cwd.clone(), cwd));
+    }
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| session_root.to_path_buf());
+    let fallback = if path.is_dir() {
+        path.clone()
+    } else {
+        path.parent().unwrap_or(session_root).to_path_buf()
+    };
+    Ok((path, fallback))
 }
 
 fn normalize_tool_paths(workspace: &Path, tool: &str, arguments: &Value) -> Result<Value> {
@@ -396,6 +425,8 @@ impl Drop for ProcessGroup {
 const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
 const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
 const READ_PATHS_ENV: &str = "NONAUT_READ_PATHS";
+const COMMAND_PATH_ENV: &str = "NONAUT_COMMAND_PATH";
+const COMMAND_HOME_ENV: &str = "NONAUT_COMMAND_HOME";
 
 fn sandbox_process(
     workspace: &Path,
@@ -410,8 +441,8 @@ fn sandbox_process(
     command
         .arg("__nonaut_sandbox")
         .env_clear()
-        .env("PATH", safe_path())
-        .env("HOME", workspace)
+        .env("PATH", policy_path(policy))
+        .env("HOME", &policy.command_home)
         .env("TMPDIR", workspace)
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
@@ -435,6 +466,9 @@ fn sandbox_process(
             .join("\n");
         command.env(READ_PATHS_ENV, paths);
     }
+    command
+        .env(COMMAND_PATH_ENV, policy_path(policy))
+        .env(COMMAND_HOME_ENV, &policy.command_home);
     Ok(command)
 }
 
@@ -470,6 +504,29 @@ fn safe_path() -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+fn policy_path(policy: &crate::policy::Policy) -> String {
+    let base = safe_path();
+    let entries = policy
+        .path_entries
+        .iter()
+        .cloned()
+        .chain(base.split(':').map(PathBuf::from));
+    std::env::join_paths(entries)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn command_path() -> String {
+    std::env::var(COMMAND_PATH_ENV).unwrap_or_else(|_| safe_path())
+}
+
+fn command_home(workspace: &Path) -> PathBuf {
+    std::env::var_os(COMMAND_HOME_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.to_path_buf())
 }
 
 fn output_result(name: &str, output: std::process::Output) -> Result<String> {
@@ -601,7 +658,7 @@ fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
     for path in system_write_paths() {
         capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Write)?;
     }
-    for path in safe_path().split(':') {
+    for path in command_path().split(':') {
         capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
     }
     capabilities = capabilities
@@ -779,8 +836,8 @@ fn run_sandboxed_command(_workspace: &Path, arguments: Vec<OsString>) -> Result<
         .args(arguments)
         .current_dir(workdir)
         .env_clear()
-        .env("PATH", safe_path())
-        .env("HOME", _workspace)
+        .env("PATH", command_path())
+        .env("HOME", command_home(_workspace))
         .env("TMPDIR", _workspace)
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb");

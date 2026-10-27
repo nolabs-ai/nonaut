@@ -37,51 +37,120 @@ nonaut
 ## Security model
 
 - Workspace access is read/write; everything outside it is denied.
-- Network access is open by default, but the [sandbox policy](#sandbox-policy)
-  can block it or restrict it to an allowlist.
+- Network access is blocked by default. The [sandbox policy](#configuration)
+  can open it or restrict it to an allowlist.
 - Provider credentials and ambient environment variables are not inherited.
 - Tool results include concise diffs and sandbox denials.
 
 The TUI and provider connections run outside the sandbox; only execution
 requested by the model crosses the nono boundary.
 
-## Sandbox policy
+## Configuration
 
-By default tools get the workspace, no other paths, and open network. An
-optional `policy.json` in nonaut's config directory
-(`~/.config/nonaut/policy.json` on Linux) changes that:
+Nonaut keeps all persistent settings in
+`$XDG_CONFIG_HOME/nonaut/config.json`, defaulting to
+`~/.config/nonaut/config.json` on Linux and macOS. It creates the file with
+defaults on first run. Successful provider connections and model, reasoning
+and theme choices made in the TUI update this same file.
+
+By default tools get read/write access to the workspace, no other paths, and
+no network access. The generated first-run configuration is intentionally
+conservative:
 
 ```json
 {
-  "network": "allowlist",
-  "allow_hosts": ["crates.io", "*.crates.io", "github.com"],
-  "read_paths": ["~/.cargo/registry"],
-  "tool_timeout_seconds": 600,
-  "workspaces": {
-    "~/Work/site": { "allow_hosts": ["registry.npmjs.org"] }
+  "ui": {
+    "theme": "dark"
+  },
+  "agent": {
+    "providers": {}
+  },
+  "tools": {
+    "timeout_seconds": 120
+  },
+  "sandbox": {
+    "unconfigured_workspaces": "allow",
+    "network": {
+      "mode": "blocked",
+      "allow_domains": []
+    },
+    "filesystem": {
+      "read": []
+    },
+    "workspaces": {}
   }
 }
 ```
 
-- `network` is `open` (default), `blocked`, or `allowlist`. Open network lets
+The `sandbox` section can open network access, restrict it to an HTTPS domain
+allowlist, or grant additional read-only paths. For example:
+
+```json
+{
+  "ui": {
+    "theme": "dark"
+  },
+  "agent": {
+    "provider": "codex",
+    "providers": {
+      "codex": {
+        "model": "gpt-5.6-luna",
+        "reasoning": "low"
+      }
+    }
+  },
+  "tools": {
+    "timeout_seconds": 600
+  },
+  "sandbox": {
+    "unconfigured_workspaces": "deny",
+    "network": {
+      "mode": "blocked",
+      "allow_domains": []
+    },
+    "filesystem": {
+      "read": ["~/.cargo/registry"]
+    },
+    "workspaces": {
+      "~/Work/nono": {
+        "profile": "rust-dev",
+        "network": {
+          "mode": "allowlist",
+          "allow_domains": ["index.crates.io", "static.crates.io", "github.com"]
+        }
+      }
+    }
+  }
+}
+```
+
+- `sandbox.network.mode` is `blocked` (default), `open`, or `allowlist`. Open network lets
   a tool send anything it can read in the workspace anywhere; use `blocked`
   or `allowlist` for code you do not want leaving the machine.
-- `allow_hosts` lets tools reach those hosts over HTTPS (port 443) through a
+- `allow_domains` lets tools reach those hosts over HTTPS (port 443) through a
   local proxy that checks every connection. `*.` matches subdomains; `*` on
   its own is rejected. Cloud metadata and link-local addresses are always
   denied.
-- `read_paths` are readable, never writable.
-- `tool_timeout_seconds` (default 120, up to 3600) caps every tool call,
+- `sandbox.filesystem.read` paths are readable, never writable.
+- `tools.timeout_seconds` (default 120, up to 3600) caps every tool call,
   command and `/exec`; raise it for long builds or test suites. When a call
   times out or is interrupted, everything it started is stopped.
-- A `workspaces` entry adds hosts and paths for that directory and may
-  override `network`.
-- On Linux, `allow_hosts` needs Landlock network rules (Linux 6.7+); older
+- `sandbox.unconfigured_workspaces` is `allow` (default) or `deny`. With
+  `deny`, reads, writes, searches and commands must fall under an explicitly
+  configured workspace.
+- Workspace selection uses the canonical operation path and the most specific
+  configured ancestor. Commands must provide a working directory; use
+  `/exec --cwd DIR COMMAND` or `nonaut exec --cwd DIR -- COMMAND`.
+- A workspace entry may select the built-in `default` or `rust-dev` profile,
+  replace the global network policy, add read-only paths, and override the
+  tool timeout. `rust-dev` exposes an installed rustup toolchain without
+  inheriting ambient credentials.
+- On Linux, `allow_domains` needs Landlock network rules (Linux 6.7+); older
   kernels keep network fully blocked. Landlock limits connections by port
   rather than address, so the proxy's port is reachable on any host; a
   seccomp supervisor would close that gap.
 
-The file lives outside the workspace on purpose: tools can write the
+The configuration lives outside the workspace on purpose: tools can write the
 workspace, so a policy stored there could be edited to widen the sandbox.
 
 ## Project instructions

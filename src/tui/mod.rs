@@ -149,6 +149,28 @@ const PROMPT_MAX_LINES: usize = 10;
 const PROMPT_HISTORY_LIMIT: usize = 500;
 const CHANGES_REFRESH: Duration = Duration::from_secs(2);
 
+fn parse_exec(session_root: &std::path::Path, input: &str) -> Result<(PathBuf, String), String> {
+    let (cwd, command) = if let Some(rest) = input.strip_prefix("--cwd ") {
+        let (cwd, command) = rest
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| "--cwd needs a directory followed by a command".to_owned())?;
+        let cwd = PathBuf::from(cwd);
+        let cwd = if cwd.is_absolute() {
+            cwd
+        } else {
+            session_root.join(cwd)
+        };
+        (cwd, command.trim())
+    } else {
+        (session_root.to_path_buf(), input.trim())
+    };
+    if command.is_empty() {
+        return Err("command may not be empty".to_owned());
+    }
+    Ok((cwd, command.to_owned()))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceView {
     Agent,
@@ -1519,16 +1541,8 @@ impl App {
                     .and_then(|picker| picker.providers.get(picker.selected))
                     .copied();
                 if let Some(provider) = provider {
-                    match save_default_provider(provider) {
-                        Ok(()) => {
-                            self.provider_picker = None;
-                            self.begin_connect(provider);
-                        }
-                        Err(error) => self.push(
-                            Role::System,
-                            format!("Could not save the default provider: {error:#}"),
-                        ),
-                    }
+                    self.provider_picker = None;
+                    self.begin_connect(provider);
                 }
             }
             _ => {}
@@ -1855,7 +1869,7 @@ impl App {
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
-            "/exec" => self.push(Role::System, "Usage: /exec <command>"),
+            "/exec" => self.push(Role::System, "Usage: /exec [--cwd DIR] <command>"),
             "/detach" => match crate::sessions::request_detach() {
                 Ok(()) => self.push(Role::System, "Session detached."),
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
@@ -1864,11 +1878,14 @@ impl App {
             "/undo" => self.undo_last(),
             "/help" => self.push(Role::System, Self::command_help()),
             _ if content.starts_with("/exec ") => {
-                let command = content[6..].trim().to_owned();
-                if command.is_empty() {
-                    self.push(Role::System, "Usage: /exec <command>");
-                } else {
-                    self.begin_exec(command);
+                match parse_exec(&self.cwd, content[6..].trim()) {
+                    Ok((cwd, command)) => self.begin_exec(cwd, command),
+                    Err(error) => {
+                        self.push(
+                            Role::System,
+                            format!("Usage: /exec [--cwd DIR] <command>\n{error}"),
+                        );
+                    }
                 }
             }
             _ if self.request.is_some() => {
@@ -2097,7 +2114,7 @@ impl App {
         self.request_uses_provider = true;
     }
 
-    fn begin_exec(&mut self, command: String) {
+    fn begin_exec(&mut self, cwd: PathBuf, command: String) {
         if self.request.is_some() {
             self.push(
                 Role::System,
@@ -2105,7 +2122,17 @@ impl App {
             );
             return;
         }
-        self.push(Role::You, format!("/exec {command}"));
+        let shown_cwd = cwd.strip_prefix(&self.cwd).map_or_else(
+            |_| cwd.display().to_string(),
+            |path| {
+                if path.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    path.display().to_string()
+                }
+            },
+        );
+        self.push(Role::You, format!("/exec --cwd {shown_cwd} {command}"));
         self.streaming_message = None;
         self.tool_summaries.clear();
         self.request_generation = self.request_generation.wrapping_add(1);
@@ -2117,7 +2144,7 @@ impl App {
         self.request = Some(tokio::spawn(async move {
             checkpoint(undo).await;
             let _ = sender.send((request_id, ProviderEvent::ToolStarted("exec".to_owned())));
-            let result = crate::tools::execute_shell(&workspace, command).await;
+            let result = crate::tools::execute_shell(&workspace, &cwd, command).await;
             let (success, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("{error:#}")),
@@ -2224,6 +2251,9 @@ impl App {
         self.connection = None;
         match event {
             ConnectionEvent::Connected(_, provider, warning) => {
+                let save_error = self
+                    .active_provider
+                    .and_then(|kind| save_default_provider(kind).err());
                 let model = provider.model();
                 self.models = provider.models().to_vec();
                 self.model_id = model.id;
@@ -2238,6 +2268,12 @@ impl App {
                 );
                 if let Some(warning) = warning {
                     self.push(Role::System, warning);
+                }
+                if let Some(error) = save_error {
+                    self.push(
+                        Role::System,
+                        format!("Could not save the default provider: {error:#}"),
+                    );
                 }
             }
             ConnectionEvent::Failed(_, error) => {
@@ -2994,7 +3030,7 @@ mod tests {
         app.submit();
         assert_eq!(
             app.messages.last().unwrap().content,
-            "Usage: /exec <command>"
+            "Usage: /exec [--cwd DIR] <command>"
         );
     }
 
@@ -3004,7 +3040,7 @@ mod tests {
         app.submit();
         assert!(app.request.is_some());
         assert!(!app.request_uses_provider);
-        assert_eq!(app.messages[0].content, "/exec printf hello");
+        assert!(app.messages[0].content.ends_with("printf hello"));
         app.request.take().unwrap().abort();
     }
 

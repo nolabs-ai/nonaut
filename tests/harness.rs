@@ -55,18 +55,67 @@ fn binary() -> &'static str {
 }
 
 fn exec(workspace: &Path, command: &str) -> Output {
-    // A private config dir keeps the developer's own policy.json out of tests.
+    exec_in(workspace, workspace, command)
+}
+
+fn exec_in(workspace: &Path, cwd: &Path, command: &str) -> Output {
+    // A private config dir keeps the developer's own config.json out of tests.
     let home = workspace.parent().unwrap();
     let config = home.join("config");
     fs::create_dir_all(config_dir(workspace)).unwrap();
     Command::new(binary())
-        .args(["exec", "--", command])
+        .arg("exec")
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--")
+        .arg(command)
         .current_dir(workspace)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", &config)
         .env("NONAUT_TEST_SECRET", "must-not-cross-the-boundary")
         .output()
         .unwrap()
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn workspace_rules_follow_command_cwd_and_rust_profile() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TestRoot::new("workspace-policy");
+    let session = root.workspace();
+    let rust = session.join("nono");
+    let other = session.join("other");
+    fs::create_dir_all(&rust).unwrap();
+    fs::create_dir_all(&other).unwrap();
+
+    let cargo_bin = root.path.join(".cargo/bin");
+    fs::create_dir_all(&cargo_bin).unwrap();
+    fs::create_dir_all(root.path.join(".rustup")).unwrap();
+    let cargo = cargo_bin.join("cargo");
+    fs::write(&cargo, "#!/bin/sh\nprintf rust-profile-ok\n").unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = serde_json::json!({
+        "sandbox": {
+            "unconfigured_workspaces": "deny",
+            "workspaces": {
+                (rust.to_string_lossy().to_string()): {"profile": "rust-dev"}
+            }
+        }
+    });
+    write_config(&session, &serde_json::to_string(&config).unwrap());
+
+    let allowed = exec_in(&session, &rust, "cargo --version");
+    assert!(allowed.status.success(), "{}", combined(&allowed));
+    assert!(combined(&allowed).contains("rust-profile-ok"));
+
+    let denied = exec_in(&session, &other, "printf should-not-run");
+    assert!(
+        !denied.status.success(),
+        "unconfigured workspace was allowed"
+    );
+    assert!(combined(&denied).contains("outside every configured workspace"));
 }
 
 fn combined(output: &Output) -> String {
@@ -133,7 +182,7 @@ fn headless_exec_blocks_network_connections() {
     }
     let root = TestRoot::new("exec-network");
     let workspace = root.workspace();
-    write_policy(&workspace, r#"{"network": "blocked"}"#);
+    write_config(&workspace, r#"{"sandbox":{"network":{"mode":"blocked"}}}"#);
     assert!(
         !curl_reaches_listener(&workspace),
         "network access unexpectedly succeeded with \"network\": \"blocked\""
@@ -142,31 +191,58 @@ fn headless_exec_blocks_network_connections() {
 
 #[test]
 #[ignore = "provider-free black-box integration test"]
-fn headless_exec_allows_network_by_default() {
+fn headless_exec_allows_network_when_explicitly_opened() {
     if !curl_available() {
         return;
     }
     let root = TestRoot::new("exec-network-open");
     let workspace = root.workspace();
+    write_config(&workspace, r#"{"sandbox":{"network":{"mode":"open"}}}"#);
     assert!(
         curl_reaches_listener(&workspace),
-        "sandboxed command could not reach the listener with the default policy"
+        "sandboxed command could not reach the listener with explicitly open network"
     );
 }
 
-fn write_policy(workspace: &Path, policy: &str) {
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn command_cwd_selects_the_workspace_network_policy() {
+    if !curl_available() {
+        return;
+    }
+    let root = TestRoot::new("workspace-network");
+    let session = root.workspace();
+    let open = session.join("open");
+    let blocked = session.join("blocked");
+    fs::create_dir_all(&open).unwrap();
+    fs::create_dir_all(&blocked).unwrap();
+    let config = serde_json::json!({
+        "sandbox": {
+            "unconfigured_workspaces": "deny",
+            "workspaces": {
+                (open.to_string_lossy().to_string()): {
+                    "network": {"mode": "open"}
+                },
+                (blocked.to_string_lossy().to_string()): {
+                    "network": {"mode": "blocked"}
+                }
+            }
+        }
+    });
+    write_config(&session, &serde_json::to_string(&config).unwrap());
+    assert!(curl_reaches_listener_in(&session, &open));
+    assert!(!curl_reaches_listener_in(&session, &blocked));
+}
+
+fn write_config(workspace: &Path, config_text: &str) {
     let config = config_dir(workspace);
     fs::create_dir_all(&config).unwrap();
-    fs::write(config.join("policy.json"), policy).unwrap();
+    fs::write(config.join("config.json"), config_text).unwrap();
 }
 
 fn config_dir(workspace: &Path) -> PathBuf {
     let home = workspace.parent().unwrap();
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/ai.nolabs.nonaut")
-    } else {
-        home.join("config/nonaut")
-    }
+    home.join("config/nonaut")
 }
 
 fn curl_available() -> bool {
@@ -178,6 +254,10 @@ fn curl_available() -> bool {
 
 /// Runs a sandboxed curl against a local listener; true if it got through.
 fn curl_reaches_listener(workspace: &Path) -> bool {
+    curl_reaches_listener_in(workspace, workspace)
+}
+
+fn curl_reaches_listener_in(workspace: &Path, cwd: &Path) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -199,8 +279,9 @@ fn curl_reaches_listener(workspace: &Path) -> bool {
         }
         false
     });
-    let output = exec(
+    let output = exec_in(
         workspace,
+        cwd,
         &format!("curl --silent --show-error --max-time 2 http://{address}"),
     );
     let reached = server.join().unwrap();
@@ -234,6 +315,8 @@ fn spawn_pty(workspace: &Path, arguments: &[&str], root: &TestRoot) -> PtyRun {
     }
     command.cwd(workspace);
     command.env("NONAUT_NO_AUTO_CONNECT", "1");
+    command.env("HOME", &root.path);
+    command.env("XDG_CONFIG_HOME", root.path.join("config"));
     command.env("XDG_STATE_HOME", root.path.join("state"));
     command.env("XDG_RUNTIME_DIR", &root.runtime);
     command.env("TERM", "xterm-256color");
@@ -312,6 +395,9 @@ fn tui_exec_interrupts_and_restores_terminal_modes() {
     let output = run.output.lock().unwrap();
     assert!(output.windows(8).any(|window| window == b"\x1b[?1000l"));
     assert!(output.windows(8).any(|window| window == b"\x1b[?1049l"));
+    let config = root.path.join("config/nonaut");
+    assert!(config.join("config.json").is_file());
+    assert_eq!(fs::read_dir(config).unwrap().count(), 1);
 }
 
 #[test]
