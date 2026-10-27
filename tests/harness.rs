@@ -79,14 +79,14 @@ fn exec_in(workspace: &Path, cwd: &Path, command: &str) -> Output {
 
 #[test]
 #[ignore = "provider-free black-box integration test"]
-fn workspace_rules_follow_command_cwd_and_rust_profile() {
+fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = TestRoot::new("workspace-policy");
     let session = root.workspace();
-    let rust = session.join("nono");
+    let mixed = session.join("nono");
     let other = session.join("other");
-    fs::create_dir_all(&rust).unwrap();
+    fs::create_dir_all(&mixed).unwrap();
     fs::create_dir_all(&other).unwrap();
 
     let cargo_bin = root.path.join(".cargo/bin");
@@ -96,19 +96,34 @@ fn workspace_rules_follow_command_cwd_and_rust_profile() {
     fs::write(&cargo, "#!/bin/sh\nprintf rust-profile-ok\n").unwrap();
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
 
+    let python_bin = root.path.join(".pyenv/shims");
+    fs::create_dir_all(&python_bin).unwrap();
+    let python_executable = python_bin.join("python");
+    fs::write(
+        &python_executable,
+        "#!/bin/sh\ntest -n \"$PIP_CACHE_DIR\" && printf python-profile-ok > \"$PIP_CACHE_DIR/probe\" && printf python-profile-ok\n",
+    )
+    .unwrap();
+    fs::set_permissions(&python_executable, fs::Permissions::from_mode(0o755)).unwrap();
+
     let config = serde_json::json!({
         "sandbox": {
             "unconfigured_workspaces": "deny",
             "workspaces": {
-                (rust.to_string_lossy().to_string()): {"profile": "rust-dev"}
+                (mixed.to_string_lossy().to_string()): {"profiles": ["rust", "python"]}
             }
         }
     });
     write_config(&session, &serde_json::to_string(&config).unwrap());
 
-    let allowed = exec_in(&session, &rust, "cargo --version");
+    let allowed = exec_in(
+        &session,
+        &mixed,
+        "cargo --version && printf ':' && python --version",
+    );
     assert!(allowed.status.success(), "{}", combined(&allowed));
     assert!(combined(&allowed).contains("rust-profile-ok"));
+    assert!(combined(&allowed).contains("python-profile-ok"));
 
     let denied = exec_in(&session, &other, "printf should-not-run");
     assert!(

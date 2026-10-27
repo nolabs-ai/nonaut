@@ -75,7 +75,8 @@ conservative:
       "allow_domains": []
     },
     "filesystem": {
-      "read": []
+      "read": [],
+      "write": []
     },
     "workspaces": {}
   }
@@ -109,11 +110,12 @@ allowlist, or grant additional read-only paths. For example:
       "allow_domains": []
     },
     "filesystem": {
-      "read": ["~/.cargo/registry"]
+      "read": ["~/.cargo/registry"],
+      "write": []
     },
     "workspaces": {
       "~/Work/nono": {
-        "profile": "rust-dev",
+        "profiles": ["rust"],
         "network": {
           "mode": "allowlist",
           "allow_domains": ["index.crates.io", "static.crates.io", "github.com"]
@@ -131,7 +133,8 @@ allowlist, or grant additional read-only paths. For example:
   local proxy that checks every connection. `*.` matches subdomains; `*` on
   its own is rejected. Cloud metadata and link-local addresses are always
   denied.
-- `sandbox.filesystem.read` paths are readable, never writable.
+- `sandbox.filesystem.read` adds read-only paths and
+  `sandbox.filesystem.write` adds explicit writable paths outside a workspace.
 - `tools.timeout_seconds` (default 120, up to 3600) caps every tool call,
   command and `/exec`; raise it for long builds or test suites. When a call
   times out or is interrupted, everything it started is stopped.
@@ -141,10 +144,11 @@ allowlist, or grant additional read-only paths. For example:
 - Workspace selection uses the canonical operation path and the most specific
   configured ancestor. Commands must provide a working directory; use
   `/exec --cwd DIR COMMAND` or `nonaut exec --cwd DIR -- COMMAND`.
-- A workspace entry may select the built-in `default` or `rust-dev` profile,
+- A workspace entry may combine the built-in `rust` and `python` profiles,
   replace the global network policy, add read-only paths, and override the
-  tool timeout. `rust-dev` exposes an installed rustup toolchain without
-  inheriting ambient credentials.
+  tool timeout. Development profiles expose installed user toolchains without
+  inheriting ambient credentials and keep writable package caches in a
+  private per-workspace directory under `$XDG_CACHE_HOME/nonaut`.
 - On Linux, `allow_domains` needs Landlock network rules (Linux 6.7+); older
   kernels keep network fully blocked. Landlock limits connections by port
   rather than address, so the proxy's port is reachable on any host; a

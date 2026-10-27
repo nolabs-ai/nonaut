@@ -4,6 +4,7 @@
 //! workspace and must not be able to widen their own permissions.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -26,34 +27,41 @@ pub(crate) struct Policy {
     pub tool_timeout_seconds: u64,
     pub allow_hosts: Vec<String>,
     pub read_paths: Vec<PathBuf>,
+    pub write_paths: Vec<PathBuf>,
     pub path_entries: Vec<PathBuf>,
     pub command_home: PathBuf,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationAccess {
+    Read,
+    Write,
 }
 
 pub(crate) const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 120;
 const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3600;
 
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            workspace: PathBuf::new(),
-            network: Network::Blocked,
-            tool_timeout_seconds: DEFAULT_TOOL_TIMEOUT_SECONDS,
-            allow_hosts: Vec::new(),
-            read_paths: Vec::new(),
-            path_entries: Vec::new(),
-            command_home: PathBuf::new(),
-        }
-    }
-}
-
-pub(crate) fn load(session_root: &Path, operation: &Path, fallback_root: &Path) -> Result<Policy> {
+pub(crate) fn load(
+    session_root: &Path,
+    operation: &Path,
+    fallback_root: &Path,
+    access: OperationAccess,
+) -> Result<Policy> {
     let config = crate::config::load()?;
     let home = BaseDirs::new()
         .context("could not determine the home directory")?
         .home_dir()
         .to_path_buf();
-    resolve(config, session_root, operation, fallback_root, &home).with_context(|| {
+    resolve(
+        config,
+        session_root,
+        operation,
+        fallback_root,
+        access,
+        &home,
+    )
+    .with_context(|| {
         crate::config::config_path().map_or_else(
             |_| "invalid Nonaut configuration".to_owned(),
             |path| format!("invalid {}", path.display()),
@@ -66,6 +74,7 @@ fn resolve(
     session_root: &Path,
     operation: &Path,
     fallback_root: &Path,
+    access: OperationAccess,
     home: &Path,
 ) -> Result<Policy> {
     let session_root = canonicalize_nearest(session_root)?;
@@ -77,39 +86,65 @@ fn resolve(
         timeout_seconds: Some(config.tools.timeout_seconds),
     };
 
-    let matching = config
-        .sandbox
-        .workspaces
-        .iter()
-        .filter_map(|(path, settings)| {
-            let path = expand_home(&path.to_string_lossy(), home);
-            let path = canonicalize_nearest(&path).ok()?;
-            operation.starts_with(&path).then_some((path, settings))
-        })
-        .max_by_key(|(path, _)| path.components().count());
+    let global_read_paths = resolve_read_paths(&filesystem, home)?;
+    let global_write_paths = resolve_write_paths(&filesystem, home)?;
+
+    let mut matching = None;
+    for (configured, settings) in &config.sandbox.workspaces {
+        let configured = expand_home(&configured.to_string_lossy(), home);
+        if !configured.is_absolute() {
+            bail!(
+                "sandbox.workspaces key `{}` must be absolute or start with ~/",
+                configured.display()
+            );
+        }
+        let configured = canonicalize_nearest(&configured).with_context(|| {
+            format!(
+                "could not resolve configured workspace {}",
+                configured.display()
+            )
+        })?;
+        if operation.starts_with(&configured)
+            && matching.as_ref().is_none_or(|(current, _): &(PathBuf, _)| {
+                configured.components().count() > current.components().count()
+            })
+        {
+            matching = Some((configured, settings));
+        }
+    }
 
     let (workspace, settings) = if let Some((path, settings)) = matching {
         (path, Some(settings))
     } else {
-        if config.sandbox.unconfigured_workspaces == UnconfiguredWorkspaces::Deny {
+        let explicitly_readable = access == OperationAccess::Read
+            && global_read_paths
+                .iter()
+                .any(|path| operation.starts_with(path));
+        let explicitly_writable = access == OperationAccess::Write
+            && global_write_paths
+                .iter()
+                .any(|path| operation.starts_with(path));
+        if explicitly_readable || explicitly_writable {
+            (session_root.clone(), None)
+        } else if config.sandbox.unconfigured_workspaces == UnconfiguredWorkspaces::Deny {
             bail!(
                 "operation at {} is outside every configured workspace",
                 operation.display()
             );
-        }
-        if !operation.starts_with(&session_root) {
+        } else if !operation.starts_with(&session_root) {
             bail!(
                 "operation at {} is outside the session scope {}",
                 operation.display(),
                 session_root.display()
             );
+        } else {
+            (fallback_root, None)
         }
-        (fallback_root, None)
     };
 
-    let mut profile = None;
+    let mut profiles = &[][..];
     if let Some(extra) = settings {
-        profile = extra.profile.as_deref();
+        profiles = &extra.profiles;
         if let Some(extra_network) = &extra.network {
             network = extra_network.clone();
         }
@@ -117,6 +152,9 @@ fn resolve(
             filesystem
                 .read
                 .extend(extra_filesystem.read.iter().cloned());
+            filesystem
+                .write
+                .extend(extra_filesystem.write.iter().cloned());
         }
         if let Some(timeout) = extra
             .tools
@@ -127,7 +165,7 @@ fn resolve(
         }
     }
 
-    validate(workspace, network, filesystem, tools, profile, home)
+    validate(workspace, network, filesystem, tools, profiles, home)
 }
 
 fn validate(
@@ -135,7 +173,7 @@ fn validate(
     network: NetworkConfig,
     filesystem: FilesystemConfig,
     tools: WorkspaceToolsConfig,
-    profile: Option<&str>,
+    profiles: &[String],
     home: &Path,
 ) -> Result<Policy> {
     let network_mode = match (network.mode, network.allow_domains.is_empty()) {
@@ -166,48 +204,44 @@ fn validate(
         }
         validate_host_pattern(host).map_err(anyhow::Error::msg)?;
     }
-    let mut read_paths = filesystem
-        .read
+    let mut read_paths = resolve_read_paths(&filesystem, home)?;
+    let mut write_paths = resolve_write_paths(&filesystem, home)?;
+    let profile = crate::profiles::resolve(profiles, home, &workspace)?;
+    read_paths.extend(profile.read_paths);
+    write_paths.extend(profile.write_paths);
+    Ok(Policy {
+        command_home: workspace.clone(),
+        workspace,
+        network: network_mode,
+        tool_timeout_seconds,
+        allow_hosts: network.allow_domains,
+        read_paths,
+        write_paths,
+        path_entries: profile.path_entries,
+        environment: profile.environment,
+    })
+}
+
+fn resolve_write_paths(filesystem: &FilesystemConfig, home: &Path) -> Result<Vec<PathBuf>> {
+    resolve_paths(&filesystem.write, home, "sandbox.filesystem.write")
+}
+
+fn resolve_read_paths(filesystem: &FilesystemConfig, home: &Path) -> Result<Vec<PathBuf>> {
+    resolve_paths(&filesystem.read, home, "sandbox.filesystem.read")
+}
+
+fn resolve_paths(paths: &[String], home: &Path, setting: &str) -> Result<Vec<PathBuf>> {
+    paths
         .iter()
         .map(|raw| {
             let path = expand_home(raw, home);
             if path.is_absolute() {
                 Ok(path)
             } else {
-                bail!("sandbox.filesystem.read entry `{raw}` must be absolute or start with ~/")
+                bail!("{setting} entry `{raw}` must be absolute or start with ~/")
             }
         })
-        .collect::<Result<Vec<_>>>()?;
-    let mut path_entries = Vec::new();
-    let mut command_home = workspace.clone();
-    match profile {
-        None | Some("default") => {}
-        Some("rust-dev") => {
-            let cargo = home.join(".cargo");
-            for path in [
-                cargo.join("bin"),
-                cargo.join("registry"),
-                cargo.join("git"),
-                home.join(".rustup"),
-            ] {
-                if path.exists() {
-                    read_paths.push(path);
-                }
-            }
-            path_entries.push(cargo.join("bin"));
-            command_home = home.to_path_buf();
-        }
-        Some(profile) => bail!("unsupported workspace profile `{profile}`"),
-    }
-    Ok(Policy {
-        workspace,
-        network: network_mode,
-        tool_timeout_seconds,
-        allow_hosts: network.allow_domains,
-        read_paths,
-        path_entries,
-        command_home,
-    })
+        .collect()
 }
 
 fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
@@ -252,6 +286,7 @@ mod tests {
             workspace,
             workspace,
             workspace,
+            OperationAccess::Write,
             home,
         )
     }
@@ -402,6 +437,7 @@ mod tests {
             Path::new("/work"),
             Path::new("/work/nono/src/main.rs"),
             Path::new("/work/nono/src"),
+            OperationAccess::Write,
             Path::new("/home/me"),
         )
         .unwrap();
@@ -424,8 +460,77 @@ mod tests {
             Path::new("/work"),
             Path::new("/work/other/file"),
             Path::new("/work/other"),
+            OperationAccess::Write,
             Path::new("/home/me"),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn explicit_external_reads_work_without_granting_external_writes() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "sandbox": {
+                    "unconfigured_workspaces": "deny",
+                    "filesystem": {"read": ["/outside"]}
+                }
+            }"#,
+        )
+        .unwrap();
+        let read = resolve(
+            config.clone(),
+            Path::new("/work"),
+            Path::new("/outside/file"),
+            Path::new("/outside"),
+            OperationAccess::Read,
+            Path::new("/home/me"),
+        )
+        .unwrap();
+        assert_eq!(read.workspace, PathBuf::from("/work"));
+        assert_eq!(read.read_paths, [PathBuf::from("/outside")]);
+        assert!(
+            resolve(
+                config,
+                Path::new("/work"),
+                Path::new("/outside/file"),
+                Path::new("/outside"),
+                OperationAccess::Write,
+                Path::new("/home/me"),
+            )
+            .is_err()
+        );
+
+        let writable: Config = serde_json::from_str(
+            r#"{
+                "sandbox": {
+                    "unconfigured_workspaces": "deny",
+                    "filesystem": {"write": ["/outside"]}
+                }
+            }"#,
+        )
+        .unwrap();
+        let write = resolve(
+            writable,
+            Path::new("/work"),
+            Path::new("/outside/file"),
+            Path::new("/outside"),
+            OperationAccess::Write,
+            Path::new("/home/me"),
+        )
+        .unwrap();
+        assert_eq!(write.write_paths, [PathBuf::from("/outside")]);
+    }
+
+    #[test]
+    fn relative_workspace_keys_are_rejected() {
+        let result = resolve(
+            serde_json::from_str(r#"{"sandbox":{"workspaces":{"relative/path":{}}}}"#).unwrap(),
+            Path::new("/work"),
+            Path::new("/work/file"),
+            Path::new("/work"),
+            OperationAccess::Read,
+            Path::new("/home/me"),
+        );
+        assert!(result.unwrap_err().to_string().contains("must be absolute"));
     }
 }

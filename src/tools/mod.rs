@@ -1,5 +1,4 @@
 use std::{
-    ffi::OsString,
     fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
@@ -7,142 +6,35 @@ use std::{
     time::Duration,
 };
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
 use anyhow::{Context, Result, anyhow, bail};
 use diffy::create_patch;
 use directories::BaseDirs;
-use nono::{AccessMode, CapabilitySet, Sandbox};
 
-use crate::policy::Network;
+use crate::policy::OperationAccess;
 use serde_json::{Value, json};
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::io::AsyncWriteExt;
 
 const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
 const MAX_DIFF_BYTES: usize = 16 * 1024;
 
-pub fn specs() -> Value {
-    json!([
-        {
-            "type": "function",
-            "name": "read_file",
-            "description": "Attempt to read a UTF-8 text file, optionally limiting the inclusive line range. Pass the requested path to nono and let nono decide whether access is allowed; do not predict policy.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; nono enforces access." },
-                    "start_line": { "type": "integer", "minimum": 1 },
-                    "end_line": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "list_directory",
-            "description": "Attempt to list a directory. Pass the requested path to nono even when it appears outside the workspace; nono alone decides whether access is allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Directory path to attempt; use . for the workspace root. Nono enforces access." },
-                    "depth": { "type": "integer", "minimum": 1, "maximum": 8 }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "write_file",
-            "description": "Create or replace one UTF-8 text file and return a compact unified diff. Always call this tool for direct file creation or full-content replacement, including paths that appear outside the workspace. Do not predict policy; nono alone decides whether access is allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; Nonaut normalizes it and nono enforces access." },
-                    "content": { "type": "string", "description": "Complete replacement file contents." }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "search_files",
-            "description": "Attempt to search text files with ripgrep. The query is a regular expression. Pass the requested path to nono and let nono decide whether access is allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" },
-                    "path": { "type": "string", "description": "Search root to attempt; defaults to . and nono enforces access." },
-                    "glob": { "type": "string", "description": "Optional ripgrep glob, such as *.rs." }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "edit_file",
-            "description": "Edit a UTF-8 text file by replacing exact text and return a compact unified diff. Call this after at most one read when the user requests a focused patch or edit. Nono alone decides whether access is allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; nono enforces access." },
-                    "old_text": { "type": "string", "description": "Exact existing text to replace." },
-                    "new_text": { "type": "string", "description": "Replacement text." },
-                    "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of requiring exactly one; defaults to false." }
-                },
-                "required": ["path", "old_text", "new_text"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "delete_file",
-            "description": "Delete one file and return a compact unified diff. Always call this tool for an explicitly requested deletion, even when the path appears outside the workspace. Nono alone decides whether access is allowed.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to attempt. Relative paths start at the workspace; nono enforces access." }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "type": "function",
-            "name": "run_command",
-            "description": "Run a program under the policy selected by its explicit working directory. Always make an explicitly requested attempt and report the actual result instead of predicting a denial. The fresh nono sandbox grants only the matching workspace, its network policy, and no inherited secrets.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "program": { "type": "string", "description": "Executable name, such as cargo, git, or sh." },
-                    "args": { "type": "array", "items": { "type": "string" } },
-                    "cwd": { "type": "string", "description": "Working directory used to select the operation's workspace policy. Relative paths start at the session directory." },
-                    "timeout_seconds": { "type": "integer", "minimum": 1, "description": "Optional; capped by the user's tool timeout (default 120 seconds)." }
-                },
-                "required": ["program", "args", "cwd"],
-                "additionalProperties": false
-            }
-        }
-    ])
-}
+mod catalog;
+mod sandbox;
+
+pub(crate) use catalog::specs;
 
 pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
     let arguments = normalize_tool_paths(workspace, tool, arguments)?;
-    let (operation, fallback_root) = operation_location(workspace, tool, &arguments)?;
-    let policy = crate::policy::load(workspace, &operation, &fallback_root)?;
+    let (operation, fallback_root, access) = operation_location(workspace, tool, &arguments)?;
+    let policy = crate::policy::load(workspace, &operation, &fallback_root, access)?;
     let operation_workspace = policy.workspace.clone();
     if tool == "run_command" {
         return run_command(&operation_workspace, &arguments, &policy).await;
     }
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox_process(&operation_workspace, &executable, &policy)?;
+    let mut child = sandbox::process(&operation_workspace, &executable, &policy)?;
     child
         .arg("tool")
         .arg(&operation_workspace)
@@ -195,10 +87,10 @@ fn operation_location(
     session_root: &Path,
     tool: &str,
     arguments: &Value,
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<(PathBuf, PathBuf, OperationAccess)> {
     if tool == "run_command" {
         let cwd = PathBuf::from(required_string(arguments, "cwd")?);
-        return Ok((cwd.clone(), cwd));
+        return Ok((cwd.clone(), cwd, OperationAccess::Write));
     }
     let path = arguments
         .get("path")
@@ -210,7 +102,12 @@ fn operation_location(
     } else {
         path.parent().unwrap_or(session_root).to_path_buf()
     };
-    Ok((path, fallback))
+    let access = if matches!(tool, "read_file" | "list_directory" | "search_files") {
+        OperationAccess::Read
+    } else {
+        OperationAccess::Write
+    };
+    Ok((path, fallback, access))
 }
 
 fn normalize_tool_paths(workspace: &Path, tool: &str, arguments: &Value) -> Result<Value> {
@@ -370,7 +267,7 @@ async fn run_command(
         .clamp(1, limit);
 
     let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut command = sandbox_process(workspace, &executable, policy)?;
+    let mut command = sandbox::process(workspace, &executable, policy)?;
     command
         .arg("command")
         .arg(workspace)
@@ -418,115 +315,6 @@ impl Drop for ProcessGroup {
             );
         }
     }
-}
-
-// Set by the parent from the policy file; read by the sandbox child before
-// it applies the sandbox. The child cannot change the parent's copy.
-const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
-const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
-const READ_PATHS_ENV: &str = "NONAUT_READ_PATHS";
-const COMMAND_PATH_ENV: &str = "NONAUT_COMMAND_PATH";
-const COMMAND_HOME_ENV: &str = "NONAUT_COMMAND_HOME";
-
-fn sandbox_process(
-    workspace: &Path,
-    executable: &Path,
-    policy: &crate::policy::Policy,
-) -> Result<Command> {
-    let mut command = Command::new(executable);
-    // Its own process group, so a timeout or interrupt can stop everything
-    // the tool started, not just the direct child.
-    #[cfg(unix)]
-    command.process_group(0);
-    command
-        .arg("__nonaut_sandbox")
-        .env_clear()
-        .env("PATH", policy_path(policy))
-        .env("HOME", &policy.command_home)
-        .env("TMPDIR", workspace)
-        .env("LANG", "C.UTF-8")
-        .env("TERM", "dumb")
-        .current_dir(workspace);
-    match policy.network {
-        Network::Open => {}
-        Network::Blocked => {
-            command.env(NETWORK_BLOCKED_ENV, "1");
-        }
-        Network::Allowlist => {
-            let port = crate::proxy::ensure(&policy.allow_hosts)?;
-            command.env(PROXY_PORT_ENV, port.to_string());
-        }
-    }
-    if !policy.read_paths.is_empty() {
-        let paths = policy
-            .read_paths
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n");
-        command.env(READ_PATHS_ENV, paths);
-    }
-    command
-        .env(COMMAND_PATH_ENV, policy_path(policy))
-        .env(COMMAND_HOME_ENV, &policy.command_home);
-    Ok(command)
-}
-
-#[cfg(target_os = "linux")]
-fn landlock_filters_network() -> bool {
-    nono::sandbox::detect_abi().is_ok_and(|abi| abi.has_network())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn landlock_filters_network() -> bool {
-    true
-}
-
-fn proxy_port() -> Option<u16> {
-    std::env::var(PROXY_PORT_ENV).ok()?.parse().ok()
-}
-
-fn safe_path() -> String {
-    let entries = [
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
-        "/usr/local/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/bin",
-        "/sbin",
-    ]
-    .into_iter()
-    .map(PathBuf::from)
-    .filter(|entry| entry.is_dir());
-    std::env::join_paths(entries)
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn policy_path(policy: &crate::policy::Policy) -> String {
-    let base = safe_path();
-    let entries = policy
-        .path_entries
-        .iter()
-        .cloned()
-        .chain(base.split(':').map(PathBuf::from));
-    std::env::join_paths(entries)
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn command_path() -> String {
-    std::env::var(COMMAND_PATH_ENV).unwrap_or_else(|_| safe_path())
-}
-
-fn command_home(workspace: &Path) -> PathBuf {
-    std::env::var_os(COMMAND_HOME_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.to_path_buf())
 }
 
 fn output_result(name: &str, output: std::process::Output) -> Result<String> {
@@ -589,271 +377,7 @@ fn truncate(value: &str) -> String {
 }
 
 pub fn run_sandbox() -> Result<()> {
-    let mut arguments = std::env::args_os().skip(2);
-    let mode = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .context("sandbox mode was not provided")?;
-    let workspace = PathBuf::from(
-        arguments
-            .next()
-            .context("sandbox workspace was not provided")?,
-    );
-    let capabilities = sandbox_capabilities(&workspace)?;
-    #[cfg(target_os = "linux")]
-    {
-        let fallback =
-            Sandbox::apply_auto(&capabilities).context("could not apply the nono sandbox")?;
-        // A proxy-only fallback needs a seccomp supervisor nonaut does not
-        // run; refuse rather than continue with network unrestricted.
-        anyhow::ensure!(
-            !matches!(
-                fallback,
-                nono::sandbox::SeccompNetFallback::ProxyOnly { .. }
-            ),
-            "the nono sandbox could not restrict network on this kernel"
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    Sandbox::apply_auto(&capabilities).context("could not apply the nono sandbox")?;
-
-    match mode.as_str() {
-        "tool" => {
-            let tool = arguments
-                .next()
-                .and_then(|value| value.into_string().ok())
-                .context("sandboxed tool name was not provided")?;
-            run_tool_worker(&workspace, &tool)
-        }
-        "command" => run_sandboxed_command(&workspace, arguments.collect()),
-        _ => bail!("unknown sandbox mode `{mode}`"),
-    }
-}
-
-fn sandbox_capabilities(workspace: &Path) -> Result<CapabilitySet> {
-    // Network is open unless the policy blocks it or limits it to nonaut's
-    // filtering proxy.
-    let mut capabilities = match proxy_port() {
-        Some(port) if landlock_filters_network() => CapabilitySet::new().proxy_only(port),
-        Some(_) => {
-            // Without Landlock network rules (Linux < 6.7) nono cannot pin
-            // connections to the proxy port, so fail closed.
-            eprintln!(
-                "nonaut: this kernel cannot limit network to the policy proxy \
-                 (needs Linux 6.7+); network stays blocked"
-            );
-            CapabilitySet::new().block_network()
-        }
-        None if std::env::var_os(NETWORK_BLOCKED_ENV).is_some() => {
-            CapabilitySet::new().block_network()
-        }
-        None => CapabilitySet::new(),
-    };
-    for path in std::env::var(READ_PATHS_ENV).unwrap_or_default().lines() {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
-    }
-    for path in system_read_paths() {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
-    }
-    for path in system_write_paths() {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Write)?;
-    }
-    for path in command_path().split(':') {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
-    }
-    capabilities = capabilities
-        .allow_path(workspace, AccessMode::ReadWrite)
-        .context("could not grant workspace access")?;
-    Ok(capabilities)
-}
-
-fn allow_existing(
-    capabilities: CapabilitySet,
-    path: &Path,
-    access: AccessMode,
-) -> Result<CapabilitySet> {
-    if path.is_dir() {
-        capabilities
-            .allow_path(path, access)
-            .with_context(|| format!("could not grant access to {}", path.display()))
-    } else if fs::canonicalize(path).is_ok() {
-        // /dev/stdin etc. resolve to pipe:[N] when stdio is piped, which nono
-        // cannot canonicalize. Inherited descriptors need no grant, so skip.
-        capabilities
-            .allow_file(path, access)
-            .with_context(|| format!("could not grant access to {}", path.display()))
-    } else {
-        Ok(capabilities)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn system_read_paths() -> &'static [&'static str] {
-    &[
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/local/bin",
-        "/usr/lib",
-        "/usr/local/lib",
-        "/usr/share",
-        "/System/Library",
-        "/Library",
-        "/dev",
-        "/private/var/db",
-        "/private/etc",
-        "/usr/share/zoneinfo",
-        "/usr/share/locale",
-        "/var/db/timezone",
-        "/usr/share/terminfo",
-        "/var",
-        "/private/var",
-        "/private",
-        "/tmp",
-        "/System/Volumes",
-        "/System/Cryptexes",
-        "/Applications",
-        "/cores",
-        "/opt",
-        "/run",
-        "/nix",
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn system_read_paths() -> &'static [&'static str] {
-    &[
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/usr/sbin",
-        "/usr/local/bin",
-        "/lib",
-        "/lib64",
-        "/lib/x86_64-linux-gnu",
-        "/lib/aarch64-linux-gnu",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/local/lib",
-        "/etc/resolv.conf",
-        "/etc/hosts",
-        "/etc/nsswitch.conf",
-        "/etc/gai.conf",
-        "/etc/group",
-        "/etc/ssl",
-        "/etc/pki",
-        "/etc/ca-certificates",
-        "/etc/ld.so.cache",
-        "/etc/ld.so.conf",
-        "/etc/ld.so.conf.d",
-        "/etc/localtime",
-        "/etc/timezone",
-        "/etc/alternatives",
-        "/etc/os-release",
-        "/etc/passwd",
-        "/etc/services",
-        "/usr/share",
-        "/usr/share/locale",
-        "/usr/share/zoneinfo",
-        "/usr/share/terminfo",
-        "/usr/share/ca-certificates",
-        "/lib/terminfo",
-        "/etc/terminfo",
-        "/dev/null",
-        "/dev/zero",
-        "/dev/random",
-        "/dev/urandom",
-        "/dev/full",
-        "/dev/tty",
-        "/dev/stdin",
-        "/dev/stdout",
-        "/dev/stderr",
-        "/dev/fd",
-        "/dev/pts",
-        "/proc/self",
-        "/proc/cpuinfo",
-        "/proc/meminfo",
-        "/proc/stat",
-        "/proc/loadavg",
-        "/proc/version",
-        "/proc/filesystems",
-    ]
-}
-
-#[cfg(target_os = "macos")]
-fn system_write_paths() -> &'static [&'static str] {
-    &[
-        "/private/tmp",
-        "/tmp",
-        "/private/var/folders",
-        "/var/folders",
-        "/dev",
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn system_write_paths() -> &'static [&'static str] {
-    &[
-        "/tmp",
-        "/dev/null",
-        "/dev/zero",
-        "/dev/full",
-        "/dev/tty",
-        "/dev/stdout",
-        "/dev/stderr",
-        "/dev/fd",
-        "/dev/pts",
-        "/proc/self/fd",
-    ]
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn system_read_paths() -> &'static [&'static str] {
-    &[]
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn system_write_paths() -> &'static [&'static str] {
-    &[]
-}
-
-#[cfg(unix)]
-fn run_sandboxed_command(_workspace: &Path, arguments: Vec<OsString>) -> Result<()> {
-    let mut arguments = arguments.into_iter();
-    let workdir = PathBuf::from(
-        arguments
-            .next()
-            .context("sandboxed command working directory was not provided")?,
-    );
-    let program = arguments
-        .next()
-        .context("sandboxed command program was not provided")?;
-    let mut command = std::process::Command::new(&program);
-    command
-        .args(arguments)
-        .current_dir(workdir)
-        .env_clear()
-        .env("PATH", command_path())
-        .env("HOME", command_home(_workspace))
-        .env("TMPDIR", _workspace)
-        .env("LANG", "C.UTF-8")
-        .env("TERM", "dumb");
-    if let Some(port) = proxy_port() {
-        let proxy = format!("http://127.0.0.1:{port}");
-        for name in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"] {
-            command.env(name, &proxy);
-        }
-    }
-    let error = command.exec();
-    Err(error).with_context(|| format!("could not execute `{}`", program.to_string_lossy()))
-}
-
-#[cfg(not(unix))]
-fn run_sandboxed_command(_workspace: &Path, _arguments: Vec<OsString>) -> Result<()> {
-    bail!("sandboxed commands are only supported on Unix platforms")
+    sandbox::run()
 }
 
 fn run_tool_worker(workspace: &Path, tool: &str) -> Result<()> {

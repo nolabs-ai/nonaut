@@ -127,13 +127,13 @@ pub(crate) enum NetworkMode {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct FilesystemConfig {
     pub read: Vec<String>,
+    pub write: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct WorkspaceConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
+    pub profiles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]

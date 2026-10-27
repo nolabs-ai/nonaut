@@ -2,10 +2,7 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -17,7 +14,7 @@ use nono::undo::ChangeType;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
@@ -30,116 +27,21 @@ use tokio::{
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 mod changes;
+mod commands;
+mod theme;
+
+use commands::{SLASH_COMMANDS, SlashCommand, parse_exec};
+use theme::{Theme, palette, select as select_theme, selected as theme};
 
 use crate::{
     config::{
-        load_model, load_reasoning, load_theme, save_default_provider, save_model, save_reasoning,
-        save_theme,
+        load_model, load_reasoning, save_default_provider, save_model, save_reasoning, save_theme,
     },
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
     undo::Undo,
 };
 
-struct Palette {
-    background: Color,
-    surface: Color,
-    foreground: Color,
-    muted: Color,
-    border: Color,
-    accent: Color,
-    added: Color,
-    removed: Color,
-}
-
-// One accent; everything else greyscale except diffs and failures.
-// Text colours meet 4.5:1 against their background in both themes.
-const DARK: Palette = Palette {
-    background: Color::Rgb(0, 0, 0),
-    surface: Color::Rgb(14, 14, 14),
-    foreground: Color::Rgb(237, 237, 237),
-    muted: Color::Rgb(163, 163, 163),
-    border: Color::Rgb(51, 51, 51),
-    accent: Color::Rgb(232, 115, 74),
-    added: Color::Rgb(62, 245, 140),
-    removed: Color::Rgb(255, 69, 69),
-};
-
-const LIGHT: Palette = Palette {
-    background: Color::Rgb(255, 255, 255),
-    surface: Color::Rgb(242, 242, 242),
-    foreground: Color::Rgb(26, 26, 26),
-    muted: Color::Rgb(64, 64, 64),
-    border: Color::Rgb(208, 208, 208),
-    // The dark-theme orange is 3.0:1 on white; this one is 4.7:1.
-    accent: Color::Rgb(196, 80, 27),
-    added: Color::Rgb(0, 135, 58),
-    removed: Color::Rgb(217, 0, 27),
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-enum Theme {
-    Dark,
-    Light,
-}
-
-impl Theme {
-    const ALL: [Self; 2] = [Self::Dark, Self::Light];
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Dark => "dark",
-            Self::Light => "light",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Dark => "dark background with light text",
-            Self::Light => "light background with dark text",
-        }
-    }
-
-    const fn palette(self) -> &'static Palette {
-        match self {
-            Self::Dark => &DARK,
-            Self::Light => &LIGHT,
-        }
-    }
-
-    fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|theme| theme.name().eq_ignore_ascii_case(name))
-    }
-}
-
-const DEFAULT_THEME: Theme = Theme::Dark;
-
-// Chosen at startup from NONAUT_THEME or the saved setting, then by /theme.
-static THEME: AtomicU8 = AtomicU8::new(DEFAULT_THEME as u8);
-
-fn theme() -> Theme {
-    match THEME.load(Ordering::Relaxed) {
-        value if value == Theme::Light as u8 => Theme::Light,
-        _ => DEFAULT_THEME,
-    }
-}
-
-fn palette() -> &'static Palette {
-    theme().palette()
-}
-
-/// NONAUT_THEME wins over the saved /theme choice; dark is the default.
-pub(crate) fn init_theme() {
-    let selected = std::env::var("NONAUT_THEME")
-        .ok()
-        .or_else(|| load_theme().ok().flatten())
-        .as_deref()
-        .and_then(Theme::from_name)
-        .unwrap_or(DEFAULT_THEME);
-    THEME.store(selected as u8, Ordering::Relaxed);
-}
+pub(crate) use theme::init as init_theme;
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const BRAND_MARK: &str = "⎔";
@@ -149,108 +51,11 @@ const PROMPT_MAX_LINES: usize = 10;
 const PROMPT_HISTORY_LIMIT: usize = 500;
 const CHANGES_REFRESH: Duration = Duration::from_secs(2);
 
-fn parse_exec(session_root: &std::path::Path, input: &str) -> Result<(PathBuf, String), String> {
-    let (cwd, command) = if let Some(rest) = input.strip_prefix("--cwd ") {
-        let (cwd, command) = rest
-            .trim_start()
-            .split_once(char::is_whitespace)
-            .ok_or_else(|| "--cwd needs a directory followed by a command".to_owned())?;
-        let cwd = PathBuf::from(cwd);
-        let cwd = if cwd.is_absolute() {
-            cwd
-        } else {
-            session_root.join(cwd)
-        };
-        (cwd, command.trim())
-    } else {
-        (session_root.to_path_buf(), input.trim())
-    };
-    if command.is_empty() {
-        return Err("command may not be empty".to_owned());
-    }
-    Ok((cwd, command.to_owned()))
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceView {
     Agent,
     Changes,
 }
-
-#[derive(Clone, Copy)]
-struct SlashCommand {
-    name: &'static str,
-    description: &'static str,
-    visible: bool,
-}
-
-const SLASH_COMMANDS: [SlashCommand; 13] = [
-    SlashCommand {
-        name: "/provider",
-        description: "choose or reconnect a provider",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/model",
-        description: "choose a provider model",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/reasoning",
-        description: "choose model reasoning effort",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/new",
-        description: "start a fresh session",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/exec",
-        description: "run a command directly in nono",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/clear",
-        description: "clear the screen",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/undo",
-        description: "restore files to before the last turn",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/theme",
-        description: "choose the interface theme",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/help",
-        description: "show available commands",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/detach",
-        description: "keep this session running and detach",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/q",
-        description: "leave nonaut",
-        visible: true,
-    },
-    SlashCommand {
-        name: "/quit",
-        description: "leave nonaut",
-        visible: false,
-    },
-    SlashCommand {
-        name: "/exit",
-        description: "leave nonaut",
-        visible: false,
-    },
-];
 
 #[derive(Clone, Copy)]
 struct NonautMarkdown;
@@ -1961,7 +1766,7 @@ impl App {
     }
 
     fn apply_theme(&mut self, selected: Theme) {
-        THEME.store(selected as u8, Ordering::Relaxed);
+        select_theme(selected);
         // The prompt caches its styles, so rebuild it with the new palette.
         self.input = Self::new_input();
         let name = selected.name();
@@ -2562,10 +2367,13 @@ mod tests {
 
     #[test]
     fn theme_flag_selects_the_palette() {
-        THEME.store(Theme::Light as u8, Ordering::Relaxed);
-        assert_eq!(palette().background, Color::Rgb(255, 255, 255));
-        THEME.store(Theme::Dark as u8, Ordering::Relaxed);
-        assert_eq!(palette().background, Color::Rgb(0, 0, 0));
+        select_theme(Theme::Light);
+        assert_eq!(
+            palette().background,
+            ratatui::style::Color::Rgb(255, 255, 255)
+        );
+        select_theme(Theme::Dark);
+        assert_eq!(palette().background, ratatui::style::Color::Rgb(0, 0, 0));
     }
 
     #[test]
