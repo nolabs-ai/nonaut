@@ -10,12 +10,44 @@ cd nonaut
 make run
 ```
 
-The default build excludes enrollment and audit shipping. Include the optional
-control-plane crate with:
+The default build includes every provider and excludes enrollment and audit
+shipping. Include the optional control-plane crate with:
 
 ```sh
 cargo build --features control-plane
 ```
+
+### Select providers
+
+Official release binaries include all providers. Source builds can exclude the
+default set and enable only the required providers:
+
+```sh
+cargo build --release --no-default-features \
+  --features provider-codex,provider-gemini
+```
+
+Available provider features are:
+
+- `provider-codex`
+- `provider-claude`
+- `provider-gemini`
+- `provider-copilot`
+- `provider-openrouter`
+- `provider-ollama`
+- `provider-openai-compatible`
+
+Features compose normally. For example, a selective build can also include
+the control plane:
+
+```sh
+cargo build --release --no-default-features \
+  --features provider-claude,provider-copilot,control-plane
+```
+
+To build a release tag, check out that tag before running the same command.
+Only compiled providers appear in the provider picker, and dependencies used
+solely by omitted providers are not built.
 
 ## Development commands
 

@@ -94,9 +94,27 @@ toolchain for one project, and allows Cargo to reach crates.io:
 ### Agent and UI
 
 - `ui.theme` selects the TUI palette.
-- `agent.provider` is `codex` or `claude` when a default has been saved.
+- `agent.provider` stores the successfully connected provider ID.
 - `agent.providers.<provider>.model` stores the selected provider model.
 - `agent.providers.<provider>.reasoning` stores its reasoning effort.
+- `agent.providers.<provider>.base_url` overrides an OpenAI-compatible endpoint.
+- `agent.providers.<provider>.api_key_env` names the environment variable that
+  contains its API key. Secrets are never stored in the configuration file.
+
+For example, a custom OpenAI-compatible service can be configured as:
+
+```json
+"agent": {
+  "provider": "openai-compatible",
+  "providers": {
+    "openai-compatible": {
+      "base_url": "https://api.example.com/v1",
+      "api_key_env": "EXAMPLE_API_KEY",
+      "model": "example-model"
+    }
+  }
+}
+```
 
 ### Tools
 

@@ -2,12 +2,15 @@
 
 ## Requirements
 
-Nonaut supports Linux and macOS on x86-64 and ARM64. A provider also requires
-its official command-line client:
+Nonaut supports Linux and macOS on x86-64 and ARM64. Provider requirements are:
 
 - Codex uses the `codex` app server and an existing ChatGPT/Codex login.
 - Claude uses the `claude` CLI and a Claude subscription login. An
   `ANTHROPIC_API_KEY` is supported as a fallback.
+- Gemini uses `GEMINI_API_KEY`.
+- GitHub Copilot uses an installed, authenticated `copilot` CLI.
+- OpenRouter uses `OPENROUTER_API_KEY`; Ollama uses its local server by default.
+- Custom OpenAI-compatible endpoints are configured in `config.json`.
 
 Nono 0.80 is embedded in Nonaut and does not need to be installed separately.
 
@@ -39,9 +42,9 @@ cd path/to/project
 nonaut
 ```
 
-Select a provider on first launch. If authentication is needed, Nonaut starts
-the provider's normal login flow. The provider choice is persisted only after
-the connection succeeds.
+Select a provider on first launch. CLI-backed providers use their existing
+login, while API-backed providers read credentials from environment variables.
+The provider choice is persisted only after the connection succeeds.
 
 Nonaut grants tools read/write access to the starting workspace, blocks
 network access, and hides the real user home by default. Use a development

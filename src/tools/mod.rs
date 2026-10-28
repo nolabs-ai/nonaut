@@ -61,6 +61,10 @@ impl ToolContext {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(any(feature = "provider-codex", feature = "control-plane", test)),
+    allow(dead_code)
+)]
 pub(crate) struct ToolFailure {
     pub reason: &'static str,
     pub exit_code: Option<i32>,

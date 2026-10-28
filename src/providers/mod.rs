@@ -1,6 +1,13 @@
+#[cfg(feature = "provider-claude")]
 mod claude;
+#[cfg(feature = "provider-claude")]
 mod claude_code;
+#[cfg(feature = "provider-codex")]
 mod codex;
+#[cfg(feature = "provider-copilot")]
+mod copilot;
+#[cfg(feature = "provider-openai-compatible-core")]
+mod openai_compatible;
 
 use std::path::Path;
 
@@ -9,9 +16,16 @@ use tokio::sync::mpsc;
 
 use crate::tools::ToolContext;
 
+#[cfg(feature = "provider-claude")]
 use claude::ClaudeApi;
+#[cfg(feature = "provider-claude")]
 use claude_code::ClaudeCode;
+#[cfg(feature = "provider-codex")]
 use codex::Codex;
+#[cfg(feature = "provider-copilot")]
+use copilot::Copilot;
+#[cfg(feature = "provider-openai-compatible-core")]
+use openai_compatible::OpenAiCompatible;
 
 pub(crate) const BASE_INSTRUCTIONS: &str = "You are the coding model inside Nonaut, a security-first agent harness. Use the provided tools to inspect and modify files and verify your work. Prefer the dedicated read_file, write_file, edit_file, and delete_file tools over run_command.";
 
@@ -63,15 +77,40 @@ fn project_instructions(cwd: &Path) -> Option<(&'static str, String)> {
 pub enum ProviderKind {
     Codex,
     Claude,
+    Gemini,
+    Copilot,
+    OpenRouter,
+    Ollama,
+    OpenAiCompatible,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+    pub const ALL: &'static [Self] = &[
+        #[cfg(feature = "provider-codex")]
+        Self::Codex,
+        #[cfg(feature = "provider-claude")]
+        Self::Claude,
+        #[cfg(feature = "provider-gemini")]
+        Self::Gemini,
+        #[cfg(feature = "provider-copilot")]
+        Self::Copilot,
+        #[cfg(feature = "provider-openrouter")]
+        Self::OpenRouter,
+        #[cfg(feature = "provider-ollama")]
+        Self::Ollama,
+        #[cfg(feature = "provider-openai-compatible")]
+        Self::OpenAiCompatible,
+    ];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::OpenRouter => "openrouter",
+            Self::Ollama => "ollama",
+            Self::OpenAiCompatible => "openai-compatible",
         }
     }
 
@@ -79,6 +118,11 @@ impl ProviderKind {
         match self {
             Self::Codex => "Codex / ChatGPT",
             Self::Claude => "Claude / Anthropic",
+            Self::Gemini => "Gemini / Google",
+            Self::Copilot => "GitHub Copilot",
+            Self::OpenRouter => "OpenRouter",
+            Self::Ollama => "Ollama",
+            Self::OpenAiCompatible => "OpenAI-compatible API",
         }
     }
 
@@ -86,6 +130,11 @@ impl ProviderKind {
         match self {
             Self::Codex => "Existing Codex account · tools isolated by nono",
             Self::Claude => "Claude subscription or API key · tools isolated by nono",
+            Self::Gemini => "Gemini API key · tools isolated by nono",
+            Self::Copilot => "Existing Copilot subscription · tools isolated by nono",
+            Self::OpenRouter => "Many hosted models through one API key",
+            Self::Ollama => "Local or Ollama cloud models",
+            Self::OpenAiCompatible => "Custom compatible endpoint",
         }
     }
 
@@ -93,14 +142,29 @@ impl ProviderKind {
         match self {
             Self::Codex => "Browser sign-in opens if needed.",
             Self::Claude => "Browser sign-in opens if needed.",
+            Self::Gemini => "Uses GEMINI_API_KEY.",
+            Self::Copilot => "Uses the installed `copilot` CLI login.",
+            Self::OpenRouter => "Uses OPENROUTER_API_KEY.",
+            Self::Ollama => "Uses the local Ollama server by default.",
+            Self::OpenAiCompatible => "Configure base_url and api_key_env first.",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self> {
-        match value.trim() {
-            "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::Claude),
+        let provider = match value.trim() {
+            "codex" => Self::Codex,
+            "claude" => Self::Claude,
+            "gemini" => Self::Gemini,
+            "copilot" => Self::Copilot,
+            "openrouter" => Self::OpenRouter,
+            "ollama" => Self::Ollama,
+            "openai-compatible" => Self::OpenAiCompatible,
             value => anyhow::bail!("unknown saved provider `{value}`"),
+        };
+        if Self::ALL.contains(&provider) {
+            Ok(provider)
+        } else {
+            anyhow::bail!("provider `{}` is not included in this build", provider.id())
         }
     }
 }
@@ -139,15 +203,27 @@ pub enum ProviderEvent {
 
 #[derive(Clone)]
 pub enum Provider {
+    #[allow(dead_code)]
+    Disabled,
+    #[cfg(feature = "provider-codex")]
     Codex(Codex),
+    #[cfg(feature = "provider-claude")]
     ClaudeApi(ClaudeApi),
+    #[cfg(feature = "provider-claude")]
     ClaudeCode(ClaudeCode),
+    #[cfg(feature = "provider-copilot")]
+    Copilot(Copilot),
+    #[cfg(feature = "provider-openai-compatible-core")]
+    OpenAiCompatible(OpenAiCompatible),
 }
 
 impl Provider {
     pub async fn connect(kind: ProviderKind, cwd: &Path) -> Result<Self> {
+        #[allow(unreachable_patterns)]
         match kind {
+            #[cfg(feature = "provider-codex")]
             ProviderKind::Codex => Codex::connect(cwd).await.map(Self::Codex),
+            #[cfg(feature = "provider-claude")]
             ProviderKind::Claude => {
                 if ClaudeCode::is_logged_in().await
                     || std::env::var_os("ANTHROPIC_API_KEY").is_none()
@@ -157,46 +233,108 @@ impl Provider {
                     ClaudeApi::connect(cwd).await.map(Self::ClaudeApi)
                 }
             }
+            #[cfg(feature = "provider-copilot")]
+            ProviderKind::Copilot => Copilot::connect(cwd).await.map(Self::Copilot),
+            #[cfg(feature = "provider-gemini")]
+            ProviderKind::Gemini => OpenAiCompatible::connect(kind, cwd)
+                .await
+                .map(Self::OpenAiCompatible),
+            #[cfg(feature = "provider-openrouter")]
+            ProviderKind::OpenRouter => OpenAiCompatible::connect(kind, cwd)
+                .await
+                .map(Self::OpenAiCompatible),
+            #[cfg(feature = "provider-ollama")]
+            ProviderKind::Ollama => OpenAiCompatible::connect(kind, cwd)
+                .await
+                .map(Self::OpenAiCompatible),
+            #[cfg(feature = "provider-openai-compatible")]
+            ProviderKind::OpenAiCompatible => OpenAiCompatible::connect(kind, cwd)
+                .await
+                .map(Self::OpenAiCompatible),
+            _ => {
+                let _ = cwd;
+                anyhow::bail!("provider `{}` is not included in this build", kind.id())
+            }
         }
     }
 
     pub fn model(&self) -> Model {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.model(),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.model(),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.model(),
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.model(),
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.model(),
         }
     }
 
     pub fn models(&self) -> &[Model] {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.models(),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.models(),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.models(),
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.models(),
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.models(),
         }
     }
 
     pub fn select_model(&self, model_id: &str) -> Result<Model> {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.select_model(model_id),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.select_model(model_id),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.select_model(model_id),
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.select_model(model_id),
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.select_model(model_id),
         }
     }
 
     pub fn select_reasoning_effort(&self, effort: &str) -> Result<String> {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.select_reasoning_effort(effort),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.select_reasoning_effort(effort),
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.select_reasoning_effort(effort),
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.select_reasoning_effort(effort),
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.select_reasoning_effort(effort),
         }
     }
 
     pub async fn new_session(&self) -> Result<()> {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.new_session().await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.new_session().await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.new_session().await,
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.new_session().await,
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.new_session().await,
         }
     }
 
@@ -207,17 +345,33 @@ impl Provider {
         sender: mpsc::UnboundedSender<(u64, ProviderEvent)>,
     ) -> Result<()> {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.stream(input, request_id, sender).await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.stream(input, request_id, sender).await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.stream(input, request_id, sender).await,
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.stream(input, request_id, sender).await,
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.stream(input, request_id, sender).await,
         }
     }
 
     pub async fn interrupt(&self) -> Result<()> {
         match self {
+            Self::Disabled => unreachable!("the disabled provider cannot be connected"),
+            #[cfg(feature = "provider-codex")]
             Self::Codex(provider) => provider.interrupt().await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeApi(provider) => provider.interrupt().await,
+            #[cfg(feature = "provider-claude")]
             Self::ClaudeCode(provider) => provider.interrupt().await,
+            #[cfg(feature = "provider-copilot")]
+            Self::Copilot(provider) => provider.interrupt().await,
+            #[cfg(feature = "provider-openai-compatible-core")]
+            Self::OpenAiCompatible(provider) => provider.interrupt().await,
         }
     }
 }

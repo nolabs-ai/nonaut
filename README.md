@@ -13,7 +13,7 @@ fresh, kernel-enforced sandbox.
 ## Features
 
 - Workspace-scoped filesystem access with network blocked by default
-- Codex and Claude support through their existing account logins
+- Codex, Claude, Gemini, GitHub Copilot, and OpenAI-compatible providers
 - Live in-app review of staged, unstaged, and untracked changes
 - Reversible agent turns with `/undo`
 - Composable Rust, Python, Node.js, Go, and Bun development profiles
@@ -41,8 +41,9 @@ cd my-project
 nonaut
 ```
 
-On first use, choose a provider and complete its normal login flow. Nonaut only
-saves the provider after the connection succeeds.
+On first use, choose a provider and authenticate with its CLI or API-key
+environment variable. Nonaut only saves the provider after the connection
+succeeds.
 
 ## Preview
 
@@ -82,6 +83,10 @@ cd nonaut
 make ci
 make run
 ```
+
+Release builds include every provider by default. Selective source builds can
+use Cargo features to include only the required providers; see
+[development and releases](docs/development.md#select-providers).
 
 Contributor commands and the release process are documented in
 [docs/development.md](docs/development.md).

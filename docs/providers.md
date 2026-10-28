@@ -1,7 +1,8 @@
 # Providers
 
-Nonaut supports Codex and Claude while keeping their authentication and
-inference outside the tool sandbox.
+Nonaut supports CLI-backed providers and OpenAI-compatible APIs while keeping
+authentication and inference outside the tool sandbox. Models receive only
+Nonaut's tools; every operation still executes through Nono.
 
 ## Codex
 
@@ -28,6 +29,46 @@ Requirements:
 
 If no subscription login is present and `ANTHROPIC_API_KEY` is set, Nonaut can
 use the Anthropic API transport instead.
+
+## Gemini
+
+Gemini uses Google's OpenAI-compatible API. Export `GEMINI_API_KEY`, then
+choose **Gemini / Google**. Nonaut discovers the available models and does not
+store the key.
+
+## GitHub Copilot
+
+Copilot uses GitHub's official SDK and an installed `copilot` CLI. Sign in with
+the CLI first, then choose **GitHub Copilot**. Copilot's built-in tools are
+disabled; only Nonaut's confined tools are exposed.
+
+## OpenAI-compatible APIs
+
+Nonaut includes presets for:
+
+- **OpenRouter**, authenticated with `OPENROUTER_API_KEY`.
+- **Ollama**, using `http://127.0.0.1:11434/v1` by default. Set
+  `OLLAMA_API_KEY` only when the endpoint requires it.
+- **OpenAI-compatible API**, for any service that implements model listing and
+  chat completions with streaming function calls.
+
+Configure a custom endpoint in `config.json`:
+
+```json
+"agent": {
+  "providers": {
+    "openai-compatible": {
+      "base_url": "https://api.example.com/v1",
+      "api_key_env": "EXAMPLE_API_KEY",
+      "model": "example-model"
+    }
+  }
+}
+```
+
+`base_url` and `api_key_env` can also override the Gemini, OpenRouter, and
+Ollama presets. The configuration stores only an environment-variable name,
+never the credential itself.
 
 ## Persisted settings
 

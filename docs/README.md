@@ -8,7 +8,7 @@ behavior of the current MVP.
 
 - [Getting started](getting-started.md) — install, authenticate, and open a project
 - [Commands](commands.md) — TUI commands, review controls, headless execution, and sessions
-- [Providers](providers.md) — Codex and Claude requirements and authentication
+- [Providers](providers.md) — supported services, authentication, and custom endpoints
 
 ## Configure the sandbox
 

@@ -73,6 +73,10 @@ pub(crate) struct ProviderConfig {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +171,19 @@ pub fn load_model(provider: ProviderKind) -> Result<Option<String>> {
         .providers
         .get(provider.id())
         .and_then(|settings| settings.model.clone()))
+}
+
+#[cfg(any(
+    feature = "provider-copilot",
+    feature = "provider-openai-compatible-core"
+))]
+pub(crate) fn load_provider_config(provider: ProviderKind) -> Result<ProviderConfig> {
+    Ok(load()?
+        .agent
+        .providers
+        .get(provider.id())
+        .cloned()
+        .unwrap_or_default())
 }
 
 pub fn save_model(provider: ProviderKind, model: &str) -> Result<()> {
@@ -297,8 +314,9 @@ mod tests {
 
     #[test]
     fn parses_known_provider() {
-        assert_eq!(ProviderKind::parse("codex\n").unwrap(), ProviderKind::Codex);
-        assert_eq!(ProviderKind::parse("claude").unwrap(), ProviderKind::Claude);
+        for &provider in ProviderKind::ALL {
+            assert_eq!(ProviderKind::parse(provider.id()).unwrap(), provider);
+        }
     }
 
     #[test]
@@ -322,6 +340,20 @@ mod tests {
         assert!(
             serde_json::from_str::<Config>(r#"{"ui":{"theme":"dark","mystery":true}}"#).is_err()
         );
+    }
+
+    #[test]
+    fn parses_openai_compatible_endpoint_settings() {
+        let config: Config = serde_json::from_str(
+            r#"{"agent":{"providers":{"openai-compatible":{"base_url":"http://localhost:8080/v1","api_key_env":"LOCAL_API_KEY"}}}}"#,
+        )
+        .unwrap();
+        let provider = &config.agent.providers["openai-compatible"];
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("http://localhost:8080/v1")
+        );
+        assert_eq!(provider.api_key_env.as_deref(), Some("LOCAL_API_KEY"));
     }
 
     #[test]
