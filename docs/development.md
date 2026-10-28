@@ -83,6 +83,6 @@ branch. The regular installer can replace a main build with a release, and
 
 ## Releases
 
-Push a version tag matching `Cargo.toml`, such as `v0.0.2`, to publish release
+Push a version tag matching `Cargo.toml`, such as `v0.0.3`, to publish release
 binaries, checksums, and signed build provenance for supported Linux and macOS
 targets.
