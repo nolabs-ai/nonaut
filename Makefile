@@ -13,12 +13,14 @@ fmt-check:
 	cargo fmt --all -- --check
 
 lint:
+	cargo clippy --all-targets -- -D warnings
 	cargo clippy --all-targets --all-features -- -D warnings
 
 script-check:
 	sh -n install.sh
 
 test:
+	cargo test --all-targets
 	cargo test --all-targets --all-features
 
 integration: build

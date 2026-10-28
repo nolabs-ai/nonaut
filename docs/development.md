@@ -10,6 +10,13 @@ cd nonaut
 make run
 ```
 
+The default build excludes enrollment and audit shipping. Include the optional
+control-plane crate with:
+
+```sh
+cargo build --features control-plane
+```
+
 ## Development commands
 
 | Command | Action |
@@ -35,6 +42,8 @@ Build and install the current `main` branch with:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --from-main
 ```
+
+Add `--control-plane` to build and install that flavor from main.
 
 This requires Cargo. Running it again downloads and rebuilds the latest main
 branch. The regular installer can replace a main build with a release, and

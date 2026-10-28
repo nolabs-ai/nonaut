@@ -292,17 +292,25 @@ impl ClaudeApi {
 
     async fn run_tool(&self, call: &Value, request_id: u64, sender: &Events) -> Value {
         let name = call["name"].as_str().unwrap_or_default().to_owned();
-        let _ = sender.send((request_id, ProviderEvent::ToolStarted(name.clone())));
-        let (success, output) = match tools::execute(&self.cwd, &name, &call["input"]).await {
-            Ok(output) => (true, output),
-            Err(error) => (false, format!("{error:#}")),
-        };
+        let call_id = call["id"].as_str().unwrap_or(&name).to_owned();
+        let context = tools::audit_context(&call_id, &self.cwd, &name, &call["input"]);
+        let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
+        let (success, output, failure) =
+            match tools::execute(&self.cwd, &name, &call["input"]).await {
+                Ok(output) => (true, output, None),
+                Err(error) => {
+                    let failure = tools::audit_failure(&error);
+                    (false, format!("{error:#}"), Some(failure))
+                }
+            };
         let _ = sender.send((
             request_id,
             ProviderEvent::ToolFinished {
+                call_id,
                 tool: name,
                 success,
                 output: output.clone(),
+                failure,
             },
         ));
         tool_result(&call["id"], &output, !success)

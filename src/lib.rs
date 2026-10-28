@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod control_plane;
 mod mcp;
 mod policy;
 mod profiles;
@@ -35,6 +36,16 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     sessions::run_cli(args).await
 }
 
+#[cfg(feature = "control-plane")]
+pub async fn run_enroll(args: Vec<String>) -> Result<()> {
+    control_plane::run_enroll(args).await
+}
+
+#[cfg(feature = "control-plane")]
+pub async fn run_audit(args: Vec<String>) -> Result<()> {
+    control_plane::run_audit(args).await
+}
+
 pub fn print_help() {
     cli::print_help();
 }
@@ -54,7 +65,55 @@ pub fn print_error(error: &anyhow::Error) {
 pub async fn run_exec(cwd: std::path::PathBuf, command: String) -> Result<String> {
     let session_root =
         std::env::current_dir().context("could not determine the working directory")?;
-    tools::execute_shell(&session_root, &cwd, command).await
+    let mut audit =
+        control_plane::start_session(&session_root, None, None, None).unwrap_or_else(|error| {
+            eprintln!("Warning: could not start the local audit session: {error:#}");
+            None
+        });
+    let call_id = "exec";
+    let mut tool_context = tools::audit_context(
+        call_id,
+        &session_root,
+        "run_command",
+        &serde_json::json!({
+            "program": "sh",
+            "args": ["-c", command],
+            "cwd": cwd,
+        }),
+    );
+    tool_context.tool = "exec".to_owned();
+    if let Some(Err(error)) = control_plane::tool_started(&mut audit, &tool_context) {
+        eprintln!("Warning: could not record the audit event: {error:#}");
+        audit = None;
+    }
+    let result = tools::execute_shell(&session_root, &cwd, command).await;
+    if audit.is_some() {
+        let success = result.is_ok();
+        let output = result
+            .as_ref()
+            .map_or_else(|error| format!("{error:#}"), Clone::clone);
+        let failure = result.as_ref().err().map(tools::audit_failure);
+        let recorded = control_plane::tool_finished(
+            &mut audit,
+            call_id,
+            "exec",
+            success,
+            &output,
+            failure.as_ref(),
+        )
+        .unwrap_or(Ok(()));
+        let finalized = recorded.and_then(|()| {
+            audit
+                .take()
+                .map(|session| control_plane::finish_session(session, success))
+                .transpose()
+                .map(|_| ())
+        });
+        if let Err(error) = finalized {
+            eprintln!("Warning: could not finalize the audit session: {error:#}");
+        }
+    }
+    result
 }
 
 pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Result<()> {

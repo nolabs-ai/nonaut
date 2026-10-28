@@ -22,6 +22,7 @@ use tokio::{
 };
 
 use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
+use crate::tools;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_EFFORT: &str = "default";
@@ -238,7 +239,7 @@ impl ClaudeCode {
             output
         });
         let mut lines = BufReader::new(stdout).lines();
-        let mut state = CliStream::default();
+        let mut state = CliStream::new(self.cwd.clone());
         while let Some(line) = lines
             .next_line()
             .await
@@ -281,8 +282,8 @@ impl Drop for AbortOnDrop {
     }
 }
 
-#[derive(Default)]
 struct CliStream {
+    workspace: PathBuf,
     session_id: Option<String>,
     tool_names: HashMap<String, String>,
     completed: bool,
@@ -290,6 +291,16 @@ struct CliStream {
 }
 
 impl CliStream {
+    fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace,
+            session_id: None,
+            tool_names: HashMap::new(),
+            completed: false,
+            error: None,
+        }
+    }
+
     fn apply(&mut self, event: &Value, request_id: u64, sender: &Events) {
         if let Some(session) = event["session_id"].as_str() {
             self.session_id = Some(session.to_owned());
@@ -312,7 +323,9 @@ impl CliStream {
                     {
                         let name = display_tool_name(name);
                         self.tool_names.insert(id.to_owned(), name.clone());
-                        let _ = sender.send((request_id, ProviderEvent::ToolStarted(name)));
+                        let context =
+                            tools::audit_context(id, &self.workspace, &name, &block["input"]);
+                        let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
                     }
                 }
             }
@@ -327,12 +340,15 @@ impl CliStream {
                             .unwrap_or_else(|| "tool".to_owned());
                         let success = block["is_error"] != true;
                         let output = content_text(&block["content"]);
+                        let failure = (!success).then(|| tools::audit_failure_text(&output));
                         let _ = sender.send((
                             request_id,
                             ProviderEvent::ToolFinished {
+                                call_id: id.to_owned(),
                                 tool,
                                 success,
                                 output,
+                                failure,
                             },
                         ));
                     }
@@ -489,7 +505,7 @@ mod tests {
     #[test]
     fn maps_cli_stream_events_to_shared_events() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut stream = CliStream::default();
+        let mut stream = CliStream::new(PathBuf::from("/workspace"));
         for event in [
             json!({ "type": "system", "session_id": "s1" }),
             json!({ "type": "stream_event", "event": { "delta": { "type": "text_delta", "text": "hello" } } }),

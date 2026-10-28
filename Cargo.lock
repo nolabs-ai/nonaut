@@ -1502,6 +1502,7 @@ dependencies = [
  "directories",
  "futures-util",
  "nix 0.31.3",
+ "nonaut-control-plane",
  "nono",
  "portable-pty",
  "ratatui",
@@ -1510,9 +1511,27 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "shell-words",
  "tokio",
  "tui-markdown",
  "webbrowser",
+]
+
+[[package]]
+name = "nonaut-control-plane"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "jiff",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1533,7 +1552,7 @@ dependencies = [
  "regress",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "sigstore-verify",
  "syn 3.0.9",
  "thiserror 2.0.21",
@@ -2138,6 +2157,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -2517,6 +2538,17 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -3248,6 +3280,7 @@ checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

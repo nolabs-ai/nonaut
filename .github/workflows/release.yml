@@ -99,21 +99,37 @@ jobs:
         if: matrix.cross
         run: cargo install cross --locked
 
-      - name: Build
+      - name: Build standard
         if: ${{ !matrix.cross }}
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Build with cross
+      - name: Build standard with cross
         if: matrix.cross
         run: cross build --locked --release --target ${{ matrix.target }}
 
-      - name: Package archive
+      - name: Package standard archive
         shell: bash
         run: |
           set -euo pipefail
           archive="nonaut-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           tar -C "target/${{ matrix.target }}/release" -czf "$archive" nonaut
           mkdir artifact
+          mv "$archive" artifact/
+
+      - name: Build control-plane
+        if: ${{ !matrix.cross }}
+        run: cargo build --locked --release --target ${{ matrix.target }} --features control-plane
+
+      - name: Build control-plane with cross
+        if: matrix.cross
+        run: cross build --locked --release --target ${{ matrix.target }} --features control-plane
+
+      - name: Package control-plane archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="nonaut-control-plane-${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" nonaut
           mv "$archive" artifact/
 
       - name: Upload archive

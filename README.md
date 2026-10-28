@@ -27,7 +27,12 @@ curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | 
 
 The installer verifies the release checksum and installs `nonaut` to
 `~/.local/bin`. Nonaut embeds Nono, so no separate sandbox installation is
-required.
+required. The standard build omits control-plane enrollment and audit shipping.
+Install the opt-in build when those capabilities are needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --control-plane
+```
 
 Open a project and start the TUI:
 

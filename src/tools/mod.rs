@@ -1,14 +1,16 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use diffy::create_patch;
 use directories::BaseDirs;
+use sha2::{Digest, Sha256};
 
 use crate::policy::OperationAccess;
 use serde_json::{Value, json};
@@ -23,6 +25,363 @@ mod catalog;
 mod sandbox;
 
 pub(crate) use catalog::specs;
+
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ToolContext {
+    pub call_id: String,
+    pub tool: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub argv_display: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_hash: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_mode: Option<String>,
+}
+
+impl ToolContext {
+    pub(crate) fn minimal(call_id: &str, tool: &str) -> Self {
+        Self {
+            call_id: call_id.to_owned(),
+            tool: tool.to_owned(),
+            operation: operation_name(tool).to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolFailure {
+    pub reason: &'static str,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug)]
+struct ProcessFailure {
+    name: String,
+    status: String,
+    exit_code: Option<i32>,
+    output: String,
+    denied: bool,
+}
+
+impl fmt::Display for ProcessFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.denied {
+            write!(
+                formatter,
+                "Likely blocked by the nono sandbox: {} hit a permission error.\n{}",
+                self.name,
+                self.output.trim_end()
+            )
+        } else {
+            write!(
+                formatter,
+                "{} exited with {}\n{}",
+                self.name,
+                self.status,
+                self.output.trim_end()
+            )
+        }
+    }
+}
+
+impl Error for ProcessFailure {}
+
+pub(crate) fn audit_context(
+    call_id: impl Into<String>,
+    workspace: &Path,
+    tool: &str,
+    arguments: &Value,
+) -> ToolContext {
+    let call_id = call_id.into();
+    let mut context = ToolContext::minimal(&call_id, tool);
+    let Ok(arguments) = normalize_tool_paths(workspace, tool, arguments) else {
+        return context;
+    };
+    let Ok((operation, fallback_root, access)) = operation_location(workspace, tool, &arguments)
+    else {
+        return context;
+    };
+    let Ok(policy) = crate::policy::load(workspace, &operation, &fallback_root, access) else {
+        return context;
+    };
+    let audit = policy.audit_context();
+    context.operation = operation_name(tool).to_owned();
+    context.workspace_hash = Some(workspace_hash(&audit.workspace));
+    context.profiles = audit.profiles;
+    context.policy_digest = Some(audit.policy_digest);
+    context.network_mode = Some(audit.network_mode);
+    if tool == "run_command" {
+        command_context(&mut context, &arguments, &audit.workspace);
+    } else if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        context.target = Some(display_audit_path(&audit.workspace, Path::new(path)));
+    }
+    context
+}
+
+pub(crate) fn audit_failure(error: &anyhow::Error) -> ToolFailure {
+    if let Some(failure) = error.downcast_ref::<ProcessFailure>() {
+        return ToolFailure {
+            reason: if failure.denied {
+                "sandbox_denied"
+            } else if failure.exit_code == Some(127) {
+                "command_not_found"
+            } else if failure.exit_code == Some(126) {
+                "command_not_executable"
+            } else {
+                "process_exit"
+            },
+            exit_code: failure.exit_code,
+        };
+    }
+    audit_failure_text(&format!("{error:#}"))
+}
+
+pub(crate) fn audit_failure_text(output: &str) -> ToolFailure {
+    let reason = if output.contains("outside every configured workspace")
+        || output.contains("outside the session scope")
+    {
+        "workspace_denied"
+    } else if is_sandbox_denial(output) {
+        "sandbox_denied"
+    } else if output.contains("timed out") {
+        "timeout"
+    } else if output.contains("must be")
+        || output.contains("may not")
+        || output.contains("unknown tool")
+        || output.contains("invalid tool")
+    {
+        "invalid_arguments"
+    } else if output.contains("could not start") || output.contains("could not launch") {
+        "spawn_error"
+    } else {
+        "tool_error"
+    };
+    ToolFailure {
+        reason,
+        exit_code: None,
+    }
+}
+
+#[cfg(feature = "control-plane")]
+pub(crate) fn audit_change(tool: &str, success: bool, output: &str) -> Option<&'static str> {
+    if !success {
+        return None;
+    }
+    match tool {
+        "write_file" if output.starts_with("Created ") => Some("created"),
+        "write_file" | "edit_file" => Some("modified"),
+        "delete_file" => Some("deleted"),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "control-plane", test))]
+pub(crate) fn audit_decision(success: bool, failure: Option<&ToolFailure>) -> &'static str {
+    if success {
+        "allowed"
+    } else if failure
+        .is_some_and(|failure| matches!(failure.reason, "workspace_denied" | "sandbox_denied"))
+    {
+        "denied"
+    } else {
+        "error"
+    }
+}
+
+fn operation_name(tool: &str) -> &str {
+    match tool {
+        "read_file" => "file_read",
+        "list_directory" => "directory_list",
+        "write_file" => "file_write",
+        "search_files" => "file_search",
+        "edit_file" => "file_edit",
+        "delete_file" => "file_delete",
+        "run_command" | "exec" => "command",
+        _ => "tool",
+    }
+}
+
+fn command_context(context: &mut ToolContext, arguments: &Value, workspace: &Path) {
+    let Some(program) = arguments.get("program").and_then(Value::as_str) else {
+        return;
+    };
+    let args = arguments["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if matches!(program, "sh" | "bash" | "zsh") && args.first().is_some_and(|arg| arg == "-c") {
+        let parsed = args.get(1).and_then(|body| simple_shell_argv(body));
+        let command = parsed
+            .as_ref()
+            .and_then(|argv| argv.first())
+            .map(String::as_str)
+            .unwrap_or("shell");
+        let command = Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("shell")
+            .to_owned();
+        context.command = Some(command.clone());
+        context.argv_display = parsed.map_or_else(
+            || vec![command.clone(), "<shell-command>".to_owned()],
+            |mut argv| {
+                argv = nono::scrub_argv(&argv);
+                if let Some(program) = argv.first_mut() {
+                    *program = command.clone();
+                }
+                for argument in argv.iter_mut().skip(1) {
+                    *argument = sanitize_audit_argument(argument, workspace);
+                }
+                argv
+            },
+        );
+    } else {
+        let mut argv = vec![program.to_owned()];
+        argv.extend(args);
+        let command = Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("command")
+            .to_owned();
+        let mut argv = nono::scrub_argv(&argv);
+        if let Some(program) = argv.first_mut() {
+            *program = command.clone();
+        }
+        for argument in argv.iter_mut().skip(1) {
+            *argument = sanitize_audit_argument(argument, workspace);
+        }
+        context.command = Some(command);
+        context.argv_display = argv;
+    }
+    if let Some(cwd) = arguments.get("cwd").and_then(Value::as_str) {
+        context.cwd_display = Some(display_audit_path(workspace, Path::new(cwd)));
+    }
+}
+
+fn simple_shell_argv(command: &str) -> Option<Vec<String>> {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            }
+            continue;
+        }
+        if quote.is_none() && matches!(character, '|' | '&' | ';' | '<' | '>' | '$' | '`' | '\n') {
+            return None;
+        }
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    let argv = shell_words::split(command).ok()?;
+    let program = argv.first()?;
+    if program.contains('=') || !auditable_program(program) {
+        return None;
+    }
+    Some(argv)
+}
+
+fn auditable_program(program: &str) -> bool {
+    let program = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    matches!(
+        program,
+        "cargo"
+            | "rustc"
+            | "rustup"
+            | "git"
+            | "make"
+            | "just"
+            | "npm"
+            | "npx"
+            | "pnpm"
+            | "yarn"
+            | "bun"
+            | "node"
+            | "python"
+            | "python3"
+            | "pytest"
+            | "uv"
+            | "ruff"
+            | "go"
+            | "gofmt"
+            | "pwd"
+    )
+}
+
+fn sanitize_audit_argument(argument: &str, workspace: &Path) -> String {
+    if Path::new(argument).is_absolute() {
+        return display_audit_path(workspace, Path::new(argument));
+    }
+    if let Some((name, value)) = argument.split_once('=')
+        && Path::new(value).is_absolute()
+    {
+        return format!("{name}={}", display_audit_path(workspace, Path::new(value)));
+    }
+    argument.to_owned()
+}
+
+fn display_audit_path(workspace: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace).map_or_else(
+        |_| path_hash(path),
+        |relative| {
+            if relative.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                relative.to_string_lossy().into_owned()
+            }
+        },
+    )
+}
+
+fn path_hash(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nonaut.audit.path.v1\n");
+    hasher.update(path.as_os_str().as_bytes());
+    format!("sha256:{}", hex(&hasher.finalize()))
+}
+
+fn workspace_hash(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut hasher = Sha256::new();
+    hasher.update(b"nonaut.audit.workspace.v1\n");
+    hasher.update(path.as_os_str().as_bytes());
+    format!("sha256:{}", hex(&hasher.finalize()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
     let arguments = normalize_tool_paths(workspace, tool, arguments)?;
@@ -336,19 +695,14 @@ fn output_result(name: &str, output: std::process::Output) -> Result<String> {
             Ok(combined)
         }
     } else {
-        if is_sandbox_denial(&combined) {
-            // nono denials surface as ordinary EACCES/EPERM errors, so ordinary
-            // permission failures look identical. Keep the output either way.
-            bail!(
-                "Likely blocked by the nono sandbox: {name} hit a permission error.\n{}",
-                combined.trim_end()
-            );
+        Err(ProcessFailure {
+            name: name.to_owned(),
+            status: output.status.to_string(),
+            exit_code: output.status.code(),
+            denied: is_sandbox_denial(&combined),
+            output: combined,
         }
-        Err(anyhow!(
-            "{name} exited with {}\n{}",
-            output.status,
-            combined.trim_end()
-        ))
+        .into())
     }
 }
 
@@ -767,6 +1121,100 @@ mod tests {
             "nono: CWD access requires --allow-cwd in non-interactive mode"
         ));
         assert!(!is_sandbox_denial("cargo test exited with status 1"));
+    }
+
+    #[test]
+    fn shell_audit_context_excludes_the_command_body() {
+        let mut context = ToolContext::minimal("call-1", "run_command");
+        command_context(
+            &mut context,
+            &json!({
+                "program": "sh",
+                "args": ["-c", "cargo test --token very-secret"],
+                "cwd": "/workspace"
+            }),
+            Path::new("/workspace"),
+        );
+        assert_eq!(context.command.as_deref(), Some("cargo"));
+        assert_eq!(
+            context.argv_display,
+            ["cargo", "test", "--token", "[REDACTED]"]
+        );
+        assert_eq!(context.cwd_display.as_deref(), Some("."));
+        assert!(
+            !serde_json::to_string(&context)
+                .unwrap()
+                .contains("very-secret")
+        );
+    }
+
+    #[test]
+    fn complex_shell_audit_context_hides_the_command_body() {
+        let mut context = ToolContext::minimal("call-1", "run_command");
+        command_context(
+            &mut context,
+            &json!({
+                "program": "sh",
+                "args": ["-c", "cargo test && curl https://example.test/private"],
+                "cwd": "/workspace"
+            }),
+            Path::new("/workspace"),
+        );
+        assert_eq!(context.command.as_deref(), Some("shell"));
+        assert_eq!(context.argv_display, ["shell", "<shell-command>"]);
+        assert!(!serde_json::to_string(&context).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn process_failure_preserves_the_exit_code_for_audit() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "exit 37"])
+            .output()
+            .unwrap();
+        let error = output_result("test command", output).unwrap_err();
+        let failure = audit_failure(&error);
+        assert_eq!(failure.reason, "process_exit");
+        assert_eq!(failure.exit_code, Some(37));
+        assert_eq!(audit_decision(false, Some(&failure)), "error");
+    }
+
+    #[test]
+    fn missing_command_has_a_specific_audit_reason() {
+        let output = std::process::Command::new("sh")
+            .args(["-c", "exit 127"])
+            .output()
+            .unwrap();
+        let error = output_result("test command", output).unwrap_err();
+        let failure = audit_failure(&error);
+        assert_eq!(failure.reason, "command_not_found");
+        assert_eq!(failure.exit_code, Some(127));
+    }
+
+    #[test]
+    fn external_audit_paths_are_opaque() {
+        let shown = display_audit_path(
+            Path::new("/Users/example/Work/nonaut"),
+            Path::new("/Users/example/.ssh/config"),
+        );
+        assert!(shown.starts_with("sha256:"));
+        assert!(!shown.contains("example"));
+    }
+
+    #[test]
+    fn command_audit_context_hides_external_absolute_paths() {
+        let mut context = ToolContext::minimal("call-1", "run_command");
+        command_context(
+            &mut context,
+            &json!({
+                "program": "/usr/bin/cargo",
+                "args": ["--manifest-path=/Users/example/private/Cargo.toml"],
+                "cwd": "/Users/example/private"
+            }),
+            Path::new("/workspace"),
+        );
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert_eq!(context.command.as_deref(), Some("cargo"));
+        assert!(!encoded.contains("/Users/example"));
     }
 
     #[test]

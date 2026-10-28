@@ -38,6 +38,7 @@ use crate::{
         load_model, load_reasoning, save_default_provider, save_model, save_reasoning, save_theme,
     },
     providers::{Model, Provider, ProviderEvent, ProviderKind, ReasoningOption},
+    tools::ToolContext,
     undo::Undo,
 };
 
@@ -181,6 +182,7 @@ pub struct App {
     connection_generation: u64,
     request: Option<JoinHandle<()>>,
     request_uses_provider: bool,
+    audit_session: Option<crate::control_plane::AuditSession>,
     undo: Option<Arc<Mutex<Undo>>>,
     prompt_history: Vec<String>,
     /// Position while browsing history with Up/Down; None when not browsing.
@@ -260,6 +262,7 @@ impl App {
             connection_generation: 0,
             request: None,
             request_uses_provider: false,
+            audit_session: None,
             undo: None,
             prompt_history: Vec::new(),
             history_index: None,
@@ -1940,26 +1943,44 @@ impl App {
         self.push(Role::You, format!("/exec --cwd {shown_cwd} {command}"));
         self.streaming_message = None;
         self.tool_summaries.clear();
+        self.begin_audit_session();
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
         let workspace = self.cwd.clone();
+        let call_id = format!("exec-{request_id}");
+        let mut audit = crate::tools::audit_context(
+            &call_id,
+            &workspace,
+            "run_command",
+            &serde_json::json!({
+                "program": "sh",
+                "args": ["-c", command],
+                "cwd": cwd,
+            }),
+        );
+        audit.tool = "exec".to_owned();
         let undo = self.undo.clone();
         self.request_uses_provider = false;
         self.request = Some(tokio::spawn(async move {
             checkpoint(undo).await;
-            let _ = sender.send((request_id, ProviderEvent::ToolStarted("exec".to_owned())));
+            let _ = sender.send((request_id, ProviderEvent::ToolStarted(audit)));
             let result = crate::tools::execute_shell(&workspace, &cwd, command).await;
-            let (success, output) = match result {
-                Ok(output) => (true, output),
-                Err(error) => (false, format!("{error:#}")),
+            let (success, output, failure) = match result {
+                Ok(output) => (true, output, None),
+                Err(error) => {
+                    let failure = crate::tools::audit_failure(&error);
+                    (false, format!("{error:#}"), Some(failure))
+                }
             };
             let _ = sender.send((
                 request_id,
                 ProviderEvent::ToolFinished {
+                    call_id,
                     tool: "exec".to_owned(),
                     success,
                     output,
+                    failure,
                 },
             ));
             let _ = sender.send((request_id, ProviderEvent::Completed));
@@ -1974,6 +1995,7 @@ impl App {
         };
         self.streaming_message = None;
         self.tool_summaries.clear();
+        self.begin_audit_session();
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
@@ -2109,8 +2131,13 @@ impl App {
                     message.content.push_str(&delta);
                 }
             }
-            ProviderEvent::Usage(tokens) => self.session_tokens = tokens,
-            ProviderEvent::ToolStarted(tool) => {
+            ProviderEvent::Usage(tokens) => {
+                self.session_tokens = tokens;
+                crate::control_plane::record_usage(&mut self.audit_session, tokens);
+            }
+            ProviderEvent::ToolStarted(context) => {
+                self.audit_tool_started(&context);
+                let tool = context.tool;
                 self.streaming_message = None;
                 if Self::compact_tool(&tool) {
                     self.start_compact_tool(&tool);
@@ -2123,10 +2150,13 @@ impl App {
                 }
             }
             ProviderEvent::ToolFinished {
+                call_id,
                 tool,
                 success,
                 output,
+                failure,
             } => {
+                self.audit_tool_finished(&call_id, &tool, success, &output, failure.as_ref());
                 self.streaming_message = None;
                 if Self::compact_tool(&tool) && self.finish_compact_tool(&tool, success, &output) {
                     return;
@@ -2172,6 +2202,7 @@ impl App {
                 }
             }
             ProviderEvent::Completed => {
+                self.finish_audit_session(true);
                 self.streaming_message = None;
                 self.request = None;
                 self.request_uses_provider = false;
@@ -2179,6 +2210,7 @@ impl App {
                 self.start_queued_request();
             }
             ProviderEvent::Interrupted => {
+                self.finish_audit_session(false);
                 let provider_request = self.request_uses_provider;
                 self.streaming_message = None;
                 if let Some(request) = self.request.take() {
@@ -2206,6 +2238,7 @@ impl App {
                 self.push(Role::System, "New session started.");
             }
             ProviderEvent::Failed(error) => {
+                self.finish_audit_session(false);
                 if let Some(index) = self.streaming_message.take() {
                     if let Some(message) = self.messages.get_mut(index) {
                         message.content = format!("Request failed: {error}");
@@ -2223,6 +2256,64 @@ impl App {
     fn start_queued_request(&mut self) {
         if let Some(content) = self.queued_request.take() {
             self.begin_request(content);
+        }
+    }
+
+    fn begin_audit_session(&mut self) {
+        let provider = self.active_provider.map(|provider| provider.id());
+        let model = (self.model_id != "none").then_some(self.model_id.as_str());
+        let reasoning = (self.reasoning_effort != "none").then_some(self.reasoning_effort.as_str());
+        match crate::control_plane::start_session(&self.cwd, provider, model, reasoning) {
+            Ok(session) => self.audit_session = session,
+            Err(error) => self.push(
+                Role::System,
+                format!("Could not start the local audit session: {error:#}"),
+            ),
+        }
+    }
+
+    fn finish_audit_session(&mut self, success: bool) {
+        if let Some(session) = self.audit_session.take()
+            && let Err(error) = crate::control_plane::finish_session(session, success)
+        {
+            self.push(
+                Role::System,
+                format!("Could not finalize the local audit session: {error:#}"),
+            );
+        }
+    }
+
+    fn audit_tool_started(&mut self, context: &ToolContext) {
+        let result = crate::control_plane::tool_started(&mut self.audit_session, context);
+        self.handle_audit_result(result);
+    }
+
+    fn audit_tool_finished(
+        &mut self,
+        call_id: &str,
+        tool: &str,
+        success: bool,
+        output: &str,
+        failure: Option<&crate::tools::ToolFailure>,
+    ) {
+        let result = crate::control_plane::tool_finished(
+            &mut self.audit_session,
+            call_id,
+            tool,
+            success,
+            output,
+            failure,
+        );
+        self.handle_audit_result(result);
+    }
+
+    fn handle_audit_result(&mut self, result: Option<anyhow::Result<()>>) {
+        if let Some(Err(error)) = result {
+            self.audit_session = None;
+            self.push(
+                Role::System,
+                format!("Could not record the local audit event: {error:#}"),
+            );
         }
     }
 
@@ -2633,9 +2724,11 @@ mod tests {
         app.handle_provider_event(
             0,
             ProviderEvent::ToolFinished {
+                call_id: "read-1".to_owned(),
                 tool: "read_file".to_owned(),
                 success: true,
                 output: "contents".to_owned(),
+                failure: None,
             },
         );
         assert_eq!(app.messages.last().unwrap().role, Role::Success);
@@ -2643,9 +2736,14 @@ mod tests {
         app.handle_provider_event(
             0,
             ProviderEvent::ToolFinished {
+                call_id: "read-2".to_owned(),
                 tool: "read_file".to_owned(),
                 success: false,
                 output: "denied".to_owned(),
+                failure: Some(crate::tools::ToolFailure {
+                    reason: "sandbox_denied",
+                    exit_code: Some(1),
+                }),
             },
         );
         assert_eq!(app.messages.last().unwrap().role, Role::Error);
@@ -2654,15 +2752,20 @@ mod tests {
     #[test]
     fn running_tool_stops_animating_when_it_finishes() {
         let mut app = app_with_input("");
-        app.handle_provider_event(0, ProviderEvent::ToolStarted("read_file".to_owned()));
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolStarted(ToolContext::minimal("read-1", "read_file")),
+        );
         assert_eq!(app.messages.last().unwrap().role, Role::Running);
 
         app.handle_provider_event(
             0,
             ProviderEvent::ToolFinished {
+                call_id: "read-1".to_owned(),
                 tool: "read_file".to_owned(),
                 success: true,
                 output: String::new(),
+                failure: None,
             },
         );
 
@@ -2674,14 +2777,20 @@ mod tests {
     #[test]
     fn repeated_reads_share_one_counted_status() {
         let mut app = app_with_input("");
-        for _ in 0..3 {
-            app.handle_provider_event(0, ProviderEvent::ToolStarted("read_file".to_owned()));
+        for index in 0..3 {
+            let call_id = format!("read-{index}");
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolStarted(ToolContext::minimal(&call_id, "read_file")),
+            );
             app.handle_provider_event(
                 0,
                 ProviderEvent::ToolFinished {
+                    call_id,
                     tool: "read_file".to_owned(),
                     success: true,
                     output: String::new(),
+                    failure: None,
                 },
             );
         }

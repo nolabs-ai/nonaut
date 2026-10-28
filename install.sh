@@ -5,6 +5,7 @@ set -eu
 REPOSITORY="nolabs-ai/nonaut"
 RELEASES_URL="https://github.com/$REPOSITORY/releases"
 INSTALL_MODE="release"
+INSTALL_FLAVOR="standard"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
     ORANGE='\033[38;2;232;115;74m'
@@ -39,16 +40,20 @@ Install Nonaut from a verified release or build the latest main branch.
 
 Usage:
   install.sh
+  install.sh --control-plane
   install.sh --from-main
+  install.sh --from-main --control-plane
 
 Options:
-  --from-main  Build and install the current main branch with Cargo
-  -h, --help   Show this help
+  --control-plane  Include enrollment and durable audit delivery
+  --from-main     Build and install the current main branch with Cargo
+  -h, --help      Show this help
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --control-plane) INSTALL_FLAVOR="control-plane" ;;
         --from-main) INSTALL_MODE="main" ;;
         -h | --help)
             usage
@@ -124,8 +129,9 @@ install_binary() {
 record_install() {
     channel=$1
     installed=$2
+    flavor=$3
     staged="$install_dir/.nonaut-metadata-$$"
-    printf 'channel=%s\nversion=%s\n' "$channel" "$installed" >"$staged" \
+    printf 'channel=%s\nversion=%s\nflavor=%s\n' "$channel" "$installed" "$flavor" >"$staged" \
         || fatal "Could not write installation metadata to $install_dir."
     mv -f "$staged" "$metadata" \
         || fatal "Could not replace installation metadata in $install_dir."
@@ -134,11 +140,16 @@ record_install() {
 
 installed_channel=''
 installed_version=''
+installed_flavor='standard'
 if [ -x "$destination" ]; then
     installed_version=$($destination --version 2>/dev/null | awk '{print $2}' || true)
 fi
 if [ -f "$metadata" ]; then
     installed_channel=$(sed -n 's/^channel=//p' "$metadata" | head -n 1)
+    saved_flavor=$(sed -n 's/^flavor=//p' "$metadata" | head -n 1)
+    if [ -n "$saved_flavor" ]; then
+        installed_flavor=$saved_flavor
+    fi
 fi
 
 show_path_hint() {
@@ -171,13 +182,18 @@ if [ "$INSTALL_MODE" = "main" ]; then
     [ -f "$source_dir/Cargo.toml" ] \
         || fatal "The source archive did not contain Cargo.toml."
     notice "Building Nonaut from main..."
-    (cd "$source_dir" && cargo build --locked --release) \
-        || fatal "The Nonaut source build failed."
+    if [ "$INSTALL_FLAVOR" = "control-plane" ]; then
+        (cd "$source_dir" && cargo build --locked --release --features control-plane) \
+            || fatal "The Nonaut control-plane source build failed."
+    else
+        (cd "$source_dir" && cargo build --locked --release) \
+            || fatal "The Nonaut source build failed."
+    fi
     binary="$source_dir/target/release/nonaut"
     [ -x "$binary" ] || fatal "The source build did not produce a Nonaut binary."
     version=$($binary --version 2>/dev/null | awk '{print $2}')
     install_binary "$binary"
-    record_install "main" "${version:-unknown}"
+    record_install "main" "${version:-unknown}" "$INSTALL_FLAVOR"
     success "Installed Nonaut ${version:-from main} to $destination"
     show_path_hint
     exit 0
@@ -202,7 +218,8 @@ printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
 version=${tag#v}
 
 if [ -x "$destination" ]; then
-    if [ "$installed_channel" = "release" ] && [ "$installed_version" = "$version" ]; then
+    if [ "$installed_channel" = "release" ] && [ "$installed_version" = "$version" ] \
+        && [ "$installed_flavor" = "$INSTALL_FLAVOR" ]; then
         success "Nonaut $version is already installed."
         exit 0
     fi
@@ -218,7 +235,11 @@ fi
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/nonaut.XXXXXX") \
     || fatal "Could not create a temporary directory."
 
-archive="nonaut-$tag-$target.tar.gz"
+archive_prefix="nonaut"
+if [ "$INSTALL_FLAVOR" = "control-plane" ]; then
+    archive_prefix="nonaut-control-plane"
+fi
+archive="$archive_prefix-$tag-$target.tar.gz"
 base_url="$RELEASES_URL/download/$tag"
 
 curl -fsSL "$base_url/$archive" -o "$temporary/$archive" \
@@ -245,7 +266,7 @@ tar -xzf "$temporary/$archive" -C "$temporary"
     || fatal "The downloaded Nonaut binary could not run on this system."
 
 install_binary "$temporary/nonaut"
-record_install "release" "$version"
+record_install "release" "$version" "$INSTALL_FLAVOR"
 
 success "Installed Nonaut $version to $destination"
 show_path_hint

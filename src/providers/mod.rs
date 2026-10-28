@@ -7,6 +7,8 @@ use std::path::Path;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use crate::tools::ToolContext;
+
 use claude::ClaudeApi;
 use claude_code::ClaudeCode;
 use codex::Codex;
@@ -121,11 +123,13 @@ pub struct ReasoningOption {
 pub enum ProviderEvent {
     Delta(String),
     Usage(u64),
-    ToolStarted(String),
+    ToolStarted(ToolContext),
     ToolFinished {
+        call_id: String,
         tool: String,
         success: bool,
         output: String,
+        failure: Option<crate::tools::ToolFailure>,
     },
     Completed,
     Interrupted,

@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
 use nono::net_filter::validate_host_pattern;
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 pub(crate) use crate::config::NetworkMode as Network;
 use crate::config::{
@@ -31,6 +33,14 @@ pub(crate) struct Policy {
     pub path_entries: Vec<PathBuf>,
     pub command_home: PathBuf,
     pub environment: BTreeMap<String, String>,
+    pub profiles: Vec<String>,
+}
+
+pub(crate) struct AuditContext {
+    pub workspace: PathBuf,
+    pub profiles: Vec<String>,
+    pub network_mode: String,
+    pub policy_digest: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +80,17 @@ pub(crate) fn load(
     crate::runtime_paths::prepare_private_directory(&policy.command_home)
         .context("could not prepare the private command home")?;
     Ok(policy)
+}
+
+#[cfg(feature = "control-plane")]
+pub(crate) fn audit_context(session_root: &Path) -> Result<AuditContext> {
+    let policy = load(
+        session_root,
+        session_root,
+        session_root,
+        OperationAccess::Write,
+    )?;
+    Ok(policy.audit_context())
 }
 
 fn resolve(
@@ -224,7 +245,41 @@ fn validate(
         write_paths,
         path_entries: profile.path_entries,
         environment: profile.environment,
+        profiles: profiles.to_vec(),
     })
+}
+
+impl Policy {
+    pub(crate) fn audit_context(&self) -> AuditContext {
+        let network_mode = match self.network {
+            Network::Open => "open",
+            Network::Blocked => "blocked",
+            Network::Allowlist => "allowlist",
+        }
+        .to_owned();
+        let document = json!({
+            "workspace": self.workspace,
+            "network": network_mode,
+            "allow_hosts": self.allow_hosts,
+            "timeout_seconds": self.tool_timeout_seconds,
+            "profiles": self.profiles,
+            "read_paths": self.read_paths,
+            "write_paths": self.write_paths,
+            "path_entries": self.path_entries,
+            "environment_names": self.environment.keys().collect::<Vec<_>>()
+        });
+        let digest = Sha256::digest(serde_json::to_vec(&document).unwrap_or_default());
+        AuditContext {
+            workspace: self.workspace.clone(),
+            profiles: self.profiles.clone(),
+            network_mode,
+            policy_digest: format!("sha256:{}", hex(&digest)),
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn resolve_write_paths(filesystem: &FilesystemConfig, home: &Path) -> Result<Vec<PathBuf>> {

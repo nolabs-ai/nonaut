@@ -215,7 +215,10 @@ impl Codex {
                 && notification["params"]["turnId"] == turn_id
             {
                 if let Some(tool) = notification["params"]["tool"].as_str() {
-                    let _ = sender.send((request_id, ProviderEvent::ToolStarted(tool.to_owned())));
+                    let call_id = notification["params"]["callId"].as_str().unwrap_or(tool);
+                    let context = serde_json::from_value(notification["params"]["audit"].clone())
+                        .unwrap_or_else(|_| crate::tools::ToolContext::minimal(call_id, tool));
+                    let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
                 }
             } else if notification["method"] == "nonaut/toolFinished"
                 && notification["params"]["threadId"] == thread_id
@@ -225,12 +228,34 @@ impl Codex {
                     let _ = sender.send((
                         request_id,
                         ProviderEvent::ToolFinished {
+                            call_id: notification["params"]["callId"]
+                                .as_str()
+                                .unwrap_or(tool)
+                                .to_owned(),
                             tool: tool.to_owned(),
                             success: notification["params"]["success"] == true,
                             output: notification["params"]["output"]
                                 .as_str()
                                 .unwrap_or_default()
                                 .to_owned(),
+                            failure: notification["params"]["failure"].as_object().and_then(
+                                |failure| {
+                                    Some(crate::tools::ToolFailure {
+                                        reason: match failure["reason"].as_str()? {
+                                            "process_exit" => "process_exit",
+                                            "sandbox_denied" => "sandbox_denied",
+                                            "workspace_denied" => "workspace_denied",
+                                            "timeout" => "timeout",
+                                            "invalid_arguments" => "invalid_arguments",
+                                            "spawn_error" => "spawn_error",
+                                            _ => "tool_error",
+                                        },
+                                        exit_code: failure["exitCode"]
+                                            .as_i64()
+                                            .and_then(|code| i32::try_from(code).ok()),
+                                    })
+                                },
+                            ),
                         },
                     ));
                 }
@@ -458,9 +483,16 @@ async fn start_tool_call(
     };
     let thread_id = params["threadId"].as_str().unwrap_or_default().to_owned();
     let arguments = params["arguments"].clone();
+    let audit = tools::audit_context(&call_id, &workspace, &tool, &arguments);
     let _ = notifications.send(json!({
         "method": "nonaut/toolStarted",
-        "params": { "threadId": thread_id, "turnId": turn_id, "tool": tool }
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "callId": call_id,
+            "tool": tool,
+            "audit": audit
+        }
     }));
 
     let (start_tx, start_rx) = oneshot::channel();
@@ -471,9 +503,12 @@ async fn start_tool_call(
     let handle = tokio::spawn(async move {
         let _ = start_rx.await;
         let result = tools::execute(&workspace, &task_tool, &arguments).await;
-        let (success, output) = match result {
-            Ok(output) => (true, output),
-            Err(error) => (false, format!("{error:#}")),
+        let (success, output, failure) = match result {
+            Ok(output) => (true, output, None),
+            Err(error) => {
+                let failure = tools::audit_failure(&error);
+                (false, format!("{error:#}"), Some(failure))
+            }
         };
         let event_output = output.clone();
         if let Some(writer) = writer.upgrade() {
@@ -491,9 +526,14 @@ async fn start_tool_call(
             "params": {
                 "threadId": thread_id,
                 "turnId": task_turn_id,
+                "callId": task_call_id,
                 "tool": task_tool,
                 "success": success,
-                "output": event_output
+                "output": event_output,
+                "failure": failure.as_ref().map(|failure| json!({
+                    "reason": failure.reason,
+                    "exitCode": failure.exit_code
+                }))
             }
         }));
         task_active.lock().await.remove(&task_call_id);

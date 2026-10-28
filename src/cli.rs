@@ -69,7 +69,7 @@ pub(crate) fn render_help(color: bool) -> String {
     let heading = |value| styled(value, MUTED, true, color);
     let command = |value| styled(value, ACCENT, false, color);
 
-    let commands = [
+    let commands = vec![
         (
             "exec [--cwd DIR] -- <command>",
             "Run a command in the nono sandbox",
@@ -80,12 +80,30 @@ pub(crate) fn render_help(color: bool) -> String {
         ("kill --all, -a", "Stop all persistent sessions"),
         ("help, --help, -h", "Show this help"),
         ("version, --version, -V", "Show the version"),
-    ]
-    .map(|(name, description)| {
-        let padded = format!("{name:<27}");
-        format!("  {} {description}", styled(&padded, ACCENT, false, color))
-    })
-    .join("\n");
+    ];
+    #[cfg(feature = "control-plane")]
+    let commands = {
+        let mut commands = commands;
+        commands.splice(
+            1..1,
+            [
+                (
+                    "enroll --url URL --token TOKEN",
+                    "Enroll for audit delivery",
+                ),
+                ("audit <status|sync>", "Inspect or retry audit delivery"),
+            ],
+        );
+        commands
+    };
+    let commands = commands
+        .into_iter()
+        .map(|(name, description)| {
+            let padded = format!("{name:<27}");
+            format!("  {} {description}", styled(&padded, ACCENT, false, color))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "{title}\n{subtitle}\n\n{}\n  {}\n  {}\n\n{}\n{commands}\n\n{}\n  Start the TUI and type {} to view in-session commands.\n",
@@ -141,6 +159,14 @@ mod tests {
         let help = render_help(false);
         for command in ["exec", "ps", "attach", "kill", "help"] {
             assert!(help.contains(command));
+        }
+        #[cfg(feature = "control-plane")]
+        for command in ["enroll", "audit"] {
+            assert!(help.contains(command));
+        }
+        #[cfg(not(feature = "control-plane"))]
+        for command in ["enroll", "audit"] {
+            assert!(!help.contains(command));
         }
         assert!(help.contains("/help"));
         assert!(!help.contains("\u{1b}["));

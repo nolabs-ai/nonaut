@@ -54,6 +54,22 @@ fn run() -> anyhow::Result<()> {
         nonaut::print_version();
         return Ok(());
     }
+    if mode == Some("enroll") {
+        #[cfg(feature = "control-plane")]
+        return runtime.block_on(nonaut::run_enroll(args.into_iter().skip(1).collect()));
+        #[cfg(not(feature = "control-plane"))]
+        anyhow::bail!(
+            "this Nonaut build does not include control-plane support; rebuild with `--features control-plane`"
+        );
+    }
+    if mode == Some("audit") {
+        #[cfg(feature = "control-plane")]
+        return runtime.block_on(nonaut::run_audit(args.into_iter().skip(1).collect()));
+        #[cfg(not(feature = "control-plane"))]
+        anyhow::bail!(
+            "this Nonaut build does not include control-plane support; rebuild with `--features control-plane`"
+        );
+    }
     if mode == Some("exec") {
         if matches!(
             args.get(1).map(String::as_str),
