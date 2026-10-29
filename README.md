@@ -1,9 +1,11 @@
 <p align="center">
-  <img src="assets/nonaut-banner.png" alt="nonaut" width="720">
+  <img src="assets/nonaut-hero.png" alt="Nonaut astronaut mascot beside the Nonaut wordmark" width="720">
 </p>
 
 <p align="center">
-  A security-first agent harness powered by <a href="https://github.com/nolabs-ai/nono">nono</a>.
+  <strong>A small, security-first coding agent powered by <a href="https://github.com/nolabs-ai/nono">nono</a>.</strong>
+  <br>
+  <sub>Give your agent a workspace, not your whole machine.</sub>
 </p>
 
 Nonaut is a minimal terminal coding agent where provider authentication and
