@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   workflow_dispatch:
     inputs:
       tag:
@@ -15,24 +23,27 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-${{ github.event.pull_request.number || github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event.inputs.tag || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'pull_request' && github.sha || github.event.inputs.tag || github.ref_name }}
 
 jobs:
   validate:
     name: Validate release
+    if: github.event_name != 'pull_request' || startsWith(github.event.pull_request.title, 'release:')
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout tag
+      - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Validate tag and crate version
+        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,10 +86,10 @@ jobs:
             os: macos-15
 
     steps:
-      - name: Checkout tag
+      - name: Checkout release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Linux build tools
         if: runner.os == 'Linux'
@@ -121,9 +132,69 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  verify:
+    name: Verify release artifacts
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Inspect archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_count="$(find artifacts -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
+          if [[ "$archive_count" -ne 10 ]]; then
+            echo "::error::expected 10 release archives, found $archive_count"
+            find artifacts -maxdepth 1 -type f -name '*.tar.gz' | sort
+            exit 1
+          fi
+          while IFS= read -r archive; do
+            contents="$(tar -tzf "$archive")"
+            if [[ "$contents" != "nonaut" && "$contents" != "./nonaut" ]]; then
+              echo "::error::$archive must contain exactly one nonaut binary"
+              printf '%s\n' "$contents"
+              exit 1
+            fi
+          done < <(find artifacts -maxdepth 1 -type f -name '*.tar.gz' | sort)
+
+      - name: Smoke test Linux archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          standard="artifacts/nonaut-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          control_plane="artifacts/nonaut-control-plane-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p smoke/standard smoke/control-plane
+          tar -xzf "$standard" -C smoke/standard
+          tar -xzf "$control_plane" -C smoke/control-plane
+          smoke/standard/nonaut --version
+          smoke/control-plane/nonaut --version
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum -- *.tar.gz > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nonaut-checksums
+          path: artifacts/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
   attest:
     name: Attest release artifacts
-    needs: build
+    if: github.event_name != 'pull_request'
+    needs: verify
     runs-on: ubuntu-22.04
     permissions:
       id-token: write
@@ -143,6 +214,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
+    if: github.event_name != 'pull_request'
     needs: attest
     runs-on: ubuntu-22.04
     permissions:
@@ -154,12 +226,12 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Verify checksums
         shell: bash
         run: |
           set -euo pipefail
           cd artifacts
-          sha256sum -- *.tar.gz > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
