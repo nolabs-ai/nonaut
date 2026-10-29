@@ -8,33 +8,33 @@
   <sub>Give your agent a workspace, not your whole machine.</sub>
 </p>
 
-Nonaut is a minimal terminal coding agent where provider authentication and
-inference stay in the control plane while every model-requested tool runs in a
-fresh, kernel-enforced sandbox.
+---
 
-## Features
+## Why Nonaut?
 
-- Workspace-scoped filesystem access with network blocked by default
-- Codex, Claude, Gemini, GitHub Copilot, and OpenAI-compatible providers
-- Live in-app review of staged, unstaged, and untracked changes
-- Reversible agent turns with `/undo`
-- Composable Rust, Python, Node.js, Go, and Bun development profiles
-- Persistent sessions that can detach and reattach
+- **Enforced by Nono.** Every model-requested tool runs inside [Nono](https://github.com/nolabs-ai/nono), a kernel-enforced security boundary built on Seatbelt for macOS and Landlock for Linux.
+- **Safe by default.** Agents see the active workspace while your real home, ambient credentials, and network stay unavailable unless explicitly granted.
+- **Private control plane.** Provider authentication and model inference remain outside the tool sandbox.
+- **Bring your provider.** Use Codex, Claude, Gemini, GitHub Copilot, or any OpenAI-compatible endpoint.
+- **Stay in control.** Review staged, unstaged, and untracked changes in the TUI, or roll back a whole agent turn with `/undo`.
+- **Built for real projects.** Compose Rust, Python, Node.js, Go, and Bun development profiles, then detach from persistent sessions and reconnect later.
 
-## Install
+## Preview
+
+<p align="center">
+  <img src="assets/nonaut-preview.png" alt="Nonaut terminal interface showing workspace access and a blocked sandbox request">
+</p>
+
+## Quick start
+
+Nonaut supports Linux and macOS on x86-64 and ARM64. Install the latest release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh
 ```
 
 The installer verifies the release checksum and installs `nonaut` to
-`~/.local/bin`. Nonaut embeds Nono, so no separate sandbox installation is
-required. The standard build omits control-plane enrollment and audit shipping.
-Install the opt-in build when those capabilities are needed:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --control-plane
-```
+`~/.local/bin`. Nonaut embeds Nono, so no separate sandbox installation is required.
 
 Open a project and start the TUI:
 
@@ -47,11 +47,26 @@ On first use, choose a provider and authenticate with its CLI or API-key
 environment variable. Nonaut only saves the provider after the connection
 succeeds.
 
-## Preview
+<details>
+<summary>Install the optional control-plane build</summary>
 
-<p align="center">
-  <img src="assets/nonaut-preview.png" alt="Nonaut terminal interface showing workspace access and a blocked sandbox request">
-</p>
+The standard build omits control-plane enrollment and audit shipping. Install the opt-in build when those capabilities are needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --control-plane
+```
+
+</details>
+
+## Security model
+
+| Component | Runs where | Access |
+| --- | --- | --- |
+| TUI and provider connection | Nonaut control plane | Authentication and model APIs |
+| Model-requested tools | Fresh Nono sandbox | Active workspace and an isolated home |
+| Additional capabilities | Nono sandbox | Only paths and network explicitly granted |
+
+The TUI and provider connection remain outside the tool sandbox. See the [security model](docs/security.md) for boundaries, platform behavior, and limitations.
 
 ## Documentation
 
@@ -64,16 +79,6 @@ succeeds.
 - [Development and releases](docs/development.md)
 
 See the [documentation index](docs/README.md) for the complete guide.
-
-## Security
-
-Tools receive read/write access to the active workspace and an isolated
-per-workspace home. The real home, ambient credentials, and network remain
-unavailable unless the user explicitly grants additional capabilities.
-
-The TUI and provider connection run outside the sandbox. See the
-[security model](docs/security.md) for boundaries, platform behavior, and
-limitations.
 
 ## Development
 
