@@ -1,10 +1,8 @@
 use std::{
     error::Error,
-    fmt, fs,
-    io::{self, Read},
+    fmt, fs, io,
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    time::Duration,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,14 +12,15 @@ use sha2::{Digest, Sha256};
 
 use crate::policy::OperationAccess;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
 
-const MAX_OUTPUT_BYTES: usize = 128 * 1024;
+const MAX_OUTPUT_BYTES: usize = 48 * 1024;
+const MAX_OUTPUT_LINES: usize = 1_000;
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
 const MAX_DIFF_BYTES: usize = 16 * 1024;
 
 mod catalog;
+mod index;
 mod sandbox;
 
 pub(crate) use catalog::specs;
@@ -47,6 +46,8 @@ pub(crate) struct ToolContext {
     pub policy_digest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
 }
 
 impl ToolContext {
@@ -59,6 +60,14 @@ impl ToolContext {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandProgress {
+    pub latest_line: String,
+    pub line_count: usize,
+}
+
+pub(crate) type ProgressReporter = Arc<dyn Fn(CommandProgress) + Send + Sync>;
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
@@ -110,6 +119,20 @@ pub(crate) fn audit_context(
 ) -> ToolContext {
     let call_id = call_id.into();
     let mut context = ToolContext::minimal(&call_id, tool);
+    if tool == "batch" {
+        let Ok(policy) = crate::policy::pin(workspace) else {
+            return context;
+        };
+        let audit = policy.audit_context();
+        context.workspace_hash = Some(workspace_hash(&audit.workspace));
+        context.profiles = audit.profiles;
+        context.policy_digest = Some(audit.policy_digest);
+        context.network_mode = Some(audit.network_mode);
+        context.target = arguments["calls"]
+            .as_array()
+            .map(|calls| format!("{} read calls", calls.len()));
+        return context;
+    }
     let Ok(arguments) = normalize_tool_paths(workspace, tool, arguments) else {
         return context;
     };
@@ -117,9 +140,15 @@ pub(crate) fn audit_context(
     else {
         return context;
     };
-    let Ok(policy) = crate::policy::load(workspace, &operation, &fallback_root, access) else {
+    let Ok(policy) = crate::policy::pin(workspace) else {
         return context;
     };
+    if policy
+        .authorize(&operation, &fallback_root, access)
+        .is_err()
+    {
+        return context;
+    }
     let audit = policy.audit_context();
     context.operation = operation_name(tool).to_owned();
     context.workspace_hash = Some(workspace_hash(&audit.workspace));
@@ -128,6 +157,12 @@ pub(crate) fn audit_context(
     context.network_mode = Some(audit.network_mode);
     if tool == "run_command" {
         command_context(&mut context, &arguments, &audit.workspace);
+        context.timeout_seconds = Some(
+            arguments["timeout_seconds"]
+                .as_u64()
+                .unwrap_or(policy.tool_timeout_seconds)
+                .clamp(1, policy.tool_timeout_seconds),
+        );
     } else if let Some(path) = arguments.get("path").and_then(Value::as_str) {
         context.target = Some(display_audit_path(&audit.workspace, Path::new(path)));
     }
@@ -139,6 +174,10 @@ pub(crate) fn audit_failure(error: &anyhow::Error) -> ToolFailure {
         return ToolFailure {
             reason: if failure.denied {
                 "sandbox_denied"
+            } else if is_tls_failure(&failure.output) {
+                "tls_error"
+            } else if is_network_failure(&failure.output) {
+                "network_error"
             } else if failure.exit_code == Some(127) {
                 "command_not_found"
             } else if failure.exit_code == Some(126) {
@@ -161,6 +200,10 @@ pub(crate) fn audit_failure_text(output: &str) -> ToolFailure {
         "sandbox_denied"
     } else if output.contains("timed out") {
         "timeout"
+    } else if is_tls_failure(output) {
+        "tls_error"
+    } else if is_network_failure(output) {
+        "network_error"
     } else if output.contains("must be")
         || output.contains("may not")
         || output.contains("unknown tool")
@@ -176,6 +219,22 @@ pub(crate) fn audit_failure_text(output: &str) -> ToolFailure {
         reason,
         exit_code: None,
     }
+}
+
+fn is_tls_failure(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("native-tls")
+        || output.contains("certificate verify failed")
+        || output.contains("bad certificate format")
+        || output.contains("invalid certificate")
+}
+
+fn is_network_failure(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("could not resolve host")
+        || output.contains("connection refused")
+        || output.contains("network is unreachable")
+        || output.contains("failed to download")
 }
 
 #[cfg(feature = "control-plane")]
@@ -206,10 +265,13 @@ pub(crate) fn audit_decision(success: bool, failure: Option<&ToolFailure>) -> &'
 
 fn operation_name(tool: &str) -> &str {
     match tool {
+        "sandbox_info" => "sandbox_info",
         "read_file" => "file_read",
         "list_directory" => "directory_list",
         "write_file" => "file_write",
         "search_files" => "file_search",
+        "inspect_code" => "code_index",
+        "batch" => "batch",
         "edit_file" => "file_edit",
         "delete_file" => "file_delete",
         "run_command" | "exec" => "command",
@@ -388,53 +450,90 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 pub async fn execute(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
+    execute_with_progress(workspace, tool, arguments, None).await
+}
+
+pub(crate) async fn execute_with_progress(
+    workspace: &Path,
+    tool: &str,
+    arguments: &Value,
+    progress: Option<ProgressReporter>,
+) -> Result<String> {
+    if tool == "sandbox_info" {
+        if arguments
+            .as_object()
+            .is_none_or(|arguments| !arguments.is_empty())
+        {
+            bail!("sandbox_info does not accept arguments");
+        }
+        return crate::policy::pin(workspace)?.capability_manifest_json();
+    }
+    if tool == "batch" {
+        return execute_batch(workspace, arguments).await;
+    }
     let arguments = normalize_tool_paths(workspace, tool, arguments)?;
     let (operation, fallback_root, access) = operation_location(workspace, tool, &arguments)?;
-    let policy = crate::policy::load(workspace, &operation, &fallback_root, access)?;
+    let policy = crate::policy::pin(workspace)?;
+    policy.authorize(&operation, &fallback_root, access)?;
     let operation_workspace = policy.workspace.clone();
-    if tool == "run_command" {
-        return run_command(&operation_workspace, &arguments, &policy).await;
+    if access == OperationAccess::Write {
+        crate::undo::checkpoint_before_mutation(workspace).await;
     }
+    sandbox::execute(&operation_workspace, tool, &arguments, &policy, progress).await
+}
 
-    let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut child = sandbox::process(&operation_workspace, &executable, &policy)?;
-    child
-        .arg("tool")
-        .arg(&operation_workspace)
-        .arg(tool)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = child
-        .spawn()
-        .context("could not start the sandboxed tool")?;
-    let mut group = ProcessGroup::new(child.id());
-    let encoded = serde_json::to_vec(&arguments).context("could not encode tool arguments")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("tool worker stdin was unavailable")?;
-    stdin
-        .write_all(&encoded)
-        .await
-        .context("could not send arguments to the tool worker")?;
-    drop(stdin);
-    let limit = policy.tool_timeout_seconds;
-    let output = tokio::time::timeout(Duration::from_secs(limit), child.wait_with_output())
-        .await
-        .with_context(|| format!("tool timed out after {limit} seconds"))?
-        .context("could not wait for the sandboxed tool")?;
-    group.finished();
-    output_result(tool, output)
+pub(crate) async fn prewarm(workspace: &Path) -> Result<()> {
+    let policy = crate::policy::pin(workspace)?;
+    sandbox::prewarm(&policy.workspace, &policy).await
+}
+
+async fn execute_batch(workspace: &Path, arguments: &Value) -> Result<String> {
+    let calls = arguments["calls"]
+        .as_array()
+        .context("batch calls must be an array")?;
+    if calls.is_empty() || calls.len() > 16 {
+        bail!("batch calls must contain between 1 and 16 items");
+    }
+    let mut validated = Vec::with_capacity(calls.len());
+    for call in calls {
+        let tool = required_string(call, "tool")?;
+        if !matches!(
+            tool,
+            "read_file" | "list_directory" | "search_files" | "inspect_code"
+        ) {
+            bail!("batch supports read-only tools; invalid tool `{tool}`");
+        }
+        let call_arguments = call
+            .get("arguments")
+            .context("batch call arguments are required")?;
+        validated.push((tool, call_arguments));
+    }
+    let policy = crate::policy::pin(workspace)?;
+    let mut normalized = Vec::with_capacity(validated.len());
+    for (tool, call_arguments) in validated {
+        let call_arguments = normalize_tool_paths(workspace, tool, call_arguments)?;
+        let (operation, fallback_root, access) =
+            operation_location(workspace, tool, &call_arguments)?;
+        policy.authorize(&operation, &fallback_root, access)?;
+        normalized.push(json!({"tool": tool, "arguments": call_arguments}));
+    }
+    sandbox::execute(
+        &policy.workspace,
+        "batch",
+        &json!({"calls": normalized}),
+        &policy,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn execute_shell(
     session_root: &Path,
     cwd: &Path,
     command: String,
+    progress: Option<ProgressReporter>,
 ) -> Result<String> {
-    execute(
+    execute_with_progress(
         session_root,
         "run_command",
         &json!({
@@ -442,6 +541,7 @@ pub(crate) async fn execute_shell(
             "args": ["-c", command],
             "cwd": cwd,
         }),
+        progress,
     )
     .await
 }
@@ -465,7 +565,10 @@ fn operation_location(
     } else {
         path.parent().unwrap_or(session_root).to_path_buf()
     };
-    let access = if matches!(tool, "read_file" | "list_directory" | "search_files") {
+    let access = if matches!(
+        tool,
+        "read_file" | "list_directory" | "search_files" | "inspect_code"
+    ) {
         OperationAccess::Read
     } else {
         OperationAccess::Write
@@ -486,6 +589,7 @@ fn normalize_tool_paths(workspace: &Path, tool: &str, arguments: &Value) -> Resu
             | "list_directory"
             | "write_file"
             | "search_files"
+            | "inspect_code"
             | "edit_file"
             | "delete_file"
     ) && let Some(path) = expanded.get_mut("path")
@@ -600,86 +704,6 @@ fn is_shell_word_start(previous: Option<char>) -> bool {
     })
 }
 
-async fn run_command(
-    workspace: &Path,
-    arguments: &Value,
-    policy: &crate::policy::Policy,
-) -> Result<String> {
-    let program = required_string(arguments, "program")?;
-    if program.trim().is_empty() {
-        bail!("program may not be empty");
-    }
-    let args = arguments["args"]
-        .as_array()
-        .context("args must be an array")?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .context("every command argument must be a string")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let command_cwd = optional_string(arguments, "cwd")
-        .map(|cwd| cwd.unwrap_or_else(|| workspace.to_str().unwrap_or(".")))?;
-    // The model may ask for less time than the policy allows, never more.
-    let limit = policy.tool_timeout_seconds;
-    let timeout = arguments["timeout_seconds"]
-        .as_u64()
-        .unwrap_or(limit)
-        .clamp(1, limit);
-
-    let executable = std::env::current_exe().context("could not locate the Nonaut executable")?;
-    let mut command = sandbox::process(workspace, &executable, policy)?;
-    command
-        .arg("command")
-        .arg(workspace)
-        .arg(command_cwd)
-        .arg(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let child = command
-        .spawn()
-        .with_context(|| format!("could not start sandboxed command `{program}`"))?;
-    let mut group = ProcessGroup::new(child.id());
-    let output = tokio::time::timeout(Duration::from_secs(timeout), child.wait_with_output())
-        .await
-        .with_context(|| format!("command timed out after {timeout} seconds"))?
-        .context("could not wait for sandboxed command")?;
-    group.finished();
-    output_result(program, output)
-}
-
-/// Kills a sandboxed tool's whole process group if the call is abandoned by
-/// a timeout or an interrupt. `kill_on_drop` alone only reaches the direct
-/// child, leaving anything it spawned (a build, `sleep`) running.
-struct ProcessGroup(Option<u32>);
-
-impl ProcessGroup {
-    fn new(pid: Option<u32>) -> Self {
-        Self(pid)
-    }
-
-    /// The tool exited normally; leave its group alone.
-    fn finished(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(pid) = self.0.and_then(|pid| i32::try_from(pid).ok()) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-}
-
 fn output_result(name: &str, output: std::process::Output) -> Result<String> {
     let mut combined = String::new();
     if !output.stdout.is_empty() {
@@ -691,8 +715,12 @@ fn output_result(name: &str, output: std::process::Output) -> Result<String> {
         }
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
     }
-    let combined = truncate(&combined);
-    if output.status.success() {
+    status_result(name, output.status, combined)
+}
+
+fn status_result(name: &str, status: std::process::ExitStatus, output: String) -> Result<String> {
+    let combined = truncate(&output);
+    if status.success() {
         if combined.trim().is_empty() {
             Ok(format!("{name} completed successfully"))
         } else {
@@ -701,8 +729,8 @@ fn output_result(name: &str, output: std::process::Output) -> Result<String> {
     } else {
         Err(ProcessFailure {
             name: name.to_owned(),
-            status: output.status.to_string(),
-            exit_code: output.status.code(),
+            status: status.to_string(),
+            exit_code: status.code(),
             denied: is_sandbox_denial(&combined),
             output: combined,
         }
@@ -724,38 +752,96 @@ fn is_sandbox_denial(output: &str) -> bool {
 }
 
 fn truncate(value: &str) -> String {
-    if value.len() <= MAX_OUTPUT_BYTES {
+    let line_count = value.lines().count();
+    if value.len() <= MAX_OUTPUT_BYTES && line_count <= MAX_OUTPUT_LINES {
         return value.to_owned();
     }
-    let mut end = MAX_OUTPUT_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
+    let head_limit = MAX_OUTPUT_BYTES * 3 / 4;
+    let tail_limit = MAX_OUTPUT_BYTES - head_limit;
+    let mut head = 0;
+    for (lines, line) in value.split_inclusive('\n').enumerate() {
+        if lines >= MAX_OUTPUT_LINES * 3 / 4 || head + line.len() > head_limit {
+            break;
+        }
+        head += line.len();
     }
-    format!("{}\n[output truncated by Nonaut]", &value[..end])
+    let mut tail = value.len();
+    for (tail_lines, line) in value.lines().rev().enumerate() {
+        let additional = line.len().saturating_add(1);
+        if tail_lines >= MAX_OUTPUT_LINES / 4 || value.len() - tail + additional > tail_limit {
+            break;
+        }
+        tail = tail.saturating_sub(additional);
+    }
+    while !value.is_char_boundary(head) {
+        head -= 1;
+    }
+    while tail < value.len() && !value.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n[output truncated by Nonaut: middle omitted]\n{}",
+        value[..head].trim_end(),
+        value[tail..].trim_start()
+    )
 }
 
 pub fn run_sandbox() -> Result<()> {
     sandbox::run()
 }
 
-fn run_tool_worker(workspace: &Path, tool: &str) -> Result<()> {
-    let mut encoded = String::new();
-    io::stdin()
-        .take((MAX_OUTPUT_BYTES * 4) as u64)
-        .read_to_string(&mut encoded)
-        .context("could not read tool arguments")?;
-    let arguments: Value = serde_json::from_str(&encoded).context("invalid tool arguments")?;
-    let output = match tool {
-        "read_file" => read_file(workspace, &arguments),
-        "list_directory" => list_directory(workspace, &arguments),
-        "write_file" => write_file(workspace, &arguments),
-        "search_files" => search_files(workspace, &arguments),
-        "edit_file" => edit_file(workspace, &arguments),
-        "delete_file" => delete_file(workspace, &arguments),
+fn execute_tool_local(workspace: &Path, tool: &str, arguments: &Value) -> Result<String> {
+    match tool {
+        "batch" => execute_batch_local(workspace, arguments),
+        "read_file" => read_file(workspace, arguments),
+        "list_directory" => list_directory(workspace, arguments),
+        "write_file" => write_file(workspace, arguments),
+        "search_files" => search_files(workspace, arguments),
+        "inspect_code" => index::inspect(workspace, arguments),
+        "edit_file" => edit_file(workspace, arguments),
+        "delete_file" => delete_file(workspace, arguments),
         _ => bail!("unknown tool `{tool}`"),
-    }?;
-    print!("{output}");
-    Ok(())
+    }
+}
+
+fn execute_batch_local(workspace: &Path, arguments: &Value) -> Result<String> {
+    let calls = arguments["calls"]
+        .as_array()
+        .context("batch calls must be an array")?;
+    let results = std::thread::scope(|scope| {
+        calls
+            .iter()
+            .map(|call| {
+                scope.spawn(move || {
+                    let tool = required_string(call, "tool")?;
+                    let arguments = call
+                        .get("arguments")
+                        .context("batch call arguments are required")?;
+                    execute_tool_local(workspace, tool, arguments)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("batch read panicked")))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut output = String::new();
+    for (index, (call, result)) in calls.iter().zip(results).enumerate() {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        let tool = required_string(call, "tool")?;
+        output.push_str(&format!("[{}] {tool}\n", index + 1));
+        match result {
+            Ok(value) => output.push_str(&value),
+            Err(error) => output.push_str(&format!("Error: {error:#}")),
+        }
+    }
+    Ok(truncate(&output))
 }
 
 fn read_file(workspace: &Path, arguments: &Value) -> Result<String> {
@@ -1195,6 +1281,18 @@ mod tests {
     }
 
     #[test]
+    fn tls_and_network_failures_are_distinguished_from_process_errors() {
+        assert_eq!(
+            audit_failure_text("download error: native-tls: bad certificate format").reason,
+            "tls_error"
+        );
+        assert_eq!(
+            audit_failure_text("failed to download archive: network is unreachable").reason,
+            "network_error"
+        );
+    }
+
+    #[test]
     fn external_audit_paths_are_opaque() {
         let shown = display_audit_path(
             Path::new("/Users/example/Work/nonaut"),
@@ -1259,6 +1357,45 @@ mod tests {
     }
 
     #[test]
+    fn oversized_output_keeps_diagnostics_at_both_ends() {
+        let value = format!("START\n{}\nEND\n", "middle\n".repeat(MAX_OUTPUT_LINES + 50));
+        let output = truncate(&value);
+        assert!(output.starts_with("START\n"));
+        assert!(output.contains("middle omitted"));
+        assert!(output.ends_with("END\n"));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_mutations_before_execution() {
+        let error = execute_batch(
+            Path::new("/unused"),
+            &json!({"calls": [{"tool": "write_file", "arguments": {}}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("read-only"));
+    }
+
+    #[test]
+    fn local_batch_preserves_parallel_read_order() {
+        let root = std::env::temp_dir().join(format!("nonaut-batch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("first.txt"), "first").unwrap();
+        fs::write(root.join("second.txt"), "second").unwrap();
+        let output = execute_batch_local(
+            &root,
+            &json!({"calls": [
+                {"tool": "read_file", "arguments": {"path": root.join("first.txt")}},
+                {"tool": "read_file", "arguments": {"path": root.join("second.txt")}}
+            ]}),
+        )
+        .unwrap();
+        assert!(output.find("first").unwrap() < output.find("second").unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tool_catalog_contains_only_known_tools() {
         let tools = specs().as_array().unwrap().clone();
         let names = tools
@@ -1268,10 +1405,13 @@ mod tests {
         assert_eq!(
             names,
             [
+                "sandbox_info",
                 "read_file",
                 "list_directory",
                 "write_file",
                 "search_files",
+                "inspect_code",
+                "batch",
                 "edit_file",
                 "delete_file",
                 "run_command"

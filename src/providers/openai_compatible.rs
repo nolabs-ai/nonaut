@@ -22,10 +22,12 @@ use tokio::{
 use crate::{config, tools};
 
 use super::{
-    BASE_INSTRUCTIONS, Model, ProviderEvent, ProviderKind, ReasoningOption, developer_instructions,
+    COMPACTION_PROMPT, Model, PromptFrame, ProviderEvent, ProviderKind, ReasoningOption,
+    ToolLoopGuard, compacted_user_message, history_needs_compaction,
 };
 
 const DEFAULT_EFFORT: &str = "default";
+const MODEL_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 type Events = mpsc::UnboundedSender<(u64, ProviderEvent)>;
 
@@ -39,14 +41,25 @@ pub(crate) struct OpenAiCompatible {
     selected_model: Arc<StdRwLock<Model>>,
     history: Arc<Mutex<Vec<Value>>>,
     active: Arc<Mutex<Option<JoinHandle<()>>>>,
+    frame: Arc<PromptFrame>,
 }
 
 impl OpenAiCompatible {
     pub async fn connect(kind: ProviderKind, cwd: &Path) -> Result<Self> {
         let saved = config::load_provider_config(kind)?;
         let endpoint = Endpoint::for_provider(kind, saved.base_url, saved.api_key_env)?;
+        let cache_key = super::cache::scoped_key(kind.id(), &endpoint.cache_scope());
         let client = endpoint.client()?;
-        let models = list_models(&client, &endpoint.base_url, endpoint.name).await?;
+        let models = match super::cache::load(&cache_key, MODEL_CACHE_AGE) {
+            Some(models) => models,
+            None => {
+                let models = list_models(&client, &endpoint.base_url, endpoint.name).await?;
+                if !models.is_empty() {
+                    let _ = super::cache::store(&cache_key, &models);
+                }
+                models
+            }
+        };
         let default = saved
             .model
             .as_deref()
@@ -55,6 +68,7 @@ impl OpenAiCompatible {
             .cloned()
             .context("the provider returned no tool-capable models")?;
 
+        let frame = Arc::new(PromptFrame::new(cwd));
         Ok(Self {
             client,
             base_url: endpoint.base_url,
@@ -64,6 +78,7 @@ impl OpenAiCompatible {
             selected_model: Arc::new(StdRwLock::new(default)),
             history: Arc::default(),
             active: Arc::default(),
+            frame,
         })
     }
 
@@ -135,34 +150,15 @@ impl OpenAiCompatible {
             .lock()
             .await
             .push(json!({ "role": "user", "content": input }));
-        let system = format!(
-            "{BASE_INSTRUCTIONS}\n\n{}\n\nWorkspace: {}",
-            developer_instructions(&self.cwd),
-            self.cwd.display()
-        );
-        let tool_specs = tools::specs()
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|spec| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": spec["name"],
-                        "description": spec["description"],
-                        "parameters": spec["inputSchema"],
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-
+        let mut recent_calls = ToolLoopGuard::default();
         loop {
-            let mut messages = vec![json!({ "role": "system", "content": system })];
+            self.compact_history().await?;
+            let mut messages = vec![json!({ "role": "system", "content": self.frame.system })];
             messages.extend(self.history.lock().await.clone());
             let body = json!({
                 "model": self.model().id,
                 "messages": messages,
-                "tools": tool_specs,
+                "tools": self.frame.openai_tools,
                 "tool_choice": "auto",
                 "stream": true,
                 "stream_options": { "include_usage": true }
@@ -188,23 +184,73 @@ impl OpenAiCompatible {
                 return Ok(());
             }
             for call in turn.calls {
-                let result = self.run_tool(&call, request_id, sender).await;
+                let result = self
+                    .run_tool(&call, request_id, sender, &mut recent_calls)
+                    .await;
                 self.history.lock().await.push(result);
             }
         }
     }
 
-    async fn run_tool(&self, call: &ToolCall, request_id: u64, sender: &Events) -> Value {
+    async fn compact_history(&self) -> Result<()> {
+        let history = self.history.lock().await.clone();
+        if !history_needs_compaction(&history) {
+            return Ok(());
+        }
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&json!({
+                "model": self.model().id,
+                "messages": [
+                    {"role": "system", "content": COMPACTION_PROMPT},
+                    {"role": "user", "content": serde_json::to_string(&history).unwrap_or_default()}
+                ],
+                "max_tokens": 4096,
+                "stream": false
+            }))
+            .send()
+            .await
+            .with_context(|| format!("could not compact {} history", self.provider_name))?;
+        if !response.status().is_success() {
+            return api_error(response, self.provider_name).await;
+        }
+        let value: Value = response
+            .json()
+            .await
+            .context("invalid compaction response")?;
+        let summary = value["choices"][0]["message"]["content"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .context("the provider returned an empty compaction summary")?;
+        *self.history.lock().await = vec![json!({
+            "role": "user",
+            "content": compacted_user_message(summary)
+        })];
+        Ok(())
+    }
+
+    async fn run_tool(
+        &self,
+        call: &ToolCall,
+        request_id: u64,
+        sender: &Events,
+        recent_calls: &mut ToolLoopGuard,
+    ) -> Value {
         let context = tools::audit_context(&call.id, &self.cwd, &call.name, &call.arguments);
         let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
-        let (success, output, failure) =
-            match tools::execute(&self.cwd, &call.name, &call.arguments).await {
-                Ok(output) => (true, output, None),
-                Err(error) => {
-                    let failure = tools::audit_failure(&error);
-                    (false, format!("{error:#}"), Some(failure))
-                }
-            };
+        let progress = super::tool_progress_reporter(request_id, call.id.clone(), sender.clone());
+        let (success, output, failure) = match recent_calls
+            .execute(&self.cwd, &call.name, &call.arguments, Some(progress))
+            .await
+        {
+            Ok(output) => (true, output, None),
+            Err(error) => {
+                let failure = tools::audit_failure(&error);
+                (false, format!("{error:#}"), Some(failure))
+            }
+        };
         let _ = sender.send((
             request_id,
             ProviderEvent::ToolFinished {
@@ -299,6 +345,15 @@ impl Endpoint {
             .default_headers(headers)
             .build()
             .context("could not build the provider HTTP client")
+    }
+
+    fn cache_scope(&self) -> String {
+        let credential = self
+            .api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .unwrap_or_default();
+        format!("{}\0{credential}", self.base_url)
     }
 }
 

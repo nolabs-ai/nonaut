@@ -60,9 +60,17 @@ impl ClaudeCode {
     pub async fn connect(cwd: &std::path::Path) -> Result<Self> {
         let executable = claude_executable();
         ensure_authenticated(&executable).await?;
+        Ok(Self::connected(executable, cwd))
+    }
+
+    pub fn connect_authenticated(cwd: &std::path::Path) -> Self {
+        Self::connected(claude_executable(), cwd)
+    }
+
+    fn connected(executable: PathBuf, cwd: &std::path::Path) -> Self {
         let models = claude_models();
         let selected_model = models[0].clone();
-        Ok(Self {
+        Self {
             executable,
             cwd: cwd.to_path_buf(),
             models,
@@ -70,7 +78,7 @@ impl ClaudeCode {
             selected_reasoning_effort: Arc::new(RwLock::new(DEFAULT_EFFORT.to_owned())),
             session_id: Arc::default(),
             active: Arc::default(),
-        })
+        }
     }
 
     pub fn model(&self) -> Model {

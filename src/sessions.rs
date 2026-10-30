@@ -10,10 +10,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
-    cursor::Show,
+    cursor::{MoveTo, Show},
     event::{DisableMouseCapture, PopKeyboardEnhancementFlags},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -82,9 +85,9 @@ impl Paths {
     }
 }
 
-pub(crate) async fn run_cli(args: Vec<String>) -> Result<()> {
+pub(crate) async fn run_cli(args: Vec<String>, requested_workspace: Option<&str>) -> Result<()> {
     match args.as_slice() {
-        [] => start().await,
+        [] => start(requested_workspace).await,
         [command] if command == "ps" => list().await,
         [command, flag] if command == "ps" && matches!(flag.as_str(), "--help" | "-h") => {
             cli::print_command_help("ps", "nonaut ps", "List sessions kept alive with /detach.");
@@ -117,8 +120,14 @@ pub(crate) async fn run_cli(args: Vec<String>) -> Result<()> {
     }
 }
 
-async fn start() -> Result<()> {
-    let workspace = env::current_dir().context("could not determine the working directory")?;
+async fn start(requested_workspace: Option<&str>) -> Result<()> {
+    let launch = env::current_dir().context("could not determine the working directory")?;
+    let selected = crate::workspace::select(&launch, requested_workspace)?;
+    let workspace = if requested_workspace.is_none() && !selected.configured {
+        crate::workspace_setup::prompt(&launch)?.root
+    } else {
+        selected.root
+    };
     let id = format!("{}-{}", unix_seconds(), std::process::id());
     let paths = Paths::discover()?;
     let socket = paths.socket(&id);
@@ -527,6 +536,9 @@ fn restore_terminal() {
         DisableMouseCapture,
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
+        Clear(ClearType::Purge),
+        Clear(ClearType::All),
+        MoveTo(0, 0),
         Show
     );
     let _ = disable_raw_mode();

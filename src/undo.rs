@@ -1,15 +1,16 @@
 //! Workspace snapshots for `/undo`, built on nono's content-addressed store.
 //!
-//! A snapshot is taken before every agent turn and `/exec`, and `/undo`
-//! restores the newest one. Snapshots live in nonaut's state directory,
-//! outside the workspace and `/tmp`, so sandboxed tools cannot alter them.
-//! `.git`, build output and `.gitignore`d files are not tracked, so they are
-//! neither captured nor touched by a restore.
+//! A turn snapshot starts in the background while the model thinks. Its first
+//! mutation waits for completion, preserving the boundary without delaying
+//! inference. Snapshots live outside the workspace and `/tmp`, beyond tool
+//! reach. `.git`, build output and ignored files are not tracked.
 
 use std::{
+    collections::HashMap,
     env, fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +20,13 @@ use nono::undo::{
 };
 
 const UNTRACKED: [&str; 3] = [".git", "target", "node_modules"];
+
+struct TurnSnapshot {
+    undo: Arc<Mutex<Undo>>,
+    taken: tokio::sync::OnceCell<()>,
+}
+
+static ARMED: OnceLock<Mutex<HashMap<PathBuf, Arc<TurnSnapshot>>>> = OnceLock::new();
 
 pub(crate) struct Undo {
     manager: SnapshotManager,
@@ -30,6 +38,7 @@ pub(crate) struct Undo {
 
 impl Undo {
     pub(crate) fn open(workspace: &Path) -> Result<Self> {
+        remove_empty_legacy_stores(workspace);
         Self::open_in(workspace, &state_dir()?)
     }
 
@@ -95,6 +104,75 @@ impl Undo {
     }
 }
 
+fn remove_empty_legacy_stores(workspace: &Path) {
+    let Ok(entries) = fs::read_dir(workspace) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("nonaut-undo-store-")
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let path = entry.path();
+        if fs::read_dir(&path).is_ok_and(|mut contents| contents.next().is_none()) {
+            let _ = fs::remove_dir(path);
+        }
+    }
+}
+
+/// Start the turn snapshot off the inference path. Mutations share its barrier.
+pub(crate) fn arm(workspace: &Path, undo: Option<Arc<Mutex<Undo>>>) {
+    let armed = ARMED.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut armed = armed.lock().unwrap_or_else(PoisonError::into_inner);
+    match undo {
+        Some(undo) => {
+            let turn = Arc::new(TurnSnapshot {
+                undo,
+                taken: tokio::sync::OnceCell::new(),
+            });
+            armed.insert(workspace.to_path_buf(), Arc::clone(&turn));
+            tokio::spawn(async move {
+                take_snapshot(&turn).await;
+            });
+        }
+        None => {
+            armed.remove(workspace);
+        }
+    }
+}
+
+pub(crate) async fn checkpoint_before_mutation(workspace: &Path) {
+    let turn = ARMED.get().and_then(|armed| {
+        armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(workspace)
+            .cloned()
+    });
+    if let Some(turn) = turn {
+        take_snapshot(&turn).await;
+    }
+}
+
+async fn take_snapshot(turn: &TurnSnapshot) {
+    turn.taken
+        .get_or_init(|| async {
+            let undo = Arc::clone(&turn.undo);
+            let _ = tokio::task::spawn_blocking(move || {
+                undo.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .checkpoint();
+            })
+            .await;
+        })
+        .await;
+}
+
 impl Drop for Undo {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.session_dir);
@@ -154,5 +232,42 @@ mod tests {
         assert!(workspace.join("target/build.bin").exists());
         assert!(undo.undo().unwrap().is_none());
         fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn removes_only_empty_legacy_workspace_stores() {
+        let workspace = temp("legacy");
+        let empty = workspace.join("nonaut-undo-store-1");
+        let populated = workspace.join("nonaut-undo-store-2");
+        fs::create_dir_all(&empty).unwrap();
+        fs::create_dir_all(&populated).unwrap();
+        fs::write(populated.join("snapshot"), "keep").unwrap();
+
+        remove_empty_legacy_stores(&workspace);
+
+        assert!(!empty.exists());
+        assert!(populated.exists());
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn armed_turn_snapshots_once_before_mutation() {
+        let workspace = temp("lazy");
+        let store = temp("lazy-store");
+        let file = workspace.join("tracked.txt");
+        fs::write(&file, "before").unwrap();
+        let undo = Arc::new(Mutex::new(Undo::open_in(&workspace, &store).unwrap()));
+
+        arm(&workspace, Some(Arc::clone(&undo)));
+        checkpoint_before_mutation(&workspace).await;
+        checkpoint_before_mutation(&workspace).await;
+        assert_eq!(undo.lock().unwrap().stack.len(), 1);
+
+        fs::write(&file, "after").unwrap();
+        undo.lock().unwrap().undo().unwrap();
+        assert_eq!(fs::read_to_string(file).unwrap(), "before");
+        arm(&workspace, None);
+        fs::remove_dir_all(workspace).unwrap();
+        fs::remove_dir_all(store).unwrap();
     }
 }

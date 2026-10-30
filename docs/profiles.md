@@ -19,12 +19,16 @@ directories, environment variables, and private writable caches.
 Profiles are selected per workspace:
 
 ```json
-"workspaces": {
-  "~/Work/rust-service": {
-    "profiles": ["rust"]
-  },
-  "~/Work/web-app": {
-    "profiles": ["node"]
+"workspace": {
+  "definitions": {
+    "rust-service": {
+      "path": "~/Work/rust-service",
+      "profiles": ["rust"]
+    },
+    "web-app": {
+      "path": "~/Work/web-app",
+      "profiles": ["node"]
+    }
   }
 }
 ```
@@ -32,7 +36,8 @@ Profiles are selected per workspace:
 Polyglot projects can compose profiles:
 
 ```json
-"~/Work/product": {
+"product": {
+  "path": "~/Work/product",
   "profiles": ["python", "node", "go"]
 }
 ```
@@ -51,6 +56,10 @@ $XDG_CACHE_HOME/nonaut/profiles/<profile>/<workspace-id>
 ```
 
 When `XDG_CACHE_HOME` is unset, Nonaut uses `~/.cache`.
+
+The Rust profile also points `BUNDLED_CLI_CACHE_DIR` into this cache. Build
+scripts that honor it can reuse verified downloaded tool archives across
+commands instead of downloading them for every private `HOME`.
 
 Commands also receive a private workspace-scoped `HOME` under:
 
@@ -71,4 +80,15 @@ dependency downloads normally require:
   "mode": "allowlist",
   "allow_domains": ["index.crates.io", "static.crates.io"]
 }
+```
+
+On macOS, a build script that insists on Security.framework/native-tls may
+still fail its first HTTPS download because Nonaut deliberately does not expose
+the login Keychain or security service to arbitrary commands. Do not weaken the
+sandbox to fix that. Populate a build script's verified archive cache from a
+trusted host build, then sandboxed builds reuse it. For the Rust profile, print
+the exact workspace cache destination with:
+
+```sh
+nonaut --workspace NAME exec -- 'printf %s "$BUNDLED_CLI_CACHE_DIR"'
 ```

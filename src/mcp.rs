@@ -48,8 +48,9 @@ impl NonautTools {
 
 impl ServerHandler for NonautTools {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Nonaut tools. Every call is enforced by a fresh nono sandbox.")
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Nonaut tools. Every call is enforced by an immutable policy-pinned nono sandbox.",
+        )
     }
 
     async fn list_tools(

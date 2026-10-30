@@ -2,8 +2,8 @@
 
 Nonaut separates the trusted control plane from model-requested execution.
 The TUI, provider authentication, and inference run outside the sandbox. File
-tools, searches, edits, and commands run through a fresh Nono sandbox with the
-resolved workspace policy.
+tools, searches, edits, and commands run through a Nono worker permanently
+confined to the resolved workspace policy.
 
 Nonaut currently embeds Nono 0.80.
 
@@ -23,11 +23,34 @@ caches. Explicit filesystem and network configuration can widen this boundary.
 The configuration file remains outside every workspace so an agent cannot
 edit its own permissions.
 
+## Sandbox lifetime
+
+At session start, Nonaut resolves the selected workspace, read-only
+references, development profiles, explicit filesystem grants, private runtime
+paths, and network policy into one capability set. Nono applies that immutable
+set once to a long-lived worker; every tool process inherits its Seatbelt or
+Landlock boundary.
+
+The configuration is pinned for the session. Changes take effect after a
+restart rather than widening a running sandbox. Separate sessions have
+separate workers. Interrupting or timing out a call kills the worker process
+group; the next call recreates it with the same pinned capability set.
+
+At creation, Nonaut writes a sanitized JSON description of that capability
+set outside the writable workspace. Sandboxed commands receive its exact path
+as `NONAUT_CAP_FILE`, with read-only access to that file. The model can request
+the same data through `sandbox_info`. Both expose model-addressable paths,
+runtime-only support paths, network rules, profile names, environment variable
+names, the tool timeout, and a policy digest; environment values and secrets
+are never included. The manifest describes the boundary, while Nono's
+Seatbelt or Landlock policy remains authoritative.
+
 ## Filesystem
 
 Nono enforces filesystem capabilities at the operating-system layer. Nonaut
-normalizes operation paths, resolves the most specific configured workspace,
-and passes the resulting capabilities to Nono.
+pins one primary workspace when the session starts and passes the resulting
+capabilities to Nono. Other configured workspaces remain inaccessible unless
+the active workspace names them as read-only references.
 
 The real user home is not used as sandbox `HOME`. Provider credentials, SSH
 keys, shell history, cloud configuration, and unrelated projects therefore
@@ -37,6 +60,11 @@ Read or write grants outside the workspace should be narrow. A writable grant
 allows the agent to change anything beneath that path; a readable grant can
 expose its contents to the provider and, when network is open, to remote
 destinations.
+
+A reference prevents writes to its source path. Read access cannot guarantee
+that source code is never executed: an agent can ask an interpreter to read it
+or copy it into the writable workspace. Treat references as readable context,
+not as a separate no-execute boundary.
 
 ## Network
 
@@ -73,8 +101,11 @@ control plane to sensitive host files.
 
 ## Undo
 
-Nonaut snapshots the workspace before each agent turn and `/exec`. `/undo`
-restores the latest snapshot and can be repeated to step back further.
+Nonaut starts a snapshot in the background with each agent turn and `/exec`,
+overlapping the filesystem walk with model inference. Before the first command
+or file mutation can execute, it waits for that snapshot if necessary;
+concurrent mutations share the same barrier. `/undo` restores the latest turn
+and can be repeated to step back further.
 
 `.git`, `target`, `node_modules`, and files ignored by `.gitignore` are not
 tracked. Snapshots live under `$XDG_STATE_HOME/nonaut/undo`, outside sandbox

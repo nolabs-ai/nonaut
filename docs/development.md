@@ -53,10 +53,11 @@ solely by omitted providers are not built.
 
 | Command | Action |
 | --- | --- |
-| `make ci` | Run the complete local CI suite |
+| `make ci` | Run exhaustive all-feature checks, integration tests, and smoke build |
 | `make run` | Build an optimized binary and launch Nonaut |
-| `make build` | Build the optimized binary |
-| `make check` | Check formatting, lint, installer syntax, and unit tests |
+| `make build` | Build the debug binary for local development |
+| `make release-build` | Build the optimized release binary |
+| `make check` | Run the fast default-feature formatting, lint, and unit checks |
 | `make integration` | Run provider-free sandbox and TUI integration tests |
 | `make smoke` | Exercise the release binary through `nonaut exec` |
 | `make fmt` | Format the Rust workspace |
@@ -66,6 +67,10 @@ solely by omitted providers are not built.
 
 Run `make ci` before opening a pull request. Integration tests do not connect
 to a provider or consume model tokens.
+
+`make check` avoids rebuilding the same default provider graph for a second
+all-features pass during normal iteration. `make ci` retains both configurations
+so feature-gating mistakes are still caught before merging.
 
 ## Install from main
 

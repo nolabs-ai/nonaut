@@ -24,6 +24,7 @@ use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const MODEL_CACHE_AGE: Duration = Duration::from_secs(60 * 60);
 
 type RpcReply = std::result::Result<Value, String>;
 type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RpcReply>>>>;
@@ -32,7 +33,7 @@ type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RpcReply>>>>;
 pub(crate) struct Codex {
     rpc: Rpc,
     cwd: PathBuf,
-    thread_id: Arc<RwLock<String>>,
+    thread_id: Arc<RwLock<Option<String>>>,
     active_turn_id: Arc<RwLock<Option<String>>>,
     models: Vec<Model>,
     selected_model: Arc<StdRwLock<Model>>,
@@ -71,32 +72,47 @@ impl Codex {
         .context("Codex app-server initialization failed")?;
         rpc.notify("initialized", json!({}))?;
 
-        let mut authenticated = is_authenticated(&rpc).await?;
+        let cached = super::cache::load::<(Vec<Model>, Option<Model>)>("codex", MODEL_CACHE_AGE);
+        let (mut authenticated, mut catalog, mut fetched) = if let Some(catalog) = cached {
+            (is_authenticated(&rpc).await?, catalog, false)
+        } else {
+            let (authenticated, catalog) = tokio::join!(is_authenticated(&rpc), list_models(&rpc));
+            (authenticated?, catalog?, true)
+        };
         if !authenticated {
             login(&rpc).await?;
             authenticated = is_authenticated(&rpc).await?;
+            catalog = list_models(&rpc).await?;
+            fetched = true;
         }
         if !authenticated {
             bail!("Codex login completed without an account");
         }
 
-        let (models, default_model) = list_models(&rpc).await?;
+        if fetched && !catalog.0.is_empty() {
+            let _ = super::cache::store("codex", &catalog);
+        }
+        let (models, default_model) = catalog;
         let model = default_model
             .or_else(|| models.first().cloned())
             .context("Codex app-server returned no visible models")?;
 
-        let thread_id = start_thread(&rpc, cwd, &model.id).await?;
         let reasoning_effort = model.default_reasoning_effort.clone();
 
-        Ok(Self {
+        let provider = Self {
             rpc,
             cwd: cwd.to_path_buf(),
-            thread_id: Arc::new(RwLock::new(thread_id)),
+            thread_id: Arc::new(RwLock::new(None)),
             active_turn_id: Arc::new(RwLock::new(None)),
             models,
             selected_model: Arc::new(StdRwLock::new(model)),
             selected_reasoning_effort: Arc::new(StdRwLock::new(reasoning_effort)),
-        })
+        };
+        let warm = provider.clone();
+        tokio::spawn(async move {
+            let _ = warm.ensure_thread().await;
+        });
+        Ok(provider)
     }
 
     pub fn model(&self) -> Model {
@@ -159,8 +175,7 @@ impl Codex {
 
     pub async fn new_session(&self) -> Result<()> {
         self.interrupt().await?;
-        let thread_id = start_thread(&self.rpc, &self.cwd, &self.model().id).await?;
-        *self.thread_id.write().await = thread_id;
+        *self.thread_id.write().await = None;
         Ok(())
     }
 
@@ -173,7 +188,7 @@ impl Codex {
         let mut notifications = self.rpc.subscribe();
         let model = self.model();
         let effort = self.reasoning_effort();
-        let thread_id = self.thread_id.read().await.clone();
+        let thread_id = self.ensure_thread().await?;
         let response = self
             .rpc
             .request(
@@ -220,6 +235,30 @@ impl Codex {
                         .unwrap_or_else(|_| crate::tools::ToolContext::minimal(call_id, tool));
                     let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
                 }
+            } else if notification["method"] == "nonaut/toolProgress"
+                && notification["params"]["threadId"] == thread_id
+                && notification["params"]["turnId"] == turn_id
+            {
+                let call_id = notification["params"]["callId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let latest_line = notification["params"]["latestLine"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let line_count = notification["params"]["lineCount"]
+                    .as_u64()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or_default();
+                let _ = sender.send((
+                    request_id,
+                    ProviderEvent::ToolProgress {
+                        call_id,
+                        latest_line,
+                        line_count,
+                    },
+                ));
             } else if notification["method"] == "nonaut/toolFinished"
                 && notification["params"]["threadId"] == thread_id
                 && notification["params"]["turnId"] == turn_id
@@ -246,6 +285,8 @@ impl Codex {
                                             "sandbox_denied" => "sandbox_denied",
                                             "workspace_denied" => "workspace_denied",
                                             "timeout" => "timeout",
+                                            "tls_error" => "tls_error",
+                                            "network_error" => "network_error",
                                             "invalid_arguments" => "invalid_arguments",
                                             "spawn_error" => "spawn_error",
                                             _ => "tool_error",
@@ -287,7 +328,12 @@ impl Codex {
         let Some(turn_id) = self.active_turn_id.read().await.clone() else {
             return Ok(());
         };
-        let thread_id = self.thread_id.read().await.clone();
+        let thread_id = self
+            .thread_id
+            .read()
+            .await
+            .clone()
+            .context("Codex turn has no thread")?;
         self.rpc.cancel_tools(&turn_id).await;
         self.rpc
             .request(
@@ -297,6 +343,19 @@ impl Codex {
             .await?;
         *self.active_turn_id.write().await = None;
         Ok(())
+    }
+
+    async fn ensure_thread(&self) -> Result<String> {
+        if let Some(thread_id) = self.thread_id.read().await.clone() {
+            return Ok(thread_id);
+        }
+        let mut thread_id = self.thread_id.write().await;
+        if let Some(existing) = thread_id.as_ref() {
+            return Ok(existing.clone());
+        }
+        let created = start_thread(&self.rpc, &self.cwd, &self.model().id).await?;
+        *thread_id = Some(created.clone());
+        Ok(created)
     }
 }
 
@@ -502,7 +561,24 @@ async fn start_tool_call(
     let task_active = active_tools.clone();
     let handle = tokio::spawn(async move {
         let _ = start_rx.await;
-        let result = tools::execute(&workspace, &task_tool, &arguments).await;
+        let progress_notifications = notifications.clone();
+        let progress_thread_id = thread_id.clone();
+        let progress_turn_id = task_turn_id.clone();
+        let progress_call_id = task_call_id.clone();
+        let progress = Arc::new(move |progress: tools::CommandProgress| {
+            let _ = progress_notifications.send(json!({
+                "method": "nonaut/toolProgress",
+                "params": {
+                    "threadId": progress_thread_id,
+                    "turnId": progress_turn_id,
+                    "callId": progress_call_id,
+                    "latestLine": progress.latest_line,
+                    "lineCount": progress.line_count
+                }
+            }));
+        });
+        let result =
+            tools::execute_with_progress(&workspace, &task_tool, &arguments, Some(progress)).await;
         let (success, output, failure) = match result {
             Ok(output) => (true, output, None),
             Err(error) => {

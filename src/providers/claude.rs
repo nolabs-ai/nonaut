@@ -13,6 +13,7 @@ use reqwest::{
     Client,
     header::{CONTENT_TYPE, HeaderMap, HeaderValue},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
@@ -21,16 +22,20 @@ use tokio::{
 
 use crate::tools;
 
-use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
+use super::{
+    COMPACTION_PROMPT, Model, PromptFrame, ProviderEvent, ReasoningOption, ToolLoopGuard,
+    compacted_user_message, history_needs_compaction,
+};
 
 const MAX_OUTPUT_TOKENS: u64 = 64_000;
 /// Omits `output_config.effort` so the model's own default applies.
 const DEFAULT_EFFORT: &str = "default";
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const MODEL_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 type Events = mpsc::UnboundedSender<(u64, ProviderEvent)>;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct ModelInfo {
     model: Model,
     max_tokens: u64,
@@ -48,6 +53,7 @@ pub(crate) struct ClaudeApi {
     selected_reasoning_effort: Arc<StdRwLock<String>>,
     history: Arc<Mutex<Vec<Value>>>,
     active: Arc<Mutex<Option<JoinHandle<()>>>>,
+    frame: Arc<PromptFrame>,
 }
 
 impl ClaudeApi {
@@ -60,6 +66,7 @@ impl ClaudeApi {
             .unwrap_or_else(|_| "https://api.anthropic.com".to_owned())
             .trim_end_matches('/')
             .to_owned();
+        let cache_key = super::cache::scoped_key("claude", &format!("{base_url}\0{}", key.trim()));
         let mut key = HeaderValue::from_str(key.trim()).context("invalid ANTHROPIC_API_KEY")?;
         key.set_sensitive(true);
         let mut headers = HeaderMap::new();
@@ -70,17 +77,16 @@ impl ClaudeApi {
             .build()
             .context("could not build the HTTP client")?;
 
-        let response = client
-            .get(format!("{base_url}/v1/models?limit=1000"))
-            .send()
-            .await
-            .context("could not reach the Claude API")?;
-        let catalog = api_json(response).await?["data"]
-            .as_array()
-            .context("the Claude API returned an invalid model list")?
-            .iter()
-            .filter_map(parse_model)
-            .collect::<Vec<_>>();
+        let catalog = match super::cache::load(&cache_key, MODEL_CACHE_AGE) {
+            Some(catalog) => catalog,
+            None => {
+                let catalog = fetch_catalog(&client, &base_url).await?;
+                if !catalog.is_empty() {
+                    let _ = super::cache::store(&cache_key, &catalog);
+                }
+                catalog
+            }
+        };
         let default = catalog
             .iter()
             .find(|info| info.model.id.contains("opus"))
@@ -89,6 +95,7 @@ impl ClaudeApi {
             .model
             .clone();
 
+        let frame = Arc::new(PromptFrame::new(cwd));
         Ok(Self {
             client,
             base_url,
@@ -99,6 +106,7 @@ impl ClaudeApi {
             selected_reasoning_effort: Arc::new(StdRwLock::new(DEFAULT_EFFORT.to_owned())),
             history: Arc::default(),
             active: Arc::default(),
+            frame,
         })
     }
 
@@ -177,6 +185,7 @@ impl ClaudeApi {
 
     async fn run_turn(&self, input: String, request_id: u64, sender: &Events) -> Result<()> {
         push_user_text(&mut *self.history.lock().await, input);
+        let mut recent_calls = ToolLoopGuard::default();
         let id = self.model().id;
         let info = self
             .catalog
@@ -188,25 +197,8 @@ impl ClaudeApi {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let system = format!(
-            "{BASE_INSTRUCTIONS}\n\n{}\n\nWorkspace: {}",
-            developer_instructions(&self.cwd),
-            self.cwd.display()
-        );
-        let tools = tools::specs()
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|spec| {
-                json!({
-                    "name": spec["name"],
-                    "description": spec["description"],
-                    "input_schema": spec["inputSchema"],
-                })
-            })
-            .collect::<Vec<_>>();
-
         loop {
+            self.compact_history(info).await?;
             let mut messages = self.history.lock().await.clone();
             // Cache the prefix; marked on a copy so history never accumulates
             // more breakpoints than the API allows.
@@ -221,8 +213,8 @@ impl ClaudeApi {
                 "model": info.model.id,
                 "max_tokens": info.max_tokens,
                 "stream": true,
-                "system": [{ "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }],
-                "tools": tools,
+                "system": [{ "type": "text", "text": self.frame.system, "cache_control": { "type": "ephemeral" } }],
+                "tools": self.frame.anthropic_tools,
                 "messages": messages,
             });
             if info.adaptive_thinking {
@@ -273,7 +265,10 @@ impl ClaudeApi {
                 "tool_use" if !calls.is_empty() => {
                     let mut results = Vec::new();
                     for call in &calls {
-                        results.push(self.run_tool(call, request_id, sender).await);
+                        results.push(
+                            self.run_tool(call, request_id, sender, &mut recent_calls)
+                                .await,
+                        );
                     }
                     self.history
                         .lock()
@@ -290,19 +285,65 @@ impl ClaudeApi {
         }
     }
 
-    async fn run_tool(&self, call: &Value, request_id: u64, sender: &Events) -> Value {
+    async fn compact_history(&self, info: &ModelInfo) -> Result<()> {
+        let history = self.history.lock().await.clone();
+        if !history_needs_compaction(&history) {
+            return Ok(());
+        }
+        let response = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&json!({
+                "model": info.model.id,
+                "max_tokens": 4096,
+                "system": COMPACTION_PROMPT,
+                "messages": [{
+                    "role": "user",
+                    "content": serde_json::to_string(&history).unwrap_or_default()
+                }],
+            }))
+            .send()
+            .await
+            .context("could not compact Claude history")?;
+        let value = api_json(response).await?;
+        let summary = value["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|block| block["type"] == "text")
+            .and_then(|block| block["text"].as_str())
+            .filter(|text| !text.trim().is_empty())
+            .context("Claude returned an empty compaction summary")?;
+        *self.history.lock().await = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": compacted_user_message(summary)}]
+        })];
+        Ok(())
+    }
+
+    async fn run_tool(
+        &self,
+        call: &Value,
+        request_id: u64,
+        sender: &Events,
+        recent_calls: &mut ToolLoopGuard,
+    ) -> Value {
         let name = call["name"].as_str().unwrap_or_default().to_owned();
         let call_id = call["id"].as_str().unwrap_or(&name).to_owned();
         let context = tools::audit_context(&call_id, &self.cwd, &name, &call["input"]);
         let _ = sender.send((request_id, ProviderEvent::ToolStarted(context)));
-        let (success, output, failure) =
-            match tools::execute(&self.cwd, &name, &call["input"]).await {
-                Ok(output) => (true, output, None),
-                Err(error) => {
-                    let failure = tools::audit_failure(&error);
-                    (false, format!("{error:#}"), Some(failure))
-                }
-            };
+        let progress = super::tool_progress_reporter(request_id, call_id.clone(), sender.clone());
+        let (success, output, failure) = match recent_calls
+            .execute(&self.cwd, &name, &call["input"], Some(progress))
+            .await
+        {
+            Ok(output) => (true, output, None),
+            Err(error) => {
+                let failure = tools::audit_failure(&error);
+                (false, format!("{error:#}"), Some(failure))
+            }
+        };
         let _ = sender.send((
             request_id,
             ProviderEvent::ToolFinished {
@@ -315,6 +356,20 @@ impl ClaudeApi {
         ));
         tool_result(&call["id"], &output, !success)
     }
+}
+
+async fn fetch_catalog(client: &Client, base_url: &str) -> Result<Vec<ModelInfo>> {
+    let response = client
+        .get(format!("{base_url}/v1/models?limit=1000"))
+        .send()
+        .await
+        .context("could not reach the Claude API")?;
+    Ok(api_json(response).await?["data"]
+        .as_array()
+        .context("the Claude API returned an invalid model list")?
+        .iter()
+        .filter_map(parse_model)
+        .collect())
 }
 
 /// Stops the turn if the caller drops `stream` without calling `interrupt`.

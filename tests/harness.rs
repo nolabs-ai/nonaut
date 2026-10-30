@@ -59,11 +59,24 @@ fn exec(workspace: &Path, command: &str) -> Output {
 }
 
 fn exec_in(workspace: &Path, cwd: &Path, command: &str) -> Output {
+    exec_in_selected(workspace, cwd, command, None)
+}
+
+fn exec_in_selected(
+    workspace: &Path,
+    cwd: &Path,
+    command: &str,
+    selected_workspace: Option<&str>,
+) -> Output {
     // A private config dir keeps the developer's own config.json out of tests.
     let home = workspace.parent().unwrap();
     let config = home.join("config");
     fs::create_dir_all(config_dir(workspace)).unwrap();
-    Command::new(binary())
+    let mut process = Command::new(binary());
+    if let Some(name) = selected_workspace {
+        process.args(["--workspace", name]);
+    }
+    process
         .arg("exec")
         .arg("--cwd")
         .arg(cwd)
@@ -137,10 +150,11 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).unwrap();
 
     let config = serde_json::json!({
-        "sandbox": {
-            "unconfigured_workspaces": "deny",
-            "workspaces": {
-                (mixed.to_string_lossy().to_string()): {
+        "workspace": {
+            "default": "mixed",
+            "definitions": {
+                "mixed": {
+                    "path": mixed,
                     "profiles": ["rust", "python", "node", "go", "bun"]
                 }
             }
@@ -165,7 +179,7 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
         !denied.status.success(),
         "unconfigured workspace was allowed"
     );
-    assert!(combined(&denied).contains("outside every configured workspace"));
+    assert!(combined(&denied).contains("outside workspace"));
 }
 
 fn combined(output: &Output) -> String {
@@ -238,6 +252,48 @@ fn headless_exec_blocks_outside_files_and_inherited_secrets() {
 
 #[test]
 #[ignore = "provider-free black-box integration test"]
+fn sandboxed_commands_can_read_but_not_modify_the_capability_manifest() {
+    let root = TestRoot::new("capability-manifest");
+    let workspace = root.workspace();
+
+    let readable = exec(
+        &workspace,
+        "test -n \"$NONAUT_CAP_FILE\" && test -r \"$NONAUT_CAP_FILE\" && cat \"$NONAUT_CAP_FILE\"",
+    );
+    assert!(readable.status.success(), "{}", combined(&readable));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&readable.stdout).expect("capability file was not JSON");
+    assert_eq!(manifest["enforced_by"], "nono");
+    assert_eq!(
+        manifest["workspace"],
+        serde_json::json!(workspace.canonicalize().unwrap())
+    );
+    assert!(
+        manifest["policy_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+
+    let denied = exec(&workspace, "printf tamper >> \"$NONAUT_CAP_FILE\"");
+    assert!(!denied.status.success(), "capability file was writable");
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn timed_out_commands_return_their_partial_output() {
+    let root = TestRoot::new("partial-timeout");
+    let workspace = root.workspace();
+    write_config(&workspace, r#"{"tools":{"timeout_seconds":1}}"#);
+
+    let output = exec(&workspace, "printf before-timeout; sleep 10");
+    assert!(!output.status.success(), "command unexpectedly completed");
+    let failure = combined(&output);
+    assert!(failure.contains("timed out after 1 seconds"), "{failure}");
+    assert!(failure.contains("before-timeout"), "{failure}");
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
 fn headless_exec_blocks_network_connections() {
     if !curl_available() {
         return;
@@ -278,7 +334,7 @@ fn headless_exec_can_read_the_macos_tls_certificate_bundle() {
 
 #[test]
 #[ignore = "provider-free black-box integration test"]
-fn command_cwd_selects_the_workspace_network_policy() {
+fn explicit_workspace_selection_uses_its_network_policy() {
     if !curl_available() {
         return;
     }
@@ -289,21 +345,89 @@ fn command_cwd_selects_the_workspace_network_policy() {
     fs::create_dir_all(&open).unwrap();
     fs::create_dir_all(&blocked).unwrap();
     let config = serde_json::json!({
-        "sandbox": {
-            "unconfigured_workspaces": "deny",
-            "workspaces": {
-                (open.to_string_lossy().to_string()): {
+        "workspace": {
+            "definitions": {
+                "open": {
+                    "path": open,
                     "network": {"mode": "open"}
                 },
-                (blocked.to_string_lossy().to_string()): {
+                "blocked": {
+                    "path": blocked,
                     "network": {"mode": "blocked"}
                 }
             }
         }
     });
     write_config(&session, &serde_json::to_string(&config).unwrap());
-    assert!(curl_reaches_listener_in(&session, &open));
-    assert!(!curl_reaches_listener_in(&session, &blocked));
+    assert!(curl_reaches_listener_in_selected(&session, &open, "open"));
+    assert!(!curl_reaches_listener_in_selected(
+        &session, &blocked, "blocked"
+    ));
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn named_workspace_references_are_read_only_and_other_workspaces_stay_hidden() {
+    let root = TestRoot::new("workspace-references");
+    let session = root.workspace();
+    let primary = session.join("primary");
+    let reference = session.join("reference");
+    let unrelated = session.join("unrelated");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&reference).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(reference.join("api.txt"), "reference-visible").unwrap();
+    fs::write(unrelated.join("secret.txt"), "must-stay-hidden").unwrap();
+    let config = serde_json::json!({
+        "workspace": {
+            "definitions": {
+                "primary": {
+                    "path": primary,
+                    "references": {"api": {"path": reference}}
+                },
+                "unrelated": {"path": unrelated}
+            }
+        }
+    });
+    write_config(&session, &serde_json::to_string(&config).unwrap());
+
+    let read = exec_in_selected(
+        &session,
+        &primary,
+        &format!("cat {}/api.txt", reference.display()),
+        Some("primary"),
+    );
+    assert!(read.status.success(), "{}", combined(&read));
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "reference-visible"
+    );
+
+    let write = exec_in_selected(
+        &session,
+        &primary,
+        &format!("printf changed > {}/api.txt", reference.display()),
+        Some("primary"),
+    );
+    assert!(
+        !write.status.success(),
+        "reference write unexpectedly succeeded"
+    );
+    assert_eq!(
+        fs::read_to_string(reference.join("api.txt")).unwrap(),
+        "reference-visible"
+    );
+
+    let unrelated_read = exec_in_selected(
+        &session,
+        &primary,
+        &format!("cat {}/secret.txt", unrelated.display()),
+        Some("primary"),
+    );
+    assert!(
+        !unrelated_read.status.success(),
+        "configured sibling was implicitly readable"
+    );
 }
 
 fn write_config(workspace: &Path, config_text: &str) {
@@ -330,6 +454,10 @@ fn curl_reaches_listener(workspace: &Path) -> bool {
 }
 
 fn curl_reaches_listener_in(workspace: &Path, cwd: &Path) -> bool {
+    curl_reaches_listener_in_selected(workspace, cwd, ".")
+}
+
+fn curl_reaches_listener_in_selected(workspace: &Path, cwd: &Path, selected: &str) -> bool {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -351,10 +479,11 @@ fn curl_reaches_listener_in(workspace: &Path, cwd: &Path) -> bool {
         }
         false
     });
-    let output = exec_in(
+    let output = exec_in_selected(
         workspace,
         cwd,
         &format!("curl --silent --show-error --max-time 2 http://{address}"),
+        (selected != ".").then_some(selected),
     );
     let reached = server.join().unwrap();
     assert_eq!(
@@ -429,6 +558,33 @@ fn wait_for(output: &Arc<Mutex<Vec<u8>>>, needle: &str) {
     );
 }
 
+fn wait_for_after(output: &Arc<Mutex<Vec<u8>>>, offset: usize, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let bytes = output.lock().unwrap();
+        if bytes
+            .get(offset..)
+            .is_some_and(|tail| String::from_utf8_lossy(tail).contains(needle))
+        {
+            return;
+        }
+        drop(bytes);
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {needle:?} after output offset {offset}");
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
 fn wait_for_exit(child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -456,7 +612,7 @@ fn tui_exec_interrupts_and_restores_terminal_modes() {
     wait_for(&run.output, "Ask anything");
     run.writer.write_all(b"/exec sleep 30\r").unwrap();
     run.writer.flush().unwrap();
-    wait_for(&run.output, "Running command in nono");
+    wait_for(&run.output, "Running shell <shell-command> in nono");
     run.writer.write_all(b"\x1b").unwrap();
     run.writer.flush().unwrap();
     wait_for(&run.output, "Command interrupted");
@@ -465,11 +621,84 @@ fn tui_exec_interrupts_and_restores_terminal_modes() {
     wait_for_exit(&mut run.child);
 
     let output = run.output.lock().unwrap();
+    assert!(output.windows(8).any(|window| window == b"\x1b[?1000h"));
     assert!(output.windows(8).any(|window| window == b"\x1b[?1000l"));
     assert!(output.windows(8).any(|window| window == b"\x1b[?1049l"));
+    assert!(output.windows(4).any(|window| window == b"\x1b[3J"));
     let config = root.path.join("config/nonaut");
     assert!(config.join("config.json").is_file());
     assert_eq!(fs::read_dir(config).unwrap().count(), 1);
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
+fn tui_reuses_a_sandbox_worker_across_commands() {
+    let root = TestRoot::new("tui-worker-reuse");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
+    wait_for(&run.output, "Ask anything");
+
+    run.writer
+        .write_all(b"/exec printf $PPID > first-parent.txt\r")
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "Completed shell <shell-command>");
+    let outside = root.path.join("outside.txt");
+    fs::write(&outside, "hidden").unwrap();
+    run.writer
+        .write_all(format!("/exec cat {}\r", outside.display()).as_bytes())
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "Failed shell <shell-command>");
+
+    let widened = serde_json::json!({
+        "sandbox": {"filesystem": {"read": [outside]}}
+    });
+    write_config(&workspace, &serde_json::to_string(&widened).unwrap());
+    let offset = run.output.lock().unwrap().len();
+    run.writer
+        .write_all(format!("/exec cat {}\r", outside.display()).as_bytes())
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for_after(&run.output, offset, "Failed shell <shell-command>");
+
+    run.writer
+        .write_all(b"/exec printf $PPID > second-parent.txt\r")
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for_file(&workspace.join("second-parent.txt"));
+    run.writer.write_all(b"/q\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
+
+    let first = fs::read_to_string(workspace.join("first-parent.txt")).unwrap();
+    let second = fs::read_to_string(workspace.join("second-parent.txt")).unwrap();
+    assert_eq!(
+        first, second,
+        "commands ran under different sandbox workers"
+    );
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
+fn tui_command_card_streams_progress_and_elapsed_time() {
+    let root = TestRoot::new("tui-command-progress");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
+    wait_for(&run.output, "Ask anything");
+    run.writer
+        .write_all(b"/exec printf first-line; sleep 2; printf second-line\r")
+        .unwrap();
+    run.writer.flush().unwrap();
+
+    wait_for(&run.output, "Running shell <shell-command>");
+    wait_for(&run.output, "first");
+    wait_for(&run.output, "1 output lines");
+    wait_for(&run.output, "00:00 / 02:00");
+    wait_for(&run.output, "Completed shell <shell-command> · 00:02");
+    run.writer.write_all(b"/q\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
 }
 
 #[test]
@@ -502,10 +731,33 @@ fn tui_changes_view_shows_untracked_work_and_returns_to_agent() {
 
 #[test]
 #[ignore = "provider-free PTY integration test"]
+fn first_launch_setup_saves_the_workspace_and_starts_the_tui() {
+    let root = TestRoot::new("workspace-setup");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &[], &root);
+    wait_for(&run.output, "Configure");
+    run.writer.write_all(b"\x1b[B\r\r\r\r\r\r\r").unwrap();
+    run.writer.flush().unwrap();
+    answer_cursor_position(&mut run);
+    wait_for(&run.output, "Ask anything");
+    run.writer.write_all(b"/q\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
+
+    let config = fs::read_to_string(root.path.join("config/nonaut/config.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(
+        config["workspace"]["definitions"]["workspace"]["path"],
+        "~/workspace"
+    );
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
 fn detached_session_can_be_listed_attached_and_killed() {
     let root = TestRoot::new("session-lifecycle");
     let workspace = root.workspace();
-    let mut run = spawn_pty(&workspace, &[], &root);
+    let mut run = spawn_pty(&workspace, &["--workspace", "."], &root);
     answer_cursor_position(&mut run);
     wait_for(&run.output, "Ask anything");
     run.writer.write_all(b"/detach\r").unwrap();

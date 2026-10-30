@@ -31,8 +31,7 @@ struct Proxy {
 
 static PROXY: OnceLock<Proxy> = OnceLock::new();
 
-/// Starts the proxy on first use and applies the current allowlist, so
-/// edits to the policy take effect on the next tool call. Returns its port.
+/// Starts the session proxy on first use with the pinned allowlist.
 pub(crate) fn ensure(allow_hosts: &[String]) -> Result<u16> {
     let filter = HostFilter::new_strict(allow_hosts);
     if let Some(proxy) = PROXY.get() {

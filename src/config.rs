@@ -24,6 +24,7 @@ pub(crate) struct Config {
     pub ui: UiConfig,
     pub agent: AgentConfig,
     pub tools: ToolsConfig,
+    pub workspace: WorkspaceSettings,
     pub sandbox: SandboxConfig,
 }
 
@@ -33,6 +34,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             agent: AgentConfig::default(),
             tools: ToolsConfig::default(),
+            workspace: WorkspaceSettings::default(),
             sandbox: SandboxConfig {
                 network: NetworkConfig {
                     mode: Some(NetworkMode::Blocked),
@@ -96,18 +98,27 @@ impl Default for ToolsConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct SandboxConfig {
-    pub unconfigured_workspaces: UnconfiguredWorkspaces,
     pub network: NetworkConfig,
     pub filesystem: FilesystemConfig,
-    pub workspaces: BTreeMap<PathBuf, WorkspaceConfig>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum UnconfiguredWorkspaces {
-    #[default]
-    Allow,
-    Deny,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct WorkspaceSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    pub prompt_on_unconfigured: bool,
+    pub definitions: BTreeMap<String, WorkspaceConfig>,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            default: None,
+            prompt_on_unconfigured: true,
+            definitions: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -137,13 +148,21 @@ pub(crate) struct FilesystemConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct WorkspaceConfig {
+    pub path: String,
     pub profiles: Vec<String>,
+    pub references: BTreeMap<String, ReferenceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filesystem: Option<FilesystemConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<WorkspaceToolsConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ReferenceConfig {
+    pub path: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -268,7 +287,7 @@ fn config_dir_from(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Res
     Ok(root.join("nonaut"))
 }
 
-fn update(change: impl FnOnce(&mut Config)) -> Result<()> {
+pub(crate) fn update(change: impl FnOnce(&mut Config)) -> Result<()> {
     let mut config = load()?;
     change(&mut config);
     write(&config)
@@ -329,7 +348,13 @@ mod tests {
         let value = serde_json::to_value(Config::default()).unwrap();
         assert_eq!(value["ui"]["theme"], "dark");
         assert_eq!(value["tools"]["timeout_seconds"], 120);
-        assert_eq!(value["sandbox"]["unconfigured_workspaces"], "allow");
+        assert_eq!(value["workspace"]["prompt_on_unconfigured"], true);
+        assert!(
+            value["workspace"]["definitions"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(value["sandbox"]["network"]["mode"], "blocked");
         assert!(value["agent"].get("provider").is_none());
     }

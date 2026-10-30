@@ -2,21 +2,24 @@ use std::{
     collections::HashMap,
     io,
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
+use crossterm::{Command, clipboard::CopyToClipboard};
 use futures_util::StreamExt;
 use nono::undo::ChangeType;
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget, Wrap},
 };
 use ratatui_textarea::{CursorMove, TextArea};
 use tokio::{
@@ -51,6 +54,7 @@ const PROMPT_MIN_LINES: usize = 2;
 const PROMPT_MAX_LINES: usize = 10;
 const PROMPT_HISTORY_LIMIT: usize = 500;
 const CHANGES_REFRESH: Duration = Duration::from_secs(2);
+static NEXT_MARKDOWN_JOB: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkspaceView {
@@ -124,6 +128,55 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    rendered_markdown: Option<(u16, Vec<Line<'static>>)>,
+    markdown_job: Option<(u16, u64)>,
+}
+
+impl Message {
+    fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            rendered_markdown: None,
+            markdown_job: None,
+        }
+    }
+
+    fn replace(&mut self, role: Role, content: impl Into<String>) {
+        self.role = role;
+        self.content = content.into();
+        self.rendered_markdown = None;
+        self.markdown_job = None;
+    }
+
+    fn append(&mut self, content: &str) {
+        self.content.push_str(content);
+        self.rendered_markdown = None;
+        self.markdown_job = None;
+    }
+
+    fn set_role(&mut self, role: Role) {
+        self.role = role;
+        self.rendered_markdown = None;
+        self.markdown_job = None;
+    }
+}
+
+struct MarkdownResult {
+    message_index: usize,
+    width: u16,
+    job: u64,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConversationSelection {
+    /// Columns are relative to the conversation text area; rows are in the
+    /// fully wrapped conversation document.
+    anchor: (u16, u16),
+    cursor: (u16, u16),
+    dragging: bool,
+    copy_pending: bool,
 }
 
 struct ToolSummary {
@@ -132,6 +185,15 @@ struct ToolSummary {
     succeeded: usize,
     failed: usize,
     last_error: String,
+}
+
+struct RunningTool {
+    message_index: usize,
+    title: String,
+    started_at: Instant,
+    timeout_seconds: Option<u64>,
+    latest_line: String,
+    line_count: usize,
 }
 
 struct ModelPicker {
@@ -192,10 +254,14 @@ pub struct App {
     queued_request: Option<String>,
     streaming_message: Option<usize>,
     tool_summaries: HashMap<String, ToolSummary>,
+    running_tools: HashMap<String, RunningTool>,
+    last_tool_output: Option<(String, String)>,
     session_tokens: u64,
     conversation_scroll: u16,
     conversation_max_scroll: u16,
     follow_output: bool,
+    conversation_area: Rect,
+    conversation_selection: Option<ConversationSelection>,
     command_selection: usize,
     workspace_view: WorkspaceView,
     changes_diff: String,
@@ -210,6 +276,8 @@ pub struct App {
     changes_refreshing: bool,
     changes_tx: mpsc::UnboundedSender<changes::Snapshot>,
     changes_rx: mpsc::UnboundedReceiver<changes::Snapshot>,
+    markdown_tx: mpsc::UnboundedSender<MarkdownResult>,
+    markdown_rx: mpsc::UnboundedReceiver<MarkdownResult>,
     force_redraw: bool,
     cursor_visible: bool,
     should_quit: bool,
@@ -238,6 +306,7 @@ impl App {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (connection_tx, connection_rx) = mpsc::unbounded_channel();
         let (changes_tx, changes_rx) = mpsc::unbounded_channel();
+        let (markdown_tx, markdown_rx) = mpsc::unbounded_channel();
         Self {
             input: Self::new_input(),
             messages: Vec::new(),
@@ -271,10 +340,14 @@ impl App {
             queued_request: None,
             streaming_message: None,
             tool_summaries: HashMap::new(),
+            running_tools: HashMap::new(),
+            last_tool_output: None,
             session_tokens: 0,
             conversation_scroll: 0,
             conversation_max_scroll: 0,
             follow_output: true,
+            conversation_area: Rect::default(),
+            conversation_selection: None,
             command_selection: 0,
             workspace_view: WorkspaceView::Agent,
             changes_diff: String::new(),
@@ -289,6 +362,8 @@ impl App {
             changes_refreshing: false,
             changes_tx,
             changes_rx,
+            markdown_tx,
+            markdown_rx,
             force_redraw: false,
             cursor_visible: true,
             should_quit: false,
@@ -301,7 +376,7 @@ impl App {
         blink.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut changes_refresh = time::interval(CHANGES_REFRESH);
         changes_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        self.begin_changes_refresh();
+        self.begin_changes_summary();
         while !self.should_quit {
             if self.force_redraw {
                 terminal.clear()?;
@@ -309,7 +384,10 @@ impl App {
             }
             terminal.draw(|frame| self.render(frame))?;
             tokio::select! {
-                _ = blink.tick() => self.cursor_visible = !self.cursor_visible,
+                _ = blink.tick() => {
+                    self.cursor_visible = !self.cursor_visible;
+                    self.refresh_running_tools();
+                },
                 _ = changes_refresh.tick() => {
                     if self.workspace_view == WorkspaceView::Changes {
                         self.begin_changes_refresh();
@@ -335,6 +413,9 @@ impl App {
                 }
                 snapshot = self.changes_rx.recv() => {
                     if let Some(snapshot) = snapshot { self.apply_changes_snapshot(snapshot); }
+                }
+                rendered = self.markdown_rx.recv() => {
+                    if let Some(rendered) = rendered { self.apply_markdown(rendered); }
                 }
             }
         }
@@ -464,25 +545,73 @@ impl App {
 
         let conversation = content;
         let prompt = footer;
+        self.conversation_area = Rect::new(
+            conversation.x.saturating_add(2),
+            conversation.y,
+            conversation.width.saturating_sub(4),
+            conversation.height,
+        );
 
         let mut lines = Vec::new();
-        for message in &self.messages {
+        let markdown_tx = self.markdown_tx.clone();
+        for (message_index, message) in self.messages.iter_mut().enumerate() {
             match message.role {
                 Role::You => {
                     for (index, line) in message.content.lines().enumerate() {
                         let marker = if index == 0 { "›  " } else { "   " };
                         lines.push(Line::from(vec![
                             Span::styled(marker, Style::new().fg(palette().accent).bold()),
-                            Span::styled(line, Style::new().fg(palette().foreground).bold()),
+                            Span::styled(
+                                line.to_owned(),
+                                Style::new().fg(palette().foreground).bold(),
+                            ),
                         ]));
                     }
                     lines.push(Line::default());
                 }
                 Role::Assistant => {
-                    let options = MarkdownOptions::new(NonautMarkdown)
-                        .table_width(conversation.width.saturating_sub(4));
-                    let rendered = from_str_with_options(&message.content, &options);
-                    lines.extend(rendered.lines);
+                    let width = conversation.width.saturating_sub(4);
+                    if self.streaming_message == Some(message_index) {
+                        lines.extend(message.content.lines().map(|line| {
+                            Line::styled(line.to_owned(), Style::new().fg(palette().foreground))
+                        }));
+                    } else {
+                        let cached = message
+                            .rendered_markdown
+                            .as_ref()
+                            .filter(|(cached_width, _)| *cached_width == width)
+                            .map(|(_, lines)| lines);
+                        if let Some(cached) = cached {
+                            lines.extend(cached.iter().cloned());
+                        } else {
+                            if message
+                                .markdown_job
+                                .is_none_or(|(job_width, _)| job_width != width)
+                            {
+                                let job = NEXT_MARKDOWN_JOB.fetch_add(1, Ordering::Relaxed);
+                                message.markdown_job = Some((width, job));
+                                if let Some(rendered) = render_markdown(
+                                    markdown_tx.clone(),
+                                    message_index,
+                                    width,
+                                    job,
+                                    message.content.clone(),
+                                ) {
+                                    lines.extend(rendered.iter().cloned());
+                                    message.rendered_markdown = Some((width, rendered));
+                                    message.markdown_job = None;
+                                }
+                            }
+                            if message.rendered_markdown.is_none() {
+                                lines.extend(message.content.lines().map(|line| {
+                                    Line::styled(
+                                        line.to_owned(),
+                                        Style::new().fg(palette().foreground),
+                                    )
+                                }));
+                            }
+                        }
+                    }
                     lines.push(Line::default());
                     lines.push(Line::default());
                 }
@@ -508,7 +637,7 @@ impl App {
                         (line, style)
                     });
                     for (line, style) in rows {
-                        lines.push(Line::styled(line, style));
+                        lines.push(Line::styled(line.to_owned(), style));
                     }
                     lines.push(Line::styled(
                         "─".repeat(usize::from(conversation.width.saturating_sub(4))),
@@ -518,12 +647,25 @@ impl App {
                 }
             }
         }
-        let visible_height = conversation.height;
-        let content_width = usize::from(conversation.width.saturating_sub(4).max(1));
+        let content_width = conversation.width.saturating_sub(4).max(1);
+        self.copy_pending_selection(&lines, content_width);
         let rendered_lines = lines
             .iter()
-            .map(|line| line.width().max(1).div_ceil(content_width))
+            .map(|line| line.width().max(1).div_ceil(usize::from(content_width)))
             .sum::<usize>();
+        let paragraph = Paragraph::new(lines)
+            .style(
+                Style::new()
+                    .fg(palette().foreground)
+                    .bg(palette().background),
+            )
+            .block(
+                Block::new()
+                    .style(Style::new().bg(palette().background))
+                    .padding(Padding::horizontal(2)),
+            )
+            .wrap(Wrap { trim: false });
+        let visible_height = conversation.height;
         self.conversation_max_scroll = u16::try_from(rendered_lines)
             .unwrap_or(u16::MAX)
             .saturating_sub(visible_height);
@@ -533,21 +675,10 @@ impl App {
             self.conversation_scroll = self.conversation_scroll.min(self.conversation_max_scroll);
         }
         frame.render_widget(
-            Paragraph::new(lines)
-                .style(
-                    Style::new()
-                        .fg(palette().foreground)
-                        .bg(palette().background),
-                )
-                .block(
-                    Block::new()
-                        .style(Style::new().bg(palette().background))
-                        .padding(Padding::horizontal(2)),
-                )
-                .wrap(Wrap { trim: false })
-                .scroll((self.conversation_scroll, 0)),
+            paragraph.scroll((self.conversation_scroll, 0)),
             conversation,
         );
+        self.render_conversation_selection(frame);
         self.input.set_cursor_style(if self.cursor_visible {
             Style::new().bg(palette().accent).fg(palette().background)
         } else {
@@ -742,6 +873,14 @@ impl App {
     }
 
     fn begin_changes_refresh(&mut self) {
+        self.begin_changes_load(self.workspace_view == WorkspaceView::Changes);
+    }
+
+    fn begin_changes_summary(&mut self) {
+        self.begin_changes_load(false);
+    }
+
+    fn begin_changes_load(&mut self, full: bool) {
         if self.changes_refreshing {
             return;
         }
@@ -749,19 +888,32 @@ impl App {
         let workspace = self.cwd.clone();
         let sender = self.changes_tx.clone();
         tokio::spawn(async move {
-            let _ = sender.send(changes::load(&workspace).await);
+            let snapshot = if full {
+                changes::load(&workspace).await
+            } else {
+                changes::load_summary(&workspace).await
+            };
+            let _ = sender.send(snapshot);
         });
     }
 
     fn apply_changes_snapshot(&mut self, snapshot: changes::Snapshot) {
         self.changes_refreshing = false;
-        self.changes_diff = snapshot.diff;
+        if snapshot.full {
+            self.changes_diff = snapshot.diff;
+        }
         self.changes_file_count = snapshot.file_count;
         self.changes_error = snapshot.error;
         if self.changes_file_count == 0 && self.workspace_view == WorkspaceView::Changes {
             self.workspace_view = WorkspaceView::Agent;
             self.changes_searching = false;
             self.changes_match = None;
+        }
+        // The user may have opened Review while its summary was still
+        // loading. Follow it with the full content now rather than leaving a
+        // stale or empty diff visible.
+        if !snapshot.full && self.workspace_view == WorkspaceView::Changes {
+            self.begin_changes_refresh();
         }
     }
 
@@ -1141,11 +1293,7 @@ impl App {
             return;
         }
         if let Event::Mouse(mouse) = event {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_conversation_up(3),
-                MouseEventKind::ScrollDown => self.scroll_conversation_down(3),
-                _ => {}
-            }
+            self.handle_conversation_mouse(mouse);
             return;
         }
         if let Event::Key(key) = event
@@ -1634,15 +1782,119 @@ impl App {
             return;
         }
         self.follow_output = false;
+        let previous = self.conversation_scroll;
         self.conversation_scroll = self.conversation_scroll.saturating_sub(lines);
+        self.adjust_drag_selection(previous);
     }
 
     fn scroll_conversation_down(&mut self, lines: u16) {
+        let previous = self.conversation_scroll;
         self.conversation_scroll = self
             .conversation_scroll
             .saturating_add(lines)
             .min(self.conversation_max_scroll);
+        self.adjust_drag_selection(previous);
         self.follow_output = self.conversation_scroll == self.conversation_max_scroll;
+    }
+
+    fn adjust_drag_selection(&mut self, previous_scroll: u16) {
+        let Some(selection) = &mut self.conversation_selection else {
+            return;
+        };
+        if !selection.dragging {
+            return;
+        }
+        selection.cursor.1 = if self.conversation_scroll >= previous_scroll {
+            selection
+                .cursor
+                .1
+                .saturating_add(self.conversation_scroll - previous_scroll)
+        } else {
+            selection
+                .cursor
+                .1
+                .saturating_sub(previous_scroll - self.conversation_scroll)
+        };
+    }
+
+    fn handle_conversation_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_conversation_up(3),
+            MouseEventKind::ScrollDown => self.scroll_conversation_down(3),
+            MouseEventKind::Down(MouseButton::Left)
+                if self
+                    .conversation_area
+                    .contains((mouse.column, mouse.row).into()) =>
+            {
+                self.follow_output = false;
+                self.conversation_selection = Some(ConversationSelection {
+                    anchor: screen_to_document(
+                        self.conversation_area,
+                        self.conversation_scroll,
+                        mouse.column,
+                        mouse.row,
+                    ),
+                    cursor: screen_to_document(
+                        self.conversation_area,
+                        self.conversation_scroll,
+                        mouse.column,
+                        mouse.row,
+                    ),
+                    dragging: true,
+                    copy_pending: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let area = self.conversation_area;
+                if let Some(selection) = &mut self.conversation_selection {
+                    selection.cursor =
+                        screen_to_document(area, self.conversation_scroll, mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let area = self.conversation_area;
+                if let Some(selection) = &mut self.conversation_selection {
+                    selection.cursor =
+                        screen_to_document(area, self.conversation_scroll, mouse.column, mouse.row);
+                    selection.dragging = false;
+                    if selection.anchor == selection.cursor {
+                        self.conversation_selection = None;
+                    } else {
+                        selection.copy_pending = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_conversation_selection(&mut self, frame: &mut Frame) {
+        let Some(selection) = &mut self.conversation_selection else {
+            return;
+        };
+        let area = self.conversation_area.intersection(frame.area());
+        if area.is_empty() {
+            return;
+        }
+        let (start, end) = ordered_selection(selection.anchor, selection.cursor);
+        if let Some((start, end)) = project_selection(area, self.conversation_scroll, start, end) {
+            highlight_selection(frame.buffer_mut(), area, start, end);
+        }
+    }
+
+    fn copy_pending_selection(&mut self, lines: &[Line<'_>], width: u16) {
+        let Some(selection) = &mut self.conversation_selection else {
+            return;
+        };
+        if !selection.copy_pending {
+            return;
+        }
+        let (start, end) = ordered_selection(selection.anchor, selection.cursor);
+        let text = selected_document_text(lines, width, start, end);
+        if !text.is_empty() {
+            let _ = copy_to_clipboard(&text);
+        }
+        selection.copy_pending = false;
     }
 
     fn follow_latest_output(&mut self) {
@@ -1652,6 +1904,17 @@ impl App {
     fn submit(&mut self) {
         let content = self.input.lines().join("\n").trim().to_owned();
         if content.is_empty() {
+            return;
+        }
+        if self.connection.is_some() && !is_local_command(&content) {
+            if self.messages.last().is_none_or(|message| {
+                message.content != "Provider is still connecting. Your prompt was not sent."
+            }) {
+                self.push(
+                    Role::System,
+                    "Provider is still connecting. Your prompt was not sent.",
+                );
+            }
             return;
         }
         self.follow_latest_output();
@@ -1670,9 +1933,22 @@ impl App {
                 self.messages.clear();
                 self.streaming_message = None;
                 self.tool_summaries.clear();
+                self.running_tools.clear();
                 self.conversation_scroll = 0;
                 self.conversation_max_scroll = 0;
             }
+            "/details" => match self.last_tool_output.clone() {
+                Some((title, output)) if !output.trim().is_empty() => {
+                    self.push(
+                        Role::System,
+                        format!("Full output: {title}\n{}", output.trim_end()),
+                    );
+                }
+                Some((title, _)) => {
+                    self.push(Role::System, format!("{title} produced no output."));
+                }
+                None => self.push(Role::System, "No tool output is available yet."),
+            },
             "/provider" => self.open_provider_picker(),
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
@@ -1770,6 +2046,10 @@ impl App {
 
     fn apply_theme(&mut self, selected: Theme) {
         select_theme(selected);
+        for message in &mut self.messages {
+            message.rendered_markdown = None;
+            message.markdown_job = None;
+        }
         // The prompt caches its styles, so rebuild it with the new palette.
         self.input = Self::new_input();
         let name = selected.name();
@@ -1961,11 +2241,17 @@ impl App {
         );
         audit.tool = "exec".to_owned();
         let undo = self.undo.clone();
+        crate::undo::arm(&workspace, undo);
         self.request_uses_provider = false;
         self.request = Some(tokio::spawn(async move {
-            checkpoint(undo).await;
             let _ = sender.send((request_id, ProviderEvent::ToolStarted(audit)));
-            let result = crate::tools::execute_shell(&workspace, &cwd, command).await;
+            let progress = crate::providers::tool_progress_reporter(
+                request_id,
+                call_id.clone(),
+                sender.clone(),
+            );
+            let result =
+                crate::tools::execute_shell(&workspace, &cwd, command, Some(progress)).await;
             let (success, output, failure) = match result {
                 Ok(output) => (true, output, None),
                 Err(error) => {
@@ -1999,9 +2285,8 @@ impl App {
         self.request_generation = self.request_generation.wrapping_add(1);
         let request_id = self.request_generation;
         let sender = self.events_tx.clone();
-        let undo = self.undo.clone();
+        crate::undo::arm(&self.cwd, self.undo.clone());
         self.request = Some(tokio::spawn(async move {
-            checkpoint(undo).await;
             if let Err(error) = provider.stream(content, request_id, sender.clone()).await {
                 let _ = sender.send((request_id, ProviderEvent::Failed(format!("{error:#}"))));
             }
@@ -2017,7 +2302,6 @@ impl App {
             request.abort();
         }
         self.streaming_message = None;
-        self.queued_request = None;
         self.session_tokens = 0;
         self.provider = None;
         self.active_provider = Some(provider);
@@ -2128,7 +2412,7 @@ impl App {
                 if let Some(index) = self.streaming_message
                     && let Some(message) = self.messages.get_mut(index)
                 {
-                    message.content.push_str(&delta);
+                    message.append(&delta);
                 }
             }
             ProviderEvent::Usage(tokens) => {
@@ -2137,17 +2421,24 @@ impl App {
             }
             ProviderEvent::ToolStarted(context) => {
                 self.audit_tool_started(&context);
-                let tool = context.tool;
+                let tool = context.tool.clone();
                 self.streaming_message = None;
                 if Self::compact_tool(&tool) {
                     self.start_compact_tool(&tool);
                 } else {
-                    if tool == "exec" {
-                        self.push(Role::Running, "Running command in nono…");
-                    } else {
-                        self.push(Role::Running, format!("Running {tool} in nono…"));
-                    }
+                    self.start_running_tool(context);
                 }
+            }
+            ProviderEvent::ToolProgress {
+                call_id,
+                latest_line,
+                line_count,
+            } => {
+                if let Some(running) = self.running_tools.get_mut(&call_id) {
+                    running.latest_line = latest_line;
+                    running.line_count = line_count;
+                }
+                self.refresh_running_tool(&call_id);
             }
             ProviderEvent::ToolFinished {
                 call_id,
@@ -2161,13 +2452,39 @@ impl App {
                 if Self::compact_tool(&tool) && self.finish_compact_tool(&tool, success, &output) {
                     return;
                 }
-                if let Some(message) = self
+                let running = self.running_tools.remove(&call_id);
+                let title = running
+                    .as_ref()
+                    .map(|running| running.title.clone())
+                    .unwrap_or_else(|| Self::tool_title(&tool, &[]));
+                let elapsed = running.as_ref().map(|running| running.started_at.elapsed());
+                self.last_tool_output = Some((title.clone(), output.clone()));
+                if let Some(running) = running {
+                    let role = if success { Role::Success } else { Role::Error };
+                    let status = if success { "Completed" } else { "Failed" };
+                    let content = Self::completed_tool_content(
+                        status,
+                        &title,
+                        elapsed.unwrap_or_default(),
+                        &output,
+                        failure.as_ref(),
+                    );
+                    if let Some(message) = self.messages.get_mut(running.message_index) {
+                        message.replace(role, content);
+                    }
+                } else if let Some(message) = self
                     .messages
                     .iter_mut()
                     .rev()
                     .find(|message| message.role == Role::Running)
                 {
-                    message.role = Role::System;
+                    message.set_role(Role::System);
+                }
+                if tool == "run_command" || tool == "exec" {
+                    if success {
+                        self.begin_changes_refresh();
+                    }
+                    return;
                 }
                 if success {
                     if matches!(
@@ -2212,6 +2529,7 @@ impl App {
             ProviderEvent::Interrupted => {
                 self.finish_audit_session(false);
                 let provider_request = self.request_uses_provider;
+                self.finish_running_tools("Interrupted");
                 self.streaming_message = None;
                 if let Some(request) = self.request.take() {
                     request.abort();
@@ -2232,6 +2550,8 @@ impl App {
                 self.messages.clear();
                 self.streaming_message = None;
                 self.tool_summaries.clear();
+                self.running_tools.clear();
+                self.last_tool_output = None;
                 self.session_tokens = 0;
                 self.request = None;
                 self.request_uses_provider = false;
@@ -2239,9 +2559,10 @@ impl App {
             }
             ProviderEvent::Failed(error) => {
                 self.finish_audit_session(false);
+                self.finish_running_tools("Stopped");
                 if let Some(index) = self.streaming_message.take() {
                     if let Some(message) = self.messages.get_mut(index) {
-                        message.content = format!("Request failed: {error}");
+                        message.replace(Role::Error, format!("Request failed: {error}"));
                     }
                 } else {
                     self.push(Role::System, format!("Request failed: {error}"));
@@ -2321,12 +2642,161 @@ impl App {
         matches!(tool, "read_file" | "list_directory")
     }
 
+    fn start_running_tool(&mut self, context: ToolContext) {
+        let title = Self::tool_title(&context.tool, &context.argv_display);
+        let message_index = self.messages.len();
+        let running = RunningTool {
+            message_index,
+            title,
+            started_at: Instant::now(),
+            timeout_seconds: context.timeout_seconds,
+            latest_line: String::new(),
+            line_count: 0,
+        };
+        let content = Self::running_tool_content(&running, self.conversation_area.width);
+        self.push(Role::Running, content);
+        self.running_tools.insert(context.call_id, running);
+    }
+
+    fn refresh_running_tools(&mut self) {
+        let call_ids = self.running_tools.keys().cloned().collect::<Vec<_>>();
+        for call_id in call_ids {
+            self.refresh_running_tool(&call_id);
+        }
+    }
+
+    fn finish_running_tools(&mut self, status: &str) {
+        for (_, running) in self.running_tools.drain() {
+            let content = format!(
+                "{status} {} · {}",
+                running.title,
+                Self::format_duration(running.started_at.elapsed())
+            );
+            if let Some(message) = self.messages.get_mut(running.message_index) {
+                message.replace(Role::Error, content);
+            }
+        }
+    }
+
+    fn refresh_running_tool(&mut self, call_id: &str) {
+        let Some(running) = self.running_tools.get(call_id) else {
+            return;
+        };
+        let content = Self::running_tool_content(running, self.conversation_area.width);
+        if let Some(message) = self.messages.get_mut(running.message_index) {
+            message.replace(Role::Running, content);
+        }
+    }
+
+    fn tool_title(tool: &str, argv: &[String]) -> String {
+        if !argv.is_empty() {
+            return argv.join(" ");
+        }
+        if tool == "exec" || tool == "run_command" {
+            "command".to_owned()
+        } else {
+            tool.to_owned()
+        }
+    }
+
+    fn running_tool_content(running: &RunningTool, width: u16) -> String {
+        let elapsed = running.started_at.elapsed();
+        let timing = running.timeout_seconds.map_or_else(
+            || Self::format_duration(elapsed),
+            |timeout| {
+                format!(
+                    "{} / {}",
+                    Self::format_duration(elapsed),
+                    Self::format_duration(Duration::from_secs(timeout))
+                )
+            },
+        );
+        let title = format!("Running {} in nono…", running.title);
+        let mut content = Self::right_aligned_status(&title, &timing, width);
+        if !running.latest_line.is_empty() {
+            content.push_str("\n  ");
+            content.push_str(&running.latest_line);
+        }
+        if running.line_count > 0 {
+            content.push_str(&format!(
+                "\n  {} output lines · Esc cancel",
+                running.line_count
+            ));
+        }
+        content
+    }
+
+    fn completed_tool_content(
+        status: &str,
+        title: &str,
+        elapsed: Duration,
+        output: &str,
+        failure: Option<&crate::tools::ToolFailure>,
+    ) -> String {
+        let mut content = format!("{status} {title} · {}", Self::format_duration(elapsed));
+        if let Some(summary) = failure.and_then(Self::failure_summary) {
+            content.push_str("\n  ");
+            content.push_str(summary);
+        }
+        let (detail, hidden) = Self::compact_tool_output(output, 10);
+        if !detail.is_empty() {
+            content.push('\n');
+            content.push_str(&detail);
+        }
+        if hidden > 0 {
+            content.push_str(&format!(
+                "\n… {hidden} lines hidden · /details for full output"
+            ));
+        }
+        content
+    }
+
+    fn failure_summary(failure: &crate::tools::ToolFailure) -> Option<&'static str> {
+        match failure.reason {
+            "sandbox_denied" | "workspace_denied" => {
+                Some("The configured sandbox policy denied this operation.")
+            }
+            "timeout" => Some("The command exceeded its configured deadline."),
+            "tls_error" => Some("TLS setup or certificate verification failed."),
+            "network_error" => Some("A network connection or download failed."),
+            "command_not_found" => Some("The executable was not found in the sandbox PATH."),
+            "command_not_executable" => Some("The executable could not be started."),
+            _ => None,
+        }
+    }
+
+    fn compact_tool_output(output: &str, visible: usize) -> (String, usize) {
+        let lines = output.lines().collect::<Vec<_>>();
+        let hidden = lines.len().saturating_sub(visible);
+        let detail = lines
+            .iter()
+            .skip(hidden)
+            .map(|line| line.chars().take(240).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (detail, hidden)
+    }
+
+    fn format_duration(duration: Duration) -> String {
+        let seconds = duration.as_secs();
+        format!("{:02}:{:02}", seconds / 60, seconds % 60)
+    }
+
+    fn right_aligned_status(title: &str, timing: &str, width: u16) -> String {
+        let width = usize::from(width);
+        let padding = width.saturating_sub(title.chars().count() + timing.chars().count());
+        if padding < 2 {
+            format!("{title} · {timing}")
+        } else {
+            format!("{title}{}{timing}", " ".repeat(padding))
+        }
+    }
+
     fn start_compact_tool(&mut self, tool: &str) {
         if let Some(summary) = self.tool_summaries.get_mut(tool) {
             summary.started += 1;
             if let Some(message) = self.messages.get_mut(summary.message_index) {
-                message.role = Role::Running;
-                message.content = Self::running_summary(tool, summary.started);
+                message.replace(Role::Running, Self::running_summary(tool, summary.started));
             }
             return;
         }
@@ -2363,8 +2833,7 @@ impl App {
         };
         let content = Self::completed_summary(tool, summary);
         if let Some(message) = self.messages.get_mut(summary.message_index) {
-            message.role = role;
-            message.content = content;
+            message.replace(role, content);
         }
         true
     }
@@ -2412,23 +2881,205 @@ impl App {
     }
 
     fn push(&mut self, role: Role, content: impl Into<String>) {
-        self.messages.push(Message {
-            role,
-            content: content.into(),
-        });
+        self.messages.push(Message::new(role, content));
+    }
+
+    fn apply_markdown(&mut self, rendered: MarkdownResult) {
+        let Some(message) = self.messages.get_mut(rendered.message_index) else {
+            return;
+        };
+        if message.markdown_job != Some((rendered.width, rendered.job)) {
+            return;
+        }
+        message.rendered_markdown = Some((rendered.width, rendered.lines));
+        message.markdown_job = None;
     }
 }
 
-/// Snapshots the workspace before a turn can change it. Hashing runs off the
-/// event loop so the interface stays responsive on large workspaces.
-async fn checkpoint(undo: Option<Arc<Mutex<Undo>>>) {
-    if let Some(undo) = undo {
-        let _ = tokio::task::spawn_blocking(move || {
-            undo.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .checkpoint();
-        })
-        .await;
+fn render_markdown(
+    sender: mpsc::UnboundedSender<MarkdownResult>,
+    message_index: usize,
+    width: u16,
+    job: u64,
+    content: String,
+) -> Option<Vec<Line<'static>>> {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Some(markdown_lines(&content, width));
+    }
+    tokio::task::spawn_blocking(move || {
+        let lines = markdown_lines(&content, width);
+        let _ = sender.send(MarkdownResult {
+            message_index,
+            width,
+            job,
+            lines,
+        });
+    });
+    None
+}
+
+fn is_local_command(content: &str) -> bool {
+    SLASH_COMMANDS.iter().any(|command| {
+        content == command.name || (command.name == "/exec" && content.starts_with("/exec "))
+    })
+}
+
+fn screen_to_document(area: Rect, scroll: u16, column: u16, row: u16) -> (u16, u16) {
+    let column = column
+        .clamp(area.x, area.right().saturating_sub(1))
+        .saturating_sub(area.x);
+    let row = row
+        .clamp(area.y, area.bottom().saturating_sub(1))
+        .saturating_sub(area.y)
+        .saturating_add(scroll);
+    (column, row)
+}
+
+fn ordered_selection(first: (u16, u16), second: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (first.1, first.0) <= (second.1, second.0) {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn selection_columns(area: Rect, start: (u16, u16), end: (u16, u16), row: u16) -> (u16, u16) {
+    let first = if row == start.1 { start.0 } else { area.x };
+    let last = if row == end.1 {
+        end.0
+    } else {
+        area.right().saturating_sub(1)
+    };
+    (first, last)
+}
+
+fn project_selection(
+    area: Rect,
+    scroll: u16,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> Option<((u16, u16), (u16, u16))> {
+    let visible_end = scroll.saturating_add(area.height.saturating_sub(1));
+    if end.1 < scroll || start.1 > visible_end {
+        return None;
+    }
+    let first_row = start.1.max(scroll);
+    let last_row = end.1.min(visible_end);
+    let right = area.width.saturating_sub(1);
+    let first_column = if first_row == start.1 {
+        start.0.min(right)
+    } else {
+        0
+    };
+    let last_column = if last_row == end.1 {
+        end.0.min(right)
+    } else {
+        right
+    };
+    Some((
+        (
+            area.x.saturating_add(first_column),
+            area.y.saturating_add(first_row - scroll),
+        ),
+        (
+            area.x.saturating_add(last_column),
+            area.y.saturating_add(last_row - scroll),
+        ),
+    ))
+}
+
+fn highlight_selection(
+    buffer: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+) {
+    for row in start.1..=end.1 {
+        let (first, last) = selection_columns(area, start, end, row);
+        for column in first..=last {
+            let cell = &mut buffer[(column, row)];
+            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
+fn selected_text(
+    buffer: &ratatui::buffer::Buffer,
+    area: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> String {
+    let mut output = String::new();
+    for row in start.1..=end.1 {
+        let (first, last) = selection_columns(area, start, end, row);
+        let line_start = output.len();
+        for column in first..=last {
+            output.push_str(buffer[(column, row)].symbol());
+        }
+        output.truncate(line_start + output[line_start..].trim_end().len());
+        if row != end.1 {
+            output.push('\n');
+        }
+    }
+    output.trim_end().to_owned()
+}
+
+fn selected_document_text(
+    lines: &[Line<'_>],
+    width: u16,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let height = end.1.saturating_sub(start.1).saturating_add(1);
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .scroll((start.1, 0))
+        .render(area, &mut buffer);
+    selected_text(
+        &buffer,
+        area,
+        (start.0.min(width - 1), 0),
+        (end.0.min(width - 1), height - 1),
+    )
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut sequence = String::new();
+    CopyToClipboard::to_clipboard_from(text)
+        .write_ansi(&mut sequence)
+        .map_err(|error| error.to_string())?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(sequence.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
+    let options = MarkdownOptions::new(NonautMarkdown).table_width(width);
+    from_str_with_options(content, &options)
+        .lines
+        .into_iter()
+        .map(own_line)
+        .collect()
+}
+
+fn own_line(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), span.style))
+            .collect(),
     }
 }
 
@@ -2775,6 +3426,63 @@ mod tests {
     }
 
     #[test]
+    fn command_cards_show_identity_progress_timing_and_fold_output() {
+        let mut app = app_with_input("");
+        app.conversation_area.width = 80;
+        let mut context = ToolContext::minimal("command-1", "run_command");
+        context.argv_display = vec!["make".to_owned(), "check".to_owned()];
+        context.timeout_seconds = Some(120);
+        app.handle_provider_event(0, ProviderEvent::ToolStarted(context));
+        assert!(
+            app.messages[0]
+                .content
+                .contains("Running make check in nono…")
+        );
+        assert!(app.messages[0].content.contains("00:00 / 02:00"));
+
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolProgress {
+                call_id: "command-1".to_owned(),
+                latest_line: "Checking nonaut v0.0.3".to_owned(),
+                line_count: 42,
+            },
+        );
+        assert!(app.messages[0].content.contains("Checking nonaut v0.0.3"));
+        assert!(app.messages[0].content.contains("42 output lines"));
+
+        let output = (1..=20)
+            .map(|line| format!("diagnostic {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                call_id: "command-1".to_owned(),
+                tool: "run_command".to_owned(),
+                success: false,
+                output: output.clone(),
+                failure: Some(crate::tools::ToolFailure {
+                    reason: "process_exit",
+                    exit_code: Some(1),
+                }),
+            },
+        );
+        assert_eq!(app.messages[0].role, Role::Error);
+        assert!(
+            app.messages[0]
+                .content
+                .contains("Failed make check · 00:00")
+        );
+        assert!(app.messages[0].content.contains("10 lines hidden"));
+        assert!(!app.messages[0].content.contains("diagnostic 1\n"));
+
+        app.input.insert_str("/details");
+        app.submit();
+        assert!(app.messages.last().unwrap().content.contains(&output));
+    }
+
+    #[test]
     fn repeated_reads_share_one_counted_status() {
         let mut app = app_with_input("");
         for index in 0..3 {
@@ -2831,6 +3539,32 @@ mod tests {
         app.request.take().unwrap().abort();
     }
 
+    #[tokio::test]
+    async fn prompts_wait_for_the_provider_to_connect() {
+        let mut app = app_with_input("start immediately");
+        app.connection = Some(tokio::spawn(std::future::pending()));
+
+        app.submit();
+
+        assert_eq!(app.input.lines(), ["start immediately"]);
+        assert!(app.queued_request.is_none());
+        assert!(app.request.is_none());
+        assert!(app.messages.last().unwrap().content.contains("not sent"));
+        app.connection.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn local_commands_work_while_the_provider_connects() {
+        let mut app = app_with_input("/theme");
+        app.connection = Some(tokio::spawn(std::future::pending()));
+
+        app.submit();
+
+        assert!(app.theme_picker.is_some());
+        assert!(app.input.is_empty());
+        app.connection.take().unwrap().abort();
+    }
+
     #[test]
     fn conversation_scroll_stops_and_resumes_following_output() {
         let mut app = App::new_shell(PathBuf::from("."));
@@ -2844,6 +3578,95 @@ mod tests {
         app.scroll_conversation_down(3);
         assert_eq!(app.conversation_scroll, 20);
         assert!(app.follow_output);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_conversation_history() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.conversation_area = Rect::new(0, 0, 80, 20);
+        app.conversation_scroll = 20;
+        app.conversation_max_scroll = 20;
+
+        app.handle_conversation_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert_eq!(app.conversation_scroll, 17);
+        assert!(!app.follow_output);
+    }
+
+    #[test]
+    fn conversation_selection_extracts_and_highlights_visible_text() {
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer.set_string(0, 0, "alpha", Style::default());
+        buffer.set_string(0, 1, "beta", Style::default());
+        let start = (1, 0);
+        let end = (2, 1);
+
+        assert_eq!(selected_text(&buffer, area, start, end), "lpha\nbet");
+        highlight_selection(&mut buffer, area, start, end);
+        assert_eq!(
+            buffer[(1, 0)].style().add_modifier(Modifier::REVERSED),
+            buffer[(1, 0)].style()
+        );
+        assert_ne!(
+            buffer[(0, 0)].style().add_modifier(Modifier::REVERSED),
+            buffer[(0, 0)].style()
+        );
+    }
+
+    #[test]
+    fn conversation_selection_survives_scrolling_and_projects_into_view() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.conversation_scroll = 20;
+        app.conversation_max_scroll = 40;
+        app.conversation_selection = Some(ConversationSelection {
+            anchor: (2, 18),
+            cursor: (4, 24),
+            dragging: false,
+            copy_pending: false,
+        });
+
+        app.scroll_conversation_up(3);
+
+        let selection = app.conversation_selection.unwrap();
+        assert_eq!(selection.anchor, (2, 18));
+        assert_eq!(selection.cursor, (4, 24));
+        assert_eq!(
+            project_selection(
+                Rect::new(10, 5, 20, 4),
+                17,
+                selection.anchor,
+                selection.cursor
+            ),
+            Some(((12, 6), (29, 8)))
+        );
+    }
+
+    #[test]
+    fn dragging_selection_extends_with_scrolling_and_copies_offscreen_rows() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.conversation_scroll = 10;
+        app.conversation_max_scroll = 30;
+        app.conversation_selection = Some(ConversationSelection {
+            anchor: (1, 8),
+            cursor: (2, 12),
+            dragging: true,
+            copy_pending: false,
+        });
+
+        app.scroll_conversation_down(3);
+
+        assert_eq!(app.conversation_selection.unwrap().cursor, (2, 15));
+        let lines = [Line::from("alpha"), Line::from("beta"), Line::from("gamma")];
+        assert_eq!(
+            selected_document_text(&lines, 10, (1, 0), (2, 2)),
+            "lpha\nbeta\ngam"
+        );
     }
 
     #[test]
@@ -2869,6 +3692,26 @@ mod tests {
         let visible = rendered.to_string();
         assert!(visible.contains("permission denied"));
         assert!(!visible.contains("```"));
+    }
+
+    #[tokio::test]
+    async fn settled_markdown_renders_off_the_ui_thread_and_is_cached() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.push(Role::Assistant, "**cached** response");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(app.messages[0].markdown_job.is_some());
+        assert!(app.messages[0].rendered_markdown.is_none());
+
+        let rendered = tokio::time::timeout(Duration::from_secs(2), app.markdown_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.apply_markdown(rendered);
+        assert!(app.messages[0].rendered_markdown.is_some());
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert!(app.messages[0].markdown_job.is_none());
     }
 
     #[test]

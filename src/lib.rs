@@ -12,14 +12,18 @@ mod sessions;
 mod tools;
 mod tui;
 mod undo;
+mod workspace;
+mod workspace_setup;
 
 use anyhow::{Context, Result};
 use crossterm::{
+    cursor::MoveTo,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    terminal::{Clear, ClearType},
 };
 
 use tui::App;
@@ -29,11 +33,14 @@ pub fn run_sandbox() -> Result<()> {
 }
 
 pub async fn run_mcp(workspace: std::path::PathBuf) -> Result<()> {
+    tools::prewarm(&workspace)
+        .await
+        .context("could not prepare the workspace sandbox")?;
     mcp::run(workspace).await.context("MCP server failed")
 }
 
-pub async fn run(args: Vec<String>) -> Result<()> {
-    sessions::run_cli(args).await
+pub async fn run(args: Vec<String>, requested_workspace: Option<String>) -> Result<()> {
+    sessions::run_cli(args, requested_workspace.as_deref()).await
 }
 
 #[cfg(feature = "control-plane")]
@@ -62,9 +69,24 @@ pub fn print_error(error: &anyhow::Error) {
     cli::print_error(error);
 }
 
-pub async fn run_exec(cwd: std::path::PathBuf, command: String) -> Result<String> {
-    let session_root =
-        std::env::current_dir().context("could not determine the working directory")?;
+pub fn workspace_root(requested: Option<&str>) -> Result<std::path::PathBuf> {
+    let launch = std::env::current_dir().context("could not determine the working directory")?;
+    Ok(workspace::select(&launch, requested)?.root)
+}
+
+pub fn run_workspace_command(args: Vec<String>) -> Result<()> {
+    workspace::run_command(args)
+}
+
+pub fn run_workspace_setup() -> Result<()> {
+    workspace_setup::configure_current()
+}
+
+pub async fn run_exec(
+    session_root: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    command: String,
+) -> Result<String> {
     let mut audit =
         control_plane::start_session(&session_root, None, None, None).unwrap_or_else(|error| {
             eprintln!("Warning: could not start the local audit session: {error:#}");
@@ -86,7 +108,7 @@ pub async fn run_exec(cwd: std::path::PathBuf, command: String) -> Result<String
         eprintln!("Warning: could not record the audit event: {error:#}");
         audit = None;
     }
-    let result = tools::execute_shell(&session_root, &cwd, command).await;
+    let result = tools::execute_shell(&session_root, &cwd, command, None).await;
     if audit.is_some() {
         let success = result.is_ok();
         let output = result
@@ -122,6 +144,10 @@ pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Re
 
 pub async fn run_tui() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
+    let warmup_workspace = cwd.clone();
+    tokio::spawn(async move {
+        let _ = tools::prewarm(&warmup_workspace).await;
+    });
     tui::init_theme();
     let no_auto_connect = std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some();
     let mut app = if no_auto_connect {
@@ -158,6 +184,12 @@ pub async fn run_tui() -> Result<()> {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
     ratatui::restore();
+    let _ = execute!(
+        std::io::stdout(),
+        Clear(ClearType::Purge),
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    );
     result.context("terminal error")?;
     Ok(())
 }

@@ -71,9 +71,15 @@ pub(crate) fn render_help(color: bool) -> String {
 
     let commands = vec![
         (
+            "--workspace NAME|., -w NAME|.",
+            "Select the active workspace",
+        ),
+        (
             "exec [--cwd DIR] -- <command>",
             "Run a command in the nono sandbox",
         ),
+        ("setup", "Configure the current directory"),
+        ("workspace <command>", "Manage named workspaces"),
         ("ps", "List persistent sessions"),
         ("attach <session>", "Attach to a persistent session"),
         ("kill <session>", "Stop a persistent session"),
@@ -157,7 +163,7 @@ mod tests {
     #[test]
     fn plain_help_lists_every_cli_command() {
         let help = render_help(false);
-        for command in ["exec", "ps", "attach", "kill", "help"] {
+        for command in ["exec", "setup", "workspace", "ps", "attach", "kill", "help"] {
             assert!(help.contains(command));
         }
         #[cfg(feature = "control-plane")]

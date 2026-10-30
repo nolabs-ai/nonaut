@@ -1,188 +1,152 @@
 # Configuration
 
-Nonaut keeps all persistent settings in one JSON file:
-
-```text
-$XDG_CONFIG_HOME/nonaut/config.json
-```
-
-When `XDG_CONFIG_HOME` is unset, the path is
-`~/.config/nonaut/config.json` on Linux and macOS. Nonaut creates the file on
-first run and preserves it across application updates.
+Nonaut stores persistent settings in `$XDG_CONFIG_HOME/nonaut/config.json`,
+which defaults to `~/.config/nonaut/config.json`. The file lives outside every
+workspace so an agent cannot widen its own permissions.
 
 ## Defaults
 
-The generated configuration is intentionally conservative:
+The generated configuration is conservative:
 
 ```json
 {
-  "ui": {
-    "theme": "dark"
-  },
-  "agent": {
-    "providers": {}
-  },
-  "tools": {
-    "timeout_seconds": 120
+  "ui": { "theme": "dark" },
+  "agent": { "providers": {} },
+  "tools": { "timeout_seconds": 120 },
+  "workspace": {
+    "prompt_on_unconfigured": true,
+    "definitions": {}
   },
   "sandbox": {
-    "unconfigured_workspaces": "allow",
-    "network": {
-      "mode": "blocked",
-      "allow_domains": []
-    },
-    "filesystem": {
-      "read": [],
-      "write": []
-    },
-    "workspaces": {}
+    "network": { "mode": "blocked", "allow_domains": [] },
+    "filesystem": { "read": [], "write": [] }
   }
 }
 ```
 
-The TUI updates the same file when a provider connects successfully or the
-user changes the provider, model, reasoning effort, or theme.
+With no saved workspace, the exact directory where `nonaut` starts becomes a
+one-time read/write workspace. Its parent and siblings are not granted. An
+interactive launch offers to save that directory, select a configured
+workspace, or continue without changing the configuration.
 
-## Workspace example
-
-This example denies operations in unconfigured workspaces, enables the Rust
-toolchain for one project, and allows Cargo to reach crates.io:
+## Named workspaces
 
 ```json
 {
-  "ui": {
-    "theme": "dark"
-  },
-  "agent": {
-    "provider": "codex",
-    "providers": {}
-  },
-  "tools": {
-    "timeout_seconds": 120
-  },
-  "sandbox": {
-    "unconfigured_workspaces": "deny",
-    "network": {
-      "mode": "blocked",
-      "allow_domains": []
-    },
-    "filesystem": {
-      "read": [],
-      "write": []
-    },
-    "workspaces": {
-      "~/Work/nonaut": {
+  "workspace": {
+    "default": "nonaut",
+    "prompt_on_unconfigured": true,
+    "definitions": {
+      "nonaut": {
+        "path": "~/Work/nonaut",
         "profiles": ["rust"],
+        "references": {
+          "nono": { "path": "~/Work/nono" }
+        },
         "network": {
           "mode": "allowlist",
           "allow_domains": [
+            "github.com",
+            "api.github.com",
             "index.crates.io",
             "static.crates.io"
           ]
         },
-        "tools": {
-          "timeout_seconds": 600
-        }
+        "tools": { "timeout_seconds": 600 }
       }
     }
   }
 }
 ```
 
-## Settings
+The primary workspace is read/write. References are read-only and exist only
+for that workspace. Configuring another workspace does not make it reachable
+from the active session.
 
-### Agent and UI
+Select a workspace explicitly from any directory:
 
-- `ui.theme` selects the TUI palette.
-- `agent.provider` stores the successfully connected provider ID.
-- `agent.providers.<provider>.model` stores the selected provider model.
-- `agent.providers.<provider>.reasoning` stores its reasoning effort.
-- `agent.providers.<provider>.base_url` overrides an OpenAI-compatible endpoint.
-- `agent.providers.<provider>.api_key_env` names the environment variable that
-  contains its API key. Secrets are never stored in the configuration file.
+```console
+$ nonaut --workspace nonaut
+$ nonaut -w nonaut
+$ nonaut exec --workspace nonaut -- cargo test
+```
 
-For example, a custom OpenAI-compatible service can be configured as:
+Use `--workspace .` to choose the exact current directory even when a default
+workspace is configured.
+
+Selection order is:
+
+1. `--workspace NAME` or `--workspace .`;
+2. the most specific configured workspace containing the launch directory;
+3. `workspace.default`;
+4. the exact launch directory as a one-time workspace.
+
+The selected workspace is pinned for the entire session.
+
+## Workspace commands
+
+```console
+$ nonaut workspace list
+$ nonaut workspace show nonaut
+$ nonaut workspace add ~/Work/nonaut --name nonaut --profile rust --default
+$ nonaut workspace add ~/Work/nonaut --reference nono=~/Work/nono
+$ nonaut setup
+$ nonaut workspace edit nonaut
+$ nonaut workspace default nonaut
+$ nonaut workspace remove nonaut
+```
+
+Running interactive Nonaut from an unconfigured directory provides the visual
+equivalent of `workspace add`, including profile, network and reference setup.
+`nonaut setup` opens it explicitly for the current directory.
+
+## Development profiles
+
+Profiles expose installed toolchains read-only and create private writable
+caches and a private workspace HOME. Available profiles are `rust`, `python`,
+`node`, `go` and `bun`. Profiles do not enable network access.
+
+## Additional filesystem access
+
+Global grants apply to every workspace:
 
 ```json
-"agent": {
-  "provider": "openai-compatible",
-  "providers": {
-    "openai-compatible": {
-      "base_url": "https://api.example.com/v1",
-      "api_key_env": "EXAMPLE_API_KEY",
-      "model": "example-model"
-    }
+"sandbox": {
+  "filesystem": {
+    "read": ["~/.config/tool/settings.json"],
+    "write": ["~/Work/shared-output"]
   }
 }
 ```
 
-### Tools
+A workspace may add its own grants with the same `filesystem` object. Paths
+must be absolute or begin with `~/`. Workspace grants extend global grants.
 
-`tools.timeout_seconds` limits each tool call, `run_command`, and `/exec`.
-The default is 120 seconds and the maximum is 3600. A workspace can override
-it under `sandbox.workspaces.<path>.tools`.
+## Network
 
-When a command times out or is interrupted, Nonaut stops its entire process
-group rather than leaving child processes running.
+The global `sandbox.network` policy is inherited unless a workspace supplies
+its own complete `network` object:
 
-### Filesystem
+- `blocked` denies network access and is the default.
+- `allowlist` permits HTTPS through Nonaut's filtering proxy.
+- `open` permits unrestricted network access from sandboxed tools.
 
-Tools always receive read/write access to the selected workspace. Additional
-host paths can be granted globally or per workspace:
+An allowlist must contain at least one domain. `*.example.com` matches
+subdomains; a bare `*` is rejected. Cloud metadata and link-local destinations
+remain denied.
 
-```json
-"filesystem": {
-  "read": ["~/.config/tool/settings.json"],
-  "write": ["~/Work/shared-output"]
-}
-```
+## Tool timeout
 
-Paths must be absolute or start with `~/`. Workspace filesystem entries are
-added to the global entries.
+`tools.timeout_seconds` applies globally and defaults to 120 seconds. A
+workspace can override it under its `tools` object. Values must be between 1
+and 3600 seconds. Timed-out or interrupted commands have their complete process
+group stopped.
 
-### Network
+## Agent and UI settings
 
-`sandbox.network.mode` accepts:
-
-- `blocked` — no network access; this is the default.
-- `allowlist` — HTTPS through Nonaut's domain-filtering proxy.
-- `open` — unrestricted network access from sandboxed tools.
-
-An allowlist requires at least one domain:
-
-```json
-"network": {
-  "mode": "allowlist",
-  "allow_domains": ["api.example.com", "*.packages.example.com"]
-}
-```
-
-Allowlisted traffic is HTTPS on port 443. `*.` matches subdomains; a bare `*`
-is rejected. Cloud metadata and link-local destinations remain denied. A
-workspace network object replaces the global network object rather than
-extending it.
-
-### Workspace selection
-
-Before each operation, Nonaut canonicalizes its target path and selects the
-most specific configured ancestor. This allows one session to work across
-multiple projects while applying each project's own rules.
-
-`sandbox.unconfigured_workspaces` controls unmatched operations:
-
-- `allow` keeps them within the session scope using global policy.
-- `deny` requires the operation to fall under a configured workspace.
-
-Commands select policy from their working directory. Use either form:
-
-```text
-/exec --cwd ../another-project cargo test
-```
-
-```sh
-nonaut exec --cwd ../another-project -- "cargo test"
-```
-
-See [development profiles](profiles.md) for toolchain access and
-[sandbox and security](security.md) for the security implications of each
-setting.
+- `ui.theme` selects the TUI palette.
+- `agent.provider` stores the successfully connected provider ID.
+- `agent.providers.<provider>.model` stores the selected model.
+- `agent.providers.<provider>.reasoning` stores its reasoning effort.
+- `base_url` and `api_key_env` configure an OpenAI-compatible provider. The
+  environment variable name is stored; its secret value is not.

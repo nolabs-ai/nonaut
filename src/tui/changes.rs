@@ -9,6 +9,9 @@ pub(super) struct Snapshot {
     pub diff: String,
     pub file_count: usize,
     pub error: Option<String>,
+    /// Summary refreshes only update the badge. A full refresh also replaces
+    /// the rendered diff.
+    pub full: bool,
 }
 
 #[derive(Debug)]
@@ -28,6 +31,7 @@ pub(super) async fn load(workspace: &Path) -> Snapshot {
         Err(error) => {
             return Snapshot {
                 error: Some(error),
+                full: true,
                 ..Snapshot::default()
             };
         }
@@ -116,6 +120,28 @@ pub(super) async fn load(workspace: &Path) -> Snapshot {
         diff,
         file_count: entries.len(),
         error: None,
+        full: true,
+    }
+}
+
+/// Count changes without reading and diffing their contents. The agent view
+/// only needs the Review badge, so the more expensive full diff is deferred
+/// until that view is opened.
+pub(super) async fn load_summary(workspace: &Path) -> Snapshot {
+    match git(
+        workspace,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await
+    {
+        Ok(status) => Snapshot {
+            file_count: parse_status(&status).len(),
+            ..Snapshot::default()
+        },
+        Err(error) => Snapshot {
+            error: Some(error),
+            ..Snapshot::default()
+        },
     }
 }
 
@@ -202,6 +228,37 @@ mod tests {
         assert_eq!(snapshot.file_count, 1);
         assert!(snapshot.error.is_none());
         assert!(snapshot.diff.contains("visible untracked contents"));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn summary_counts_changes_without_building_a_diff() {
+        let workspace = std::env::temp_dir().join(format!(
+            "nonaut-changes-summary-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .current_dir(&workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(workspace.join("new.txt"), "not loaded into the summary\n").unwrap();
+
+        let snapshot = load_summary(&workspace).await;
+
+        assert_eq!(snapshot.file_count, 1);
+        assert!(snapshot.diff.is_empty());
+        assert!(!snapshot.full);
+        assert!(snapshot.error.is_none());
         fs::remove_dir_all(workspace).unwrap();
     }
 }

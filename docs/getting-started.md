@@ -51,6 +51,11 @@ network access, and hides the real user home by default. Use a development
 [profile](profiles.md) and explicit [workspace policy](configuration.md) when
 the project needs a toolchain or network domains.
 
+On the first interactive launch from an unconfigured directory, choose a
+one-time session or save a named workspace. The setup screen can add
+development profiles, network policy, and read-only reference workspaces. Run
+`nonaut setup` later to edit the current directory's configuration.
+
 ## Project instructions
 
 Nonaut includes `AGENTS.md` from the workspace root in provider instructions,
@@ -60,7 +65,7 @@ sandbox.
 
 ## Verify the sandbox without a provider
 
-`nonaut exec` uses the same policy and fresh Nono sandbox as agent tools:
+`nonaut exec` uses the same policy-pinned Nono sandbox as agent tools:
 
 ```sh
 nonaut exec -- "pwd"

@@ -17,7 +17,7 @@
 - **Private control plane.** Provider authentication and model inference remain outside the tool sandbox.
 - **Bring your provider.** Use Codex, Claude, Gemini, GitHub Copilot, or any OpenAI-compatible endpoint.
 - **Stay in control.** Review staged, unstaged, and untracked changes in the TUI, or roll back a whole agent turn with `/undo`.
-- **Built for real projects.** Compose Rust, Python, Node.js, Go, and Bun development profiles, then detach from persistent sessions and reconnect later.
+- **Built for real projects.** Compose Rust, Python, Node.js, Go, and Bun development profiles, inspect code with compact syntax indexes, then detach and reconnect later.
 
 ## Preview
 
@@ -43,6 +43,10 @@ cd my-project
 nonaut
 ```
 
+The first launch offers a one-time session or a guided named workspace with
+development profiles, network policy, and optional read-only references to
+related projects.
+
 On first use, choose a provider and authenticate with its CLI or API-key
 environment variable. Nonaut only saves the provider after the connection
 succeeds.
@@ -63,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | 
 | Component | Runs where | Access |
 | --- | --- | --- |
 | TUI and provider connection | Nonaut control plane | Authentication and model APIs |
-| Model-requested tools | Fresh Nono sandbox | Active workspace and an isolated home |
+| Model-requested tools | Policy-pinned Nono worker | Active workspace and an isolated home |
 | Additional capabilities | Nono sandbox | Only paths and network explicitly granted |
 
 The TUI and provider connection remain outside the tool sandbox. See the [security model](docs/security.md) for boundaries, platform behavior, and limitations.

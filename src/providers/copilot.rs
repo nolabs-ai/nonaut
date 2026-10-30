@@ -27,6 +27,7 @@ use super::{
 
 type Events = mpsc::UnboundedSender<(u64, ProviderEvent)>;
 type ActiveEvents = Arc<StdMutex<Option<(u64, Events)>>>;
+const MODEL_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub(crate) struct Copilot {
@@ -35,7 +36,7 @@ pub(crate) struct Copilot {
     models: Vec<Model>,
     selected_model: Arc<StdRwLock<Model>>,
     selected_effort: Arc<StdRwLock<String>>,
-    session: Arc<RwLock<Arc<Session>>>,
+    session: Arc<RwLock<Option<Arc<Session>>>>,
     active_events: ActiveEvents,
 }
 
@@ -47,13 +48,22 @@ impl Copilot {
         let client = Client::start(ClientOptions::new().with_program(executable).with_cwd(cwd))
             .await
             .context("could not start the GitHub Copilot CLI")?;
-        let models = client
-            .list_models()
-            .await
-            .context("could not list GitHub Copilot models")?
-            .into_iter()
-            .map(model_option)
-            .collect::<Vec<_>>();
+        let models = match super::cache::load("copilot", MODEL_CACHE_AGE) {
+            Some(models) => models,
+            None => {
+                let models = client
+                    .list_models()
+                    .await
+                    .context("could not list GitHub Copilot models")?
+                    .into_iter()
+                    .map(model_option)
+                    .collect::<Vec<_>>();
+                if !models.is_empty() {
+                    let _ = super::cache::store("copilot", &models);
+                }
+                models
+            }
+        };
         let saved = config::load_provider_config(ProviderKind::Copilot)?;
         let selected = saved
             .model
@@ -73,17 +83,21 @@ impl Copilot {
             })
             .unwrap_or_else(|| selected.default_reasoning_effort.clone());
         let active_events = ActiveEvents::default();
-        let session = create_session(&client, cwd, &selected.id, &effort, &active_events).await?;
 
-        Ok(Self {
+        let provider = Self {
             client,
             cwd: cwd.to_path_buf(),
             models,
             selected_model: Arc::new(StdRwLock::new(selected)),
             selected_effort: Arc::new(StdRwLock::new(effort)),
-            session: Arc::new(RwLock::new(Arc::new(session))),
+            session: Arc::new(RwLock::new(None)),
             active_events,
-        })
+        };
+        let warm = provider.clone();
+        tokio::spawn(async move {
+            let _ = warm.ensure_session().await;
+        });
+        Ok(provider)
     }
 
     pub fn model(&self) -> Model {
@@ -134,19 +148,9 @@ impl Copilot {
 
     pub async fn new_session(&self) -> Result<()> {
         self.interrupt().await?;
-        let old = self.session.read().await.clone();
-        old.disconnect().await.ok();
-        let model = self.model();
-        let effort = self.effort();
-        let new = create_session(
-            &self.client,
-            &self.cwd,
-            &model.id,
-            &effort,
-            &self.active_events,
-        )
-        .await?;
-        *self.session.write().await = Arc::new(new);
+        if let Some(old) = self.session.write().await.take() {
+            old.disconnect().await.ok();
+        }
         Ok(())
     }
 
@@ -161,18 +165,18 @@ impl Copilot {
         if lock(&self.active_events).is_none() {
             return Ok(());
         }
-        self.session
-            .read()
-            .await
-            .abort()
-            .await
-            .context("could not interrupt GitHub Copilot")?;
+        if let Some(session) = self.session.read().await.clone() {
+            session
+                .abort()
+                .await
+                .context("could not interrupt GitHub Copilot")?;
+        }
         lock(&self.active_events).take();
         Ok(())
     }
 
     async fn run_turn(&self, input: String, request_id: u64, sender: &Events) -> Result<()> {
-        let session = self.session.read().await.clone();
+        let session = self.ensure_session().await?;
         let model = self.model();
         let effort = self.effort();
         let options = (effort != "default").then(|| {
@@ -232,6 +236,29 @@ impl Copilot {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    async fn ensure_session(&self) -> Result<Arc<Session>> {
+        if let Some(session) = self.session.read().await.clone() {
+            return Ok(session);
+        }
+        let mut session = self.session.write().await;
+        if let Some(existing) = session.as_ref() {
+            return Ok(existing.clone());
+        }
+        let model = self.model();
+        let created = Arc::new(
+            create_session(
+                &self.client,
+                &self.cwd,
+                &model.id,
+                &self.effort(),
+                &self.active_events,
+            )
+            .await?,
+        );
+        *session = Some(created.clone());
+        Ok(created)
+    }
 }
 
 struct NonautTool {
@@ -256,7 +283,20 @@ impl ToolHandler for NonautTool {
             );
             let _ = sender.send((*request_id, ProviderEvent::ToolStarted(context)));
         }
-        let result = tools::execute(&self.workspace, &self.name, &invocation.arguments).await;
+        let progress = active.as_ref().map(|(request_id, sender)| {
+            super::tool_progress_reporter(
+                *request_id,
+                invocation.tool_call_id.clone(),
+                sender.clone(),
+            )
+        });
+        let result = tools::execute_with_progress(
+            &self.workspace,
+            &self.name,
+            &invocation.arguments,
+            progress,
+        )
+        .await;
         let (success, output, failure) = match result {
             Ok(output) => (true, output, None),
             Err(error) => {

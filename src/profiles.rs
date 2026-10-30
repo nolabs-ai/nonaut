@@ -50,18 +50,35 @@ const PROFILES: &[ProfileDefinition] = &[
     },
 ];
 
+pub(crate) fn available_names() -> Vec<&'static str> {
+    PROFILES.iter().map(|profile| profile.name).collect()
+}
+
 pub(crate) fn resolve(names: &[String], home: &Path, workspace: &Path) -> Result<ProfilePlan> {
-    let mut selected = BTreeSet::new();
-    for name in names {
-        if !selected.insert(name.as_str()) {
-            bail!("workspace profile `{name}` is listed more than once");
-        }
-    }
+    validate_names(names)?;
     let mut combined = ProfilePlan::default();
     for name in names {
         combined.merge(name, resolve_one(name, home, workspace)?)?;
     }
     Ok(combined)
+}
+
+pub(crate) fn validate_names(names: &[String]) -> Result<()> {
+    let mut selected = BTreeSet::new();
+    for name in names {
+        if !selected.insert(name.as_str()) {
+            bail!("workspace profile `{name}` is listed more than once");
+        }
+        if !PROFILES.iter().any(|profile| profile.name == name) {
+            let available = PROFILES
+                .iter()
+                .map(|profile| profile.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("unsupported workspace profile `{name}`; available profiles: {available}");
+        }
+    }
+    Ok(())
 }
 
 fn resolve_one(name: &str, home: &Path, workspace: &Path) -> Result<ProfilePlan> {
@@ -108,6 +125,7 @@ fn extend_unique(target: &mut Vec<PathBuf>, paths: Vec<PathBuf>) {
 fn rust(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
     let cargo = home.join(".cargo");
     let cache = profile_cache(home, "rust", workspace)?;
+    let bundled_cli_cache = cache_directory(&cache, "bundled-cli")?;
     let mut plan = ProfilePlan::default();
     add_existing(&mut plan.read_paths, cargo.join("bin"));
     add_existing(&mut plan.read_paths, home.join(".rustup"));
@@ -120,6 +138,10 @@ fn rust(home: &Path, workspace: &Path) -> Result<ProfilePlan> {
     plan.environment.insert(
         "RUSTUP_HOME".to_owned(),
         home.join(".rustup").to_string_lossy().into_owned(),
+    );
+    plan.environment.insert(
+        "BUNDLED_CLI_CACHE_DIR".to_owned(),
+        bundled_cli_cache.to_string_lossy().into_owned(),
     );
     Ok(plan)
 }
@@ -360,6 +382,29 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("listed more than once"));
+    }
+
+    #[test]
+    fn rust_profile_uses_a_stable_bundled_cli_cache() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/profile-tests")
+            .join(format!("cache-{}", std::process::id()));
+        let home = directory.join("home");
+        let workspace = directory.join("workspace");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let plan = rust(&home, &workspace).unwrap();
+        let bundled = PathBuf::from(&plan.environment["BUNDLED_CLI_CACHE_DIR"]);
+        assert!(bundled.ends_with("bundled-cli"));
+        assert!(bundled.is_dir());
+        assert!(
+            plan.write_paths
+                .iter()
+                .any(|path| bundled.starts_with(path))
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
