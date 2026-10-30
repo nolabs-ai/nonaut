@@ -74,13 +74,13 @@ pub struct ToolContext {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub argv_display: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_hash: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,
@@ -457,6 +457,19 @@ fn hex(bytes: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_context_accepts_omitted_empty_vectors() {
+        let context: ToolContext = serde_json::from_value(json!({
+            "call_id": "call-1",
+            "tool": "edit_file",
+            "operation": "write"
+        }))
+        .unwrap();
+
+        assert!(context.argv_display.is_empty());
+        assert!(context.profiles.is_empty());
+    }
 
     #[test]
     fn finalizes_a_verifiable_session_shape() {

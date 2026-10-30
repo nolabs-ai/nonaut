@@ -58,6 +58,34 @@ mod enabled {
         Ok(())
     }
 
+    pub(crate) fn run_unenroll(args: Vec<String>) -> Result<()> {
+        if matches!(
+            args.first().map(String::as_str),
+            Some("help" | "--help" | "-h")
+        ) {
+            crate::print_command_help(
+                "unenroll",
+                "nonaut unenroll",
+                "Remove this device's local control-plane enrollment credentials.",
+            );
+            return Ok(());
+        }
+        if !args.is_empty() {
+            bail!("usage: nonaut unenroll");
+        }
+
+        let client = Client::from_environment()?;
+        if client.unenroll()? {
+            println!("Removed local control-plane enrollment credentials.");
+            println!(
+                "Queued audit data was retained. Revoke the device in the control plane if needed."
+            );
+        } else {
+            println!("Not enrolled with a control plane.");
+        }
+        Ok(())
+    }
+
     pub(crate) async fn run_audit(args: Vec<String>) -> Result<()> {
         let client = Client::from_environment()?;
         match args.first().map(String::as_str) {

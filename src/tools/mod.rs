@@ -34,13 +34,13 @@ pub(crate) struct ToolContext {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub argv_display: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_hash: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,

@@ -117,6 +117,16 @@ impl Client {
         }
     }
 
+    /// Remove this device's local enrollment credentials.
+    ///
+    /// Durable audit sessions and queued deliveries are intentionally retained.
+    /// This does not revoke the device in the remote control plane.
+    pub fn unenroll(&self) -> Result<bool> {
+        let key_removed = remove_file_if_exists(&self.paths.key)?;
+        let enrollment_removed = remove_file_if_exists(&self.paths.enrollment)?;
+        Ok(key_removed || enrollment_removed)
+    }
+
     pub async fn enroll(&self, enrollment: Enrollment<'_>) -> Result<EnrollmentStatus> {
         if self.status()?.is_some() || self.paths.key.exists() {
             bail!("Nonaut is already enrolled; key rotation is not implemented");
@@ -417,9 +427,29 @@ async fn response_text(mut response: reqwest::Response) -> Result<String> {
     String::from_utf8(body).context("platform returned non-UTF-8 text")
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_client(root: &Path) -> Client {
+        Client {
+            paths: Paths {
+                enrollment: root.join("config/control-plane.json"),
+                key: root.join("state/control-plane/device.pk8"),
+                sessions: root.join("state/audit"),
+                outbox: root.join("state/outbox"),
+            },
+            http: reqwest::Client::new(),
+        }
+    }
 
     #[test]
     fn accepts_https_and_loopback_http_only() {
@@ -452,5 +482,34 @@ mod tests {
             canonical_request("device-1", "1234", request_id, "sha256:abcd"),
             "nono-request-v1\nPOST\n/api/v1/audit/ingest\ndevice-1\n1234\n01900000-0000-7000-8000-000000000001\nsha256:abcd"
         );
+    }
+
+    #[test]
+    fn unenroll_removes_credentials_and_is_idempotent() {
+        let root = std::env::temp_dir().join(format!("nonaut-unenroll-test-{}", Uuid::now_v7()));
+        let client = test_client(&root);
+        storage::write(&client.paths.key, b"private key").unwrap();
+        storage::write(&client.paths.enrollment, b"enrollment").unwrap();
+        storage::write(&client.paths.outbox.join("queued.json"), b"queued").unwrap();
+
+        assert!(client.unenroll().unwrap());
+        assert!(!client.paths.key.exists());
+        assert!(!client.paths.enrollment.exists());
+        assert!(client.paths.outbox.join("queued.json").exists());
+        assert!(!client.unenroll().unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unenroll_removes_an_orphaned_key() {
+        let root = std::env::temp_dir().join(format!("nonaut-unenroll-test-{}", Uuid::now_v7()));
+        let client = test_client(&root);
+        storage::write(&client.paths.key, b"private key").unwrap();
+
+        assert!(client.unenroll().unwrap());
+        assert!(!client.paths.key.exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -97,6 +97,7 @@ pub(crate) fn render_help(color: bool) -> String {
                     "enroll --url URL --token TOKEN",
                     "Enroll for audit delivery",
                 ),
+                ("unenroll", "Remove local enrollment credentials"),
                 ("audit <status|sync>", "Inspect or retry audit delivery"),
             ],
         );
@@ -167,11 +168,11 @@ mod tests {
             assert!(help.contains(command));
         }
         #[cfg(feature = "control-plane")]
-        for command in ["enroll", "audit"] {
+        for command in ["enroll", "unenroll", "audit"] {
             assert!(help.contains(command));
         }
         #[cfg(not(feature = "control-plane"))]
-        for command in ["enroll", "audit"] {
+        for command in ["enroll", "unenroll", "audit"] {
             assert!(!help.contains(command));
         }
         assert!(help.contains("/help"));

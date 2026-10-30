@@ -49,6 +49,11 @@ pub async fn run_enroll(args: Vec<String>) -> Result<()> {
 }
 
 #[cfg(feature = "control-plane")]
+pub fn run_unenroll(args: Vec<String>) -> Result<()> {
+    control_plane::run_unenroll(args)
+}
+
+#[cfg(feature = "control-plane")]
 pub async fn run_audit(args: Vec<String>) -> Result<()> {
     control_plane::run_audit(args).await
 }

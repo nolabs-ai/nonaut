@@ -25,11 +25,15 @@ installs it to `~/.local/bin`. Set `NONAUT_INSTALL_DIR` to use another
 directory. Run the same command again to update.
 
 The standard build has no enrollment or central audit-delivery dependency.
-Install the control-plane build to add `nonaut enroll` and `nonaut audit`:
+Install the control-plane build to add `nonaut enroll`, `nonaut unenroll`, and
+`nonaut audit`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nolabs-ai/nonaut/main/install.sh | sh -s -- --control-plane
 ```
+
+Remove local enrollment credentials with `nonaut unenroll`. This retains queued
+audit data and does not revoke the device in the remote control plane.
 
 Running the standard installer later replaces it with the lean build. The
 installer records the selected flavor, so rerunning either command updates the

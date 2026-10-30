@@ -63,6 +63,14 @@ fn run() -> anyhow::Result<()> {
             "this Nonaut build does not include control-plane support; rebuild with `--features control-plane`"
         );
     }
+    if mode == Some("unenroll") {
+        #[cfg(feature = "control-plane")]
+        return nonaut::run_unenroll(args.into_iter().skip(1).collect());
+        #[cfg(not(feature = "control-plane"))]
+        anyhow::bail!(
+            "this Nonaut build does not include control-plane support; rebuild with `--features control-plane`"
+        );
+    }
     if mode == Some("audit") {
         #[cfg(feature = "control-plane")]
         return runtime.block_on(nonaut::run_audit(args.into_iter().skip(1).collect()));
