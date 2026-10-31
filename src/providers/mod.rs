@@ -416,7 +416,7 @@ impl Provider {
         }
     }
 
-    pub fn models(&self) -> &[Model] {
+    pub fn models(&self) -> Vec<Model> {
         match self {
             Self::Disabled => unreachable!("the disabled provider cannot be connected"),
             #[cfg(feature = "provider-codex")]

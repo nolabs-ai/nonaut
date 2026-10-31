@@ -1103,8 +1103,17 @@ impl App {
                 } else {
                     Style::new().fg(palette().foreground).bg(palette().surface)
                 };
+                // The raw id is noise when the name already says it
+                // (`sonnet` vs "Claude Sonnet 5.5", `gpt-5` vs "GPT-5").
+                let name = model.display_name.to_lowercase();
+                let id = model.id.to_lowercase();
+                let hint = if name.contains(&id) || id.replace(['-', '_'], " ") == name {
+                    String::new()
+                } else {
+                    format!("  {}", model.id)
+                };
                 Line::styled(
-                    format!(" {marker} {current} {}  {}", model.display_name, model.id),
+                    format!(" {marker} {current} {}{hint}", model.display_name),
                     style,
                 )
             })
@@ -2111,6 +2120,14 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
+        // Providers may learn better names as they run, so ask for fresh ones.
+        if let Some(provider) = &self.provider {
+            self.models = provider.models();
+            let current = provider.model();
+            if current.id == self.model_id {
+                self.model_name = current.display_name;
+            }
+        }
         let models = self.models.clone();
         if models.is_empty() {
             self.push(Role::System, "The provider returned no selectable models.");

@@ -21,10 +21,15 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, developer_instructions};
+use super::{
+    BASE_INSTRUCTIONS, Model, ProviderEvent, ReasoningOption, cache, developer_instructions,
+};
 use crate::tools;
 
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const LEARNED_CACHE_KEY: &str = "claude-code-learned-models";
+const LEARNED_MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const DEFAULT_EFFORT: &str = "default";
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const MCP_PREFIX: &str = "mcp__nonaut__";
@@ -44,7 +49,7 @@ type Events = mpsc::UnboundedSender<(u64, ProviderEvent)>;
 pub(crate) struct ClaudeCode {
     executable: PathBuf,
     cwd: PathBuf,
-    models: Vec<Model>,
+    models: Arc<RwLock<Vec<Model>>>,
     selected_model: Arc<RwLock<Model>>,
     selected_reasoning_effort: Arc<RwLock<String>>,
     session_id: Arc<Mutex<Option<String>>>,
@@ -68,17 +73,107 @@ impl ClaudeCode {
     }
 
     fn connected(executable: PathBuf, cwd: &std::path::Path) -> Self {
-        let models = claude_models();
+        let mut models = claude_models();
+        // Versions are never hardcoded: they were learned from the CLI on
+        // earlier turns and remembered here until the next turn refreshes them.
+        let learned = cache::load::<HashMap<String, String>>(LEARNED_CACHE_KEY, LEARNED_MAX_AGE)
+            .unwrap_or_default();
+        for model in &mut models {
+            if let Some(name) = learned.get(&model.id) {
+                model.display_name.clone_from(name);
+            }
+        }
         let selected_model = models[0].clone();
-        Self {
+        let provider = Self {
             executable,
             cwd: cwd.to_path_buf(),
-            models,
+            models: Arc::new(RwLock::new(models)),
             selected_model: Arc::new(RwLock::new(selected_model)),
             selected_reasoning_effort: Arc::new(RwLock::new(DEFAULT_EFFORT.to_owned())),
             session_id: Arc::default(),
             active: Arc::default(),
+        };
+        // Aliases move when a new model ships, so re-resolve them in the
+        // background on every connect; the cache above covers the gap.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let probe = provider.clone();
+            tokio::spawn(async move { probe.resolve_aliases().await });
         }
+        provider
+    }
+
+    async fn resolve_aliases(&self) {
+        let probes = self
+            .models()
+            .into_iter()
+            .map(|model| {
+                let alias = model.id;
+                let provider = self.clone();
+                tokio::spawn(async move {
+                    let resolved = provider.probe_alias(&alias).await;
+                    (alias, resolved)
+                })
+            })
+            .collect::<Vec<_>>();
+        // Learned one at a time: each update rewrites the shared cache file.
+        for probe in probes {
+            if let Ok((alias, Some(resolved))) = probe.await {
+                self.learn_model(&alias, &resolved);
+            }
+        }
+    }
+
+    /// Starts the CLI only far enough to read its init event, which names the
+    /// concrete model an alias resolves to, then kills it.
+    async fn probe_alias(&self, alias: &str) -> Option<String> {
+        let mut child = Command::new(&self.executable)
+            .current_dir(&self.cwd)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("ANTHROPIC_BASE_URL")
+            .args([
+                "--print",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--model",
+                alias,
+                "--tools",
+                "",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--no-chrome",
+                "x",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let mut lines = BufReader::new(child.stdout.take()?).lines();
+        let resolved = tokio::time::timeout(PROBE_TIMEOUT, async {
+            for _ in 0..8 {
+                let line = lines.next_line().await.ok()??;
+                let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if event["type"] == "system"
+                    && let Some(model) = event["model"].as_str()
+                {
+                    return Some(model.to_owned());
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        let _ = child.start_kill();
+        resolved
     }
 
     pub fn model(&self) -> Model {
@@ -88,16 +183,48 @@ impl ClaudeCode {
             .clone()
     }
 
-    pub fn models(&self) -> &[Model] {
-        &self.models
+    pub fn models(&self) -> Vec<Model> {
+        self.models
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Records the concrete model the CLI resolved an alias to, so the picker
+    /// can show "Claude Sonnet 5.5" instead of the bare alias.
+    fn learn_model(&self, alias: &str, resolved_id: &str) {
+        let Some(name) = display_from_model_id(resolved_id) else {
+            return;
+        };
+        for model in self
+            .models
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+            .filter(|model| model.id == alias)
+        {
+            model.display_name.clone_from(&name);
+        }
+        let mut selected = self
+            .selected_model
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if selected.id == alias {
+            selected.display_name.clone_from(&name);
+        }
+        drop(selected);
+        let mut learned =
+            cache::load::<HashMap<String, String>>(LEARNED_CACHE_KEY, LEARNED_MAX_AGE)
+                .unwrap_or_default();
+        learned.insert(alias.to_owned(), name);
+        let _ = cache::store(LEARNED_CACHE_KEY, &learned);
     }
 
     pub fn select_model(&self, model_id: &str) -> Result<Model> {
         let model = self
-            .models
-            .iter()
+            .models()
+            .into_iter()
             .find(|model| model.id == model_id)
-            .cloned()
             .with_context(|| format!("Claude Code does not list model {model_id}"))?;
         *self
             .selected_model
@@ -153,12 +280,13 @@ impl ClaudeCode {
 
     async fn run_turn(&self, input: String, request_id: u64, sender: &Events) -> Result<()> {
         let executable = std::env::current_exe().context("could not locate Nonaut")?;
-        let model = self
+        let alias = self
             .selected_model
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .id
             .clone();
+        let model = alias.clone();
         let effort = self
             .selected_reasoning_effort
             .read()
@@ -265,6 +393,9 @@ impl ClaudeCode {
         if let Some(session) = state.session_id {
             *self.session_id.lock().await = Some(session);
         }
+        if let Some(resolved) = &state.resolved_model {
+            self.learn_model(&alias, resolved);
+        }
         if !status.success() {
             bail!(
                 "Claude Code exited with {status}: {}",
@@ -293,6 +424,7 @@ impl Drop for AbortOnDrop {
 struct CliStream {
     workspace: PathBuf,
     session_id: Option<String>,
+    resolved_model: Option<String>,
     tool_names: HashMap<String, String>,
     completed: bool,
     error: Option<String>,
@@ -303,6 +435,7 @@ impl CliStream {
         Self {
             workspace,
             session_id: None,
+            resolved_model: None,
             tool_names: HashMap::new(),
             completed: false,
             error: None,
@@ -314,6 +447,11 @@ impl CliStream {
             self.session_id = Some(session.to_owned());
         }
         match event["type"].as_str().unwrap_or_default() {
+            "system" => {
+                if let Some(model) = event["model"].as_str() {
+                    self.resolved_model = Some(model.to_owned());
+                }
+            }
             "stream_event" => {
                 let delta = &event["event"]["delta"];
                 if delta["type"] == "text_delta"
@@ -441,6 +579,28 @@ fn claude_models() -> Vec<Model> {
     .collect()
 }
 
+/// Turns a resolved id such as `claude-sonnet-5-5` into "Claude Sonnet 5.5".
+fn display_from_model_id(id: &str) -> Option<String> {
+    let id = id.split('[').next()?.strip_prefix("claude-")?;
+    let mut name = Vec::new();
+    let mut version = Vec::new();
+    for part in id.split('-').filter(|part| !part.is_empty()) {
+        let numeric = part.bytes().all(|byte| byte.is_ascii_digit());
+        if numeric && part.len() == 8 {
+            continue; // release date suffix
+        }
+        if numeric {
+            version.push(part.to_owned());
+        } else {
+            let mut chars = part.chars();
+            let first = chars.next()?.to_uppercase().collect::<String>();
+            name.push(first + chars.as_str());
+        }
+    }
+    (!name.is_empty() && !version.is_empty())
+        .then(|| format!("Claude {} {}", name.join(" "), version.join(".")))
+}
+
 fn claude_executable() -> PathBuf {
     if let Some(path) = std::env::var_os("CLAUDE_BIN").filter(|path| !path.is_empty()) {
         return path.into();
@@ -541,6 +701,23 @@ mod tests {
             receiver.try_recv().unwrap().1,
             ProviderEvent::Usage(15)
         ));
+    }
+
+    #[test]
+    fn names_resolved_models_from_their_ids() {
+        assert_eq!(
+            display_from_model_id("claude-sonnet-5-5").as_deref(),
+            Some("Claude Sonnet 5.5")
+        );
+        assert_eq!(
+            display_from_model_id("claude-opus-4-1-20250805").as_deref(),
+            Some("Claude Opus 4.1")
+        );
+        assert_eq!(
+            display_from_model_id("claude-opus-5-5[1m]").as_deref(),
+            Some("Claude Opus 5.5")
+        );
+        assert_eq!(display_from_model_id("sonnet"), None);
     }
 
     #[test]
