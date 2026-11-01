@@ -122,8 +122,8 @@ impl Codex {
             .clone()
     }
 
-    pub fn models(&self) -> &[Model] {
-        &self.models
+    pub fn models(&self) -> Vec<Model> {
+        self.models.clone()
     }
 
     pub fn select_model(&self, model_id: &str) -> Result<Model> {
