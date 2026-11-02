@@ -1,516 +1,552 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-
+use crate::config::{FilesystemConfig, NetworkConfig, ProjectConfig};
 use anyhow::{Context, Result, bail};
 use directories::BaseDirs;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
-use crate::config::{Config, NetworkConfig, ReferenceConfig, WorkspaceConfig};
+pub(crate) const CONFIG_ENV: &str = "NONAUT_PROJECT_CONFIG";
+static SELECTED: OnceLock<Mutex<BTreeMap<PathBuf, Loaded>>> = OnceLock::new();
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
+pub(crate) struct Loaded {
+    pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub config: ProjectConfig,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Selection {
-    pub name: Option<String>,
     pub root: PathBuf,
-    pub configured: bool,
+    pub source: PathBuf,
 }
 
-impl Selection {
-    fn ad_hoc(root: PathBuf) -> Self {
-        Self {
-            name: None,
-            root,
-            configured: false,
-        }
+pub(crate) fn select(launch: &Path, requested: Option<&str>) -> Result<Selection> {
+    let root = discover_project_root(launch)?;
+    if root.parent().is_none() || home().ok().is_some_and(|home| root == home) {
+        bail!(
+            "start Nonaut inside a project directory, not {}",
+            root.display()
+        );
     }
-}
-
-pub(crate) fn select(launch_dir: &Path, requested: Option<&str>) -> Result<Selection> {
-    select_from(&crate::config::load()?, launch_dir, requested)
-}
-
-fn select_from(config: &Config, launch_dir: &Path, requested: Option<&str>) -> Result<Selection> {
-    let launch_dir = canonical_directory(launch_dir)?;
-    if requested == Some(".") {
-        return Ok(Selection::ad_hoc(launch_dir));
-    }
-
-    if let Some(name) = requested {
-        return configured(config, name);
-    }
-
-    let mut matching: Option<(usize, String, PathBuf)> = None;
-    for (name, workspace) in &config.workspace.definitions {
-        let root = workspace_root(workspace)?;
-        if launch_dir.starts_with(&root) {
-            let depth = root.components().count();
-            if matching
-                .as_ref()
-                .is_none_or(|(current, _, _)| depth > *current)
-            {
-                matching = Some((depth, name.clone(), root));
+    let source = match requested {
+        Some(raw) => absolute(raw, launch)?,
+        None => saved_path(&root)?,
+    };
+    if requested.is_none() && !source.exists() {
+        let config = minimal_config(&root);
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            print!(
+                "{}",
+                crate::cli::render_project_setup(
+                    config.name.as_deref().unwrap_or("project"),
+                    &display_path(&root),
+                    &display_path(&source),
+                    &config.packs,
+                    crate::cli::color_enabled(),
+                )
+            );
+            io::stdout().flush()?;
+            let mut answer = String::new();
+            if io::stdin().read_line(&mut answer)? == 0 {
+                bail!("project setup cancelled");
+            }
+            if !matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "" | "y" | "yes"
+            ) {
+                bail!("project setup cancelled");
             }
         }
+        crate::config::write_json(&source, &config)?;
     }
-    if let Some((_, name, root)) = matching {
-        return Ok(Selection {
-            name: Some(name),
-            root,
-            configured: true,
-        });
-    }
-
-    if let Some(name) = config.workspace.default.as_deref() {
-        return configured(config, name)
-            .with_context(|| format!("default workspace `{name}` is invalid"));
-    }
-
-    Ok(Selection::ad_hoc(launch_dir))
-}
-
-fn configured(config: &Config, name: &str) -> Result<Selection> {
-    validate_name(name)?;
-    let workspace = config
-        .workspace
-        .definitions
-        .get(name)
-        .with_context(|| format!("workspace `{name}` is not configured"))?;
+    let loaded = load_file(&source, &root)?;
+    crate::policy::validate_project(&root, &loaded)?;
+    selected()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("project selection lock poisoned"))?
+        .insert(root.clone(), loaded.clone());
     Ok(Selection {
-        name: Some(name.to_owned()),
-        root: workspace_root(workspace)?,
-        configured: true,
+        root,
+        source: loaded.source,
     })
 }
 
-pub(crate) fn config_for_root(
-    config: &Config,
-    root: &Path,
-) -> Result<Option<(String, WorkspaceConfig)>> {
-    let root = canonical_directory(root)?;
-    let mut found = None;
-    for (name, workspace) in &config.workspace.definitions {
-        let configured_root = workspace_root(workspace)?;
-        if configured_root == root {
-            if found.is_some() {
-                bail!("multiple workspaces resolve to {}", root.display());
-            }
-            found = Some((name.clone(), workspace.clone()));
-        }
-    }
-    Ok(found)
+fn selected() -> &'static Mutex<BTreeMap<PathBuf, Loaded>> {
+    SELECTED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-pub(crate) fn workspace_root(workspace: &WorkspaceConfig) -> Result<PathBuf> {
-    if workspace.path.trim().is_empty() {
-        bail!("workspace path cannot be empty");
-    }
-    canonical_directory(&expand_home(&workspace.path)?)
-        .with_context(|| format!("invalid workspace path `{}`", workspace.path))
-}
-
-pub(crate) fn reference_root(raw: &str) -> Result<PathBuf> {
-    if raw.trim().is_empty() {
-        bail!("reference path cannot be empty");
-    }
-    canonical_directory(&expand_home(raw)?)
-        .with_context(|| format!("invalid reference path `{raw}`"))
-}
-
-pub(crate) fn display_path(path: &Path) -> String {
-    let Some(home) = BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
-        return path.display().to_string();
-    };
-    match path.strip_prefix(home) {
-        Ok(relative) if relative.as_os_str().is_empty() => "~".to_owned(),
-        Ok(relative) => format!("~/{}", relative.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-pub(crate) fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+pub(crate) fn load(root: &Path) -> Result<Loaded> {
+    let root = fs::canonicalize(root)?;
+    if let Some(loaded) = selected()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("project selection lock poisoned"))?
+        .get(&root)
     {
-        bail!("workspace names may contain only letters, numbers, '-' and '_'");
+        return Ok(loaded.clone());
     }
-    Ok(())
+    let source = match std::env::var_os(CONFIG_ENV) {
+        Some(path) => PathBuf::from(path),
+        None => saved_path(&root)?,
+    };
+    if !source.exists() {
+        if std::env::var_os(CONFIG_ENV).is_some() {
+            bail!("project policy {} does not exist", source.display());
+        }
+        return Ok(Loaded {
+            source,
+            sources: Vec::new(),
+            config: minimal_config(&root),
+        });
+    }
+    let loaded = load_file(&source, &root)?;
+    selected()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("project selection lock poisoned"))?
+        .insert(root, loaded.clone());
+    Ok(loaded)
 }
 
-pub(crate) fn save(
-    name: &str,
+pub(crate) fn minimal_config(root: &Path) -> ProjectConfig {
+    ProjectConfig {
+        name: Some(inferred_name(root)),
+        root: Some(root.to_string_lossy().into_owned()),
+        packs: crate::profiles::detect(root),
+        filesystem: FilesystemConfig {
+            readwrite: vec![".".into()],
+            ..Default::default()
+        },
+        network: Some(NetworkConfig::default()),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn saved_path(root: &Path) -> Result<PathBuf> {
+    let hash = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let digest: String = hash.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    Ok(crate::config::config_dir()?
+        .join("projects")
+        .join(format!("{}-{digest}.json", inferred_name(root))))
+}
+
+pub(crate) fn load_file(source: &Path, root: &Path) -> Result<Loaded> {
+    let source = fs::canonicalize(source)
+        .with_context(|| format!("could not open policy {}", source.display()))?;
+    let mut sources = Vec::new();
+    let config = compose(
+        &source,
+        root,
+        &mut BTreeSet::new(),
+        &mut sources,
+        &mut BTreeMap::new(),
+        0,
+    )?;
+    Ok(Loaded {
+        source,
+        sources,
+        config,
+    })
+}
+
+fn compose(
+    source: &Path,
     root: &Path,
-    profiles: Vec<String>,
-    references: Vec<(String, PathBuf)>,
-    network: Option<NetworkConfig>,
-    make_default: bool,
-    replace: Option<&str>,
-) -> Result<()> {
-    validate_name(name)?;
-    let root = canonical_directory(root)?;
-    let mut reference_map = std::collections::BTreeMap::new();
-    let mut reference_paths = Vec::new();
-    for (reference_name, path) in references {
-        validate_name(&reference_name)?;
-        let path = canonical_directory(&path)?;
-        if path.starts_with(&root) || root.starts_with(&path) {
-            bail!("reference `{reference_name}` overlaps the writable workspace");
-        }
-        if reference_paths.contains(&path) {
-            bail!("reference `{reference_name}` duplicates another reference path");
-        }
-        reference_paths.push(path.clone());
-        reference_map.insert(
-            reference_name,
-            ReferenceConfig {
-                path: display_path(&path),
-            },
+    stack: &mut BTreeSet<PathBuf>,
+    sources: &mut Vec<PathBuf>,
+    cache: &mut BTreeMap<PathBuf, ProjectConfig>,
+    depth: usize,
+) -> Result<ProjectConfig> {
+    if let Some(config) = cache.get(source) {
+        return Ok(config.clone());
+    }
+    if depth > 32 || !stack.insert(source.to_path_buf()) {
+        bail!(
+            "cyclic or excessively deep policy import at {}",
+            source.display()
         );
     }
-    crate::profiles::validate_names(&profiles)?;
-    if let Some(network) = &network {
-        crate::policy::validate_network_config(network)?;
-    }
-    let config = crate::config::load()?;
-    if config.workspace.definitions.contains_key(name) && replace != Some(name) {
-        bail!("workspace `{name}` already exists; use `nonaut workspace edit {name}`");
-    }
-    for (configured_name, configured) in &config.workspace.definitions {
-        if replace != Some(configured_name) && workspace_root(configured)? == root {
+    let text = fs::read_to_string(source)
+        .with_context(|| format!("could not read {}", source.display()))?;
+    let current: ProjectConfig = serde_json::from_str(&text)
+        .with_context(|| format!("invalid policy {}", source.display()))?;
+    if let Some(declared) = &current.root {
+        let declared = fs::canonicalize(absolute(declared, root)?)
+            .with_context(|| format!("invalid policy root {declared}"))?;
+        if declared != root {
             bail!(
-                "{} is already configured as workspace `{configured_name}`",
+                "policy root {} does not match active project {}",
+                declared.display(),
                 root.display()
             );
         }
     }
-    crate::config::update(|config| {
-        if let Some(previous) = replace {
-            config.workspace.definitions.remove(previous);
-            if config.workspace.default.as_deref() == Some(previous) {
-                config.workspace.default = None;
+    let mut merged = ProjectConfig::default();
+    for import in &current.extends {
+        if import.contains("://") {
+            bail!("policy imports must be local files");
+        }
+        let path = fs::canonicalize(absolute(
+            import,
+            source.parent().context("policy has no parent")?,
+        )?)
+        .with_context(|| format!("could not resolve policy import {import}"))?;
+        merge(
+            &mut merged,
+            compose(&path, root, stack, sources, cache, depth + 1)?,
+        )?;
+    }
+    merge(&mut merged, current)?;
+    stack.remove(source);
+    if !sources.contains(&source.to_path_buf()) {
+        sources.push(source.to_path_buf());
+    }
+    cache.insert(source.to_path_buf(), merged.clone());
+    Ok(merged)
+}
+
+fn merge(base: &mut ProjectConfig, next: ProjectConfig) -> Result<()> {
+    if next.name.is_some() {
+        base.name = next.name;
+    }
+    if next.root.is_some() {
+        base.root = next.root;
+    }
+    for pack in next.packs {
+        if !base.packs.contains(&pack) {
+            base.packs.push(pack);
+        }
+    }
+    for (target, values) in [
+        (&mut base.filesystem.read, next.filesystem.read),
+        (&mut base.filesystem.readwrite, next.filesystem.readwrite),
+        (&mut base.filesystem.deny, next.filesystem.deny),
+    ] {
+        for value in values {
+            if !target.contains(&value) {
+                target.push(value);
             }
         }
-        config.workspace.definitions.insert(
-            name.to_owned(),
-            WorkspaceConfig {
-                path: display_path(&root),
-                profiles,
-                references: reference_map,
-                network,
-                ..WorkspaceConfig::default()
-            },
-        );
-        if make_default {
-            config.workspace.default = Some(name.to_owned());
+    }
+    for (name, reference) in next.references {
+        if let Some(existing) = base.references.get(&name)
+            && (existing.path != reference.path || existing.access != reference.access)
+        {
+            bail!("conflicting definitions for reference {name}");
         }
+        base.references.insert(name, reference);
+    }
+    if next.network.is_some() {
+        base.network = next.network;
+    }
+    if next.tools.is_some() {
+        base.tools = next.tools;
+    }
+    Ok(())
+}
+
+pub(crate) fn home() -> Result<PathBuf> {
+    BaseDirs::new()
+        .context("could not determine HOME")
+        .map(|d| d.home_dir().to_path_buf())
+}
+
+pub(crate) fn absolute(raw: &str, root: &Path) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        bail!("path cannot be empty");
+    }
+    let path = match raw.strip_prefix("~/") {
+        Some(rest) => home()?.join(rest),
+        None if raw == "~" => home()?,
+        None => PathBuf::from(raw),
+    };
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
     })
 }
 
-pub(crate) fn run_command(args: Vec<String>) -> Result<()> {
-    match args.as_slice() {
-        [] => {
-            print_help();
-            Ok(())
-        }
-        [command] if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            print_help();
-            Ok(())
-        }
-        [command] if command == "list" => list(),
-        [command, name] if command == "show" => show(name),
-        [command, name] if command == "remove" => remove(name),
-        [command, name] if command == "default" => set_default(name),
-        [command, rest @ ..] if command == "add" => add(rest),
-        [command, name] if command == "edit" => crate::workspace_setup::edit(name),
-        [command, ..] => bail!("unknown workspace command `{command}`"),
-    }
-}
-
-fn list() -> Result<()> {
-    let config = crate::config::load()?;
-    if config.workspace.definitions.is_empty() {
-        println!("No configured workspaces.");
-        return Ok(());
-    }
-    for (name, workspace) in &config.workspace.definitions {
-        let default = if config.workspace.default.as_deref() == Some(name) {
-            " (default)"
-        } else {
-            ""
-        };
-        println!("{name}{default}\t{}", workspace.path);
-    }
-    Ok(())
-}
-
-fn show(name: &str) -> Result<()> {
-    let config = crate::config::load()?;
-    let workspace = config
-        .workspace
-        .definitions
-        .get(name)
-        .with_context(|| format!("workspace `{name}` is not configured"))?;
-    println!("Workspace  {name}");
-    println!("Root       {}", workspace.path);
-    println!(
-        "Default    {}",
-        if config.workspace.default.as_deref() == Some(name) {
-            "yes"
-        } else {
-            "no"
-        }
-    );
-    println!(
-        "Profiles   {}",
-        if workspace.profiles.is_empty() {
-            "none".to_owned()
-        } else {
-            workspace.profiles.join(", ")
-        }
-    );
-    let network = match workspace.network.as_ref().and_then(|network| network.mode) {
-        None if workspace
-            .network
-            .as_ref()
-            .is_some_and(|network| !network.allow_domains.is_empty()) =>
-        {
-            "allowlist"
-        }
-        None => "inherited",
-        Some(crate::config::NetworkMode::Blocked) => "blocked",
-        Some(crate::config::NetworkMode::Allowlist) => "allowlist",
-        Some(crate::config::NetworkMode::Open) => "open",
-    };
-    println!("Network    {network}");
-    if let Some(network) = &workspace.network
-        && !network.allow_domains.is_empty()
+pub(crate) fn display_policy_path(path: &Path) -> String {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+        && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        && let Some((name, id)) = stem.rsplit_once('-')
+        && !name.is_empty()
+        && id.len() == 32
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
-        println!("Domains    {}", network.allow_domains.join(", "));
+        return display_path(&path.with_file_name(format!("{name}-<id>.json")));
     }
-    println!(
-        "Timeout    {}",
-        workspace
-            .tools
-            .as_ref()
-            .and_then(|tools| tools.timeout_seconds)
-            .map_or_else(|| "inherited".to_owned(), |seconds| format!("{seconds}s"))
-    );
-    if workspace.references.is_empty() {
-        println!("References none");
-    } else {
-        for (reference, config) in &workspace.references {
-            println!("Reference  {reference} -> {} (read-only)", config.path);
-        }
-    }
-    if let Some(filesystem) = &workspace.filesystem {
-        for path in &filesystem.read {
-            println!("Read       {path}");
-        }
-        for path in &filesystem.write {
-            println!("Write      {path}");
-        }
-    }
-    Ok(())
+    display_path(path)
 }
 
-fn remove(name: &str) -> Result<()> {
-    validate_name(name)?;
-    let mut removed = false;
-    crate::config::update(|config| {
-        removed = config.workspace.definitions.remove(name).is_some();
-        if config.workspace.default.as_deref() == Some(name) {
-            config.workspace.default = None;
-        }
-    })?;
-    if !removed {
-        bail!("workspace `{name}` is not configured");
-    }
-    println!("Removed workspace {name}.");
-    Ok(())
-}
-
-fn set_default(name: &str) -> Result<()> {
-    validate_name(name)?;
-    if !crate::config::load()?
-        .workspace
-        .definitions
-        .contains_key(name)
+pub(crate) fn display_path(path: &Path) -> String {
+    match home()
+        .ok()
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
     {
-        bail!("workspace `{name}` is not configured");
+        Some(relative) if relative.as_os_str().is_empty() => "~".into(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => path.display().to_string(),
     }
-    crate::config::update(|config| {
-        config.workspace.default = Some(name.to_owned());
-    })?;
-    println!("Default workspace set to {name}.");
-    Ok(())
 }
 
-fn add(args: &[String]) -> Result<()> {
-    let mut path = None;
-    let mut name = None;
-    let mut profiles = Vec::new();
-    let mut references = Vec::new();
-    let mut make_default = false;
-    let mut arguments = args.iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--name" => name = arguments.next().cloned(),
-            "--profile" => profiles.push(
-                arguments
-                    .next()
-                    .context("--profile needs a profile name")?
-                    .clone(),
-            ),
-            "--reference" => {
-                let value = arguments.next().context("--reference needs NAME=PATH")?;
-                let (reference_name, reference_path) = value
-                    .split_once('=')
-                    .context("--reference needs NAME=PATH")?;
-                references.push((reference_name.to_owned(), absolute(reference_path)?));
-            }
-            "--default" => make_default = true,
-            value if value.starts_with('-') => bail!("unknown workspace add option `{value}`"),
-            value if path.is_none() => path = Some(absolute(value)?),
-            value => bail!("unexpected workspace add argument `{value}`"),
-        }
-    }
-    let path = path.unwrap_or(std::env::current_dir()?);
-    let inferred = path
+fn inferred_name(root: &Path) -> String {
+    let name: String = root
         .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .context("could not infer a workspace name; use --name")?;
-    let name = name.as_deref().unwrap_or(inferred);
-    save(name, &path, profiles, references, None, make_default, None)?;
-    println!("Saved workspace {name} at {}.", display_path(&path));
-    Ok(())
-}
-
-fn absolute(raw: &str) -> Result<PathBuf> {
-    let path = expand_home(raw)?;
-    if path.is_absolute() {
-        Ok(path)
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .collect();
+    if name.is_empty() {
+        "project".into()
     } else {
-        Ok(std::env::current_dir()?.join(path))
+        name
     }
 }
 
-fn print_help() {
-    println!(
-        "Workspace configuration\n\n\
-         USAGE\n  nonaut workspace list\n  nonaut workspace show NAME\n  \
-         nonaut workspace add [PATH] [--name NAME] [--profile NAME] \
-         [--reference NAME=PATH] [--default]\n  nonaut workspace default NAME\n  \
-         nonaut workspace edit NAME\n  nonaut workspace remove NAME"
-    );
+pub(crate) fn discover_project_root(launch: &Path) -> Result<PathBuf> {
+    let launch = fs::canonicalize(launch)?;
+    let boundary = home().ok().and_then(|home| fs::canonicalize(home).ok());
+    Ok(discover_with_boundary(&launch, boundary.as_deref()))
+}
+
+fn discover_with_boundary(launch: &Path, boundary: Option<&Path>) -> PathBuf {
+    for directory in launch.ancestors() {
+        if boundary == Some(directory) {
+            break;
+        }
+        if [
+            ".git",
+            "Cargo.toml",
+            "go.mod",
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+            "bun.lock",
+            "bun.lockb",
+        ]
+        .iter()
+        .any(|marker| directory.join(marker).exists())
+        {
+            return directory.to_path_buf();
+        }
+    }
+    launch.to_path_buf()
+}
+
+pub(crate) fn name_for_root(root: &Path) -> Option<String> {
+    Some(
+        load(root)
+            .ok()?
+            .config
+            .name
+            .unwrap_or_else(|| inferred_name(root)),
+    )
 }
 
 pub(crate) fn reference_instructions(root: &Path) -> Option<String> {
-    let config = crate::config::load().ok()?;
-    let (_, workspace) = config_for_root(&config, root).ok()??;
-    if workspace.references.is_empty() {
+    let loaded = load(root).ok()?;
+    if loaded.config.references.is_empty() {
         return None;
     }
-    let references = workspace
-        .references
-        .iter()
-        .map(|(name, reference)| format!("- {name}: {} (read-only)", reference.path))
-        .collect::<Vec<_>>()
-        .join("\n");
     Some(format!(
-        "Configured reference workspaces are available for context but cannot be modified:\n{references}"
+        "Configured references:\n{}",
+        loaded
+            .config
+            .references
+            .iter()
+            .map(|(name, reference)| {
+                format!(
+                    "- {name}: {} ({:?})",
+                    absolute(&reference.path, root)
+                        .unwrap_or_default()
+                        .display(),
+                    reference.access
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
-}
-
-fn expand_home(raw: &str) -> Result<PathBuf> {
-    match raw.strip_prefix("~/") {
-        Some(rest) => Ok(BaseDirs::new()
-            .context("could not determine the home directory")?
-            .home_dir()
-            .join(rest)),
-        None if raw == "~" => Ok(BaseDirs::new()
-            .context("could not determine the home directory")?
-            .home_dir()
-            .to_path_buf()),
-        None => Ok(PathBuf::from(raw)),
-    }
-}
-
-fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("workspace paths must be absolute or start with ~/");
-    }
-    let path =
-        fs::canonicalize(path).with_context(|| format!("could not resolve {}", path.display()))?;
-    if !path.is_dir() {
-        bail!("{} is not a directory", path.display());
-    }
-    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{WorkspaceConfig, WorkspaceSettings};
-
-    fn config(definitions: impl IntoIterator<Item = (&'static str, PathBuf)>) -> Config {
-        let mut config = Config {
-            workspace: WorkspaceSettings::default(),
-            ..Config::default()
-        };
-        for (name, path) in definitions {
-            config.workspace.definitions.insert(
-                name.to_owned(),
-                WorkspaceConfig {
-                    path: path.to_string_lossy().into_owned(),
-                    ..WorkspaceConfig::default()
-                },
-            );
-        }
-        config
-    }
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn current_directory_is_an_ad_hoc_workspace_without_configuration() {
-        let directory = std::env::current_dir().unwrap();
-        let selected = select_from(&Config::default(), &directory, None).unwrap();
-        assert_eq!(selected.root, directory.canonicalize().unwrap());
-        assert!(!selected.configured);
-    }
-
-    #[test]
-    fn explicit_name_and_most_specific_containing_workspace_are_selected() {
-        let root =
-            std::env::temp_dir().join(format!("nonaut-workspace-selection-{}", std::process::id()));
-        let parent = root.join("parent");
-        let child = parent.join("child");
-        fs::create_dir_all(&child).unwrap();
-        let config = config([("parent", parent.clone()), ("child", child.clone())]);
-
-        let selected = select_from(&config, &child, None).unwrap();
-        assert_eq!(selected.name.as_deref(), Some("child"));
+    fn policy_labels_abbreviate_generated_ids_without_changing_custom_paths() {
+        let source = PathBuf::from(format!("/policies/my-project-{}.json", "a".repeat(32)));
         assert_eq!(
-            select_from(&config, &parent, Some("child")).unwrap().root,
-            child.canonicalize().unwrap()
+            display_policy_path(&source),
+            "/policies/my-project-<id>.json"
         );
+        assert!(source.to_string_lossy().contains(&"a".repeat(32)));
+        for source in [
+            "/policies/rust-dev.json",
+            "/policies/app-0123456789abcdef.json",
+            "/policies/app-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.json",
+            "/policies/app-0123456789abcdef0123456789abcdef.txt",
+        ] {
+            assert_eq!(display_policy_path(Path::new(source)), source);
+        }
+    }
+    fn fixture() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nonaut-project-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        fs::canonicalize(path).unwrap()
+    }
+    #[test]
+    fn minimal_policy_has_no_external_grants() {
+        let root = fixture();
+        let value = serde_json::to_value(minimal_config(&root)).unwrap();
+        assert_eq!(value["filesystem"], serde_json::json!({"readwrite":["."]}));
+        assert_eq!(value["network"]["mode"], "blocked");
+        assert!(value.get("references").is_none());
+        assert!(value.get("extends").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn roots_are_optional_but_must_match_when_declared() {
+        let root = fixture();
+        let source = root.join("policy.json");
+        fs::write(&source, "{}").unwrap();
+        assert!(load_file(&source, &root).is_ok());
+        fs::write(
+            &source,
+            serde_json::json!({"root": root.join("..")}).to_string(),
+        )
+        .unwrap();
+        assert!(format!("{:#}", load_file(&source, &root).unwrap_err()).contains("does not match"));
+        fs::write(&source, serde_json::json!({"root": root}).to_string()).unwrap();
+        assert!(load_file(&source, &root).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn imports_compose_and_preserve_denials() {
+        let root = fixture();
+        fs::create_dir(root.join("policies")).unwrap();
+        fs::write(root.join("policies/base.json"), r#"{"packs":["rust"],"filesystem":{"deny":["./secret"]},"references":{"docs":{"path":"../docs","access":"read"}},"network":{"mode":"blocked"}}"#).unwrap();
+        fs::write(root.join("project.json"), r#"{"extends":["./policies/base.json"],"packs":["rust","python"],"filesystem":{"readwrite":["."]},"network":{"mode":"open"}}"#).unwrap();
+        let loaded = load_file(&root.join("project.json"), &root).unwrap();
+        assert_eq!(loaded.config.packs, ["rust", "python"]);
+        assert_eq!(loaded.config.filesystem.deny, ["./secret"]);
+        assert_eq!(loaded.config.references["docs"].path, "../docs");
+        assert_eq!(
+            loaded.config.network.unwrap().mode,
+            crate::config::NetworkMode::Open
+        );
+        assert_eq!(loaded.sources.len(), 2);
+        fs::write(
+            root.join("policies/base.json"),
+            r#"{"extends":["../project.json"]}"#,
+        )
+        .unwrap();
+        assert!(load_file(&root.join("project.json"), &root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn discovery_uses_nearest_marker_and_home_boundary() {
+        let root = fixture();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+        let child = root.join("nested/src");
+        fs::create_dir_all(&child).unwrap();
+        assert_eq!(discover_with_boundary(&child, None), root);
+        assert_eq!(discover_with_boundary(&child, Some(&root)), child);
+        fs::write(root.join("nested/package.json"), "{}").unwrap();
+        assert_eq!(discover_with_boundary(&child, None), root.join("nested"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn same_named_projects_have_distinct_stable_paths() {
+        assert_ne!(
+            saved_path(Path::new("/one/app")).unwrap(),
+            saved_path(Path::new("/two/app")).unwrap()
+        );
+        assert_eq!(
+            saved_path(Path::new("/one/app")).unwrap(),
+            saved_path(Path::new("/one/app")).unwrap()
+        );
+    }
+
+    #[test]
+    fn imports_reject_conflicting_references_and_invalid_documents() {
+        let root = fixture();
+        fs::write(
+            root.join("base.json"),
+            r#"{"references":{"docs":{"path":"../docs","access":"read"}}}"#,
+        )
+        .unwrap();
+        let source = root.join("project.json");
+        fs::write(&source, r#"{"extends":["base.json"],"references":{"docs":{"path":"../other","access":"read"}}}"#).unwrap();
+        assert!(
+            format!("{:#}", load_file(&source, &root).unwrap_err())
+                .contains("conflicting definitions")
+        );
+        fs::write(
+            &source,
+            r#"{"extends":["https://example.com/policy.json"]}"#,
+        )
+        .unwrap();
+        assert!(format!("{:#}", load_file(&source, &root).unwrap_err()).contains("local files"));
+        fs::write(&source, r#"{"filesystem":{"allow":["."]}}"#).unwrap();
+        assert!(load_file(&source, &root).is_err());
+        fs::write(&source, r#"{"extends":["missing.json"]}"#).unwrap();
+        assert!(load_file(&source, &root).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn default_is_used_only_when_launch_directory_matches_nothing() {
-        let root =
-            std::env::temp_dir().join(format!("nonaut-workspace-default-{}", std::process::id()));
-        let project = root.join("project");
-        let elsewhere = root.join("elsewhere");
-        fs::create_dir_all(&project).unwrap();
-        fs::create_dir_all(&elsewhere).unwrap();
-        let mut config = config([("project", project.clone())]);
-        config.workspace.default = Some("project".to_owned());
+    fn diamond_imports_deduplicate_without_false_cycles() {
+        let root = fixture();
+        fs::write(
+            root.join("base.json"),
+            r#"{"packs":["rust"],"filesystem":{"read":["src"]}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("left.json"), r#"{"extends":["base.json"]}"#).unwrap();
+        fs::write(root.join("right.json"), r#"{"extends":["base.json"]}"#).unwrap();
+        fs::write(
+            root.join("project.json"),
+            r#"{"extends":["left.json","right.json"]}"#,
+        )
+        .unwrap();
+        let loaded = load_file(&root.join("project.json"), &root).unwrap();
+        assert_eq!(loaded.sources.len(), 4);
+        assert_eq!(loaded.config.packs, ["rust"]);
+        assert_eq!(loaded.config.filesystem.read, ["src"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn declared_roots_accept_symlink_aliases() {
+        let root = fixture();
+        let alias = root.with_extension("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        fs::write(
+            root.join("project.json"),
+            serde_json::json!({"root":alias}).to_string(),
+        )
+        .unwrap();
+        assert!(load_file(&root.join("project.json"), &root).is_ok());
         assert_eq!(
-            select_from(&config, &elsewhere, None).unwrap().root,
-            project.canonicalize().unwrap()
+            discover_project_root(&alias).unwrap(),
+            discover_project_root(&root).unwrap()
         );
+        fs::remove_file(alias).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

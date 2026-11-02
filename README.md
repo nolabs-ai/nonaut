@@ -17,7 +17,7 @@
 - **Private control plane.** Provider authentication and model inference remain outside the tool sandbox.
 - **Bring your provider.** Use Codex, Claude, Gemini, GitHub Copilot, or any OpenAI-compatible endpoint.
 - **Stay in control.** Review staged, unstaged, and untracked changes in the TUI, or roll back a whole agent turn with `/undo`.
-- **Built for real projects.** Compose Rust, Python, Node.js, Go, and Bun development profiles, inspect code with compact syntax indexes, then detach and reconnect later.
+- **Built for real projects.** Compose Rust, Python, Node.js, Go, and Bun development packs, inspect code with compact syntax indexes, then detach and reconnect later.
 
 ## Preview
 
@@ -43,9 +43,11 @@ cd my-project
 nonaut
 ```
 
-The first launch offers a one-time session or a guided named workspace with
-development profiles, network policy, and optional read-only references to
-related projects.
+The first launch discovers the project root and proposes a minimal policy with
+detected development packs. After confirmation, it saves the policy under
+`~/.config/nonaut/projects/` and launches. Network stays blocked; external
+access requires manual configuration. Run `nonaut config` to find the project
+file, or `/permissions` to inspect the effective boundary.
 
 On first use, choose a provider and authenticate with its CLI or API-key
 environment variable. Nonaut only saves the provider after the connection
@@ -77,7 +79,7 @@ The TUI and provider connection remain outside the tool sandbox. See the [securi
 - [Getting started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
 - [Sandbox and security](docs/security.md)
-- [Development profiles](docs/profiles.md)
+- [Development packs](docs/profiles.md)
 - [Commands and keyboard controls](docs/commands.md)
 - [Providers](docs/providers.md)
 - [Development and releases](docs/development.md)

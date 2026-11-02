@@ -50,15 +50,21 @@ Select a provider on first launch. CLI-backed providers use their existing
 login, while API-backed providers read credentials from environment variables.
 The provider choice is persisted only after the connection succeeds.
 
-Nonaut grants tools read/write access to the starting workspace, blocks
-network access, and hides the real user home by default. Use a development
-[profile](profiles.md) and explicit [workspace policy](configuration.md) when
-the project needs a toolchain or network domains.
+On first launch, Nonaut finds the project root and proposes a minimal policy
+with detected development packs, project read/write access and blocked network.
+After confirmation, it saves the file under `~/.config/nonaut/projects/`.
+Later launches preserve manual changes. The real user home remains isolated.
 
-On the first interactive launch from an unconfigured directory, choose a
-one-time session or save a named workspace. The setup screen can add
-development profiles, network policy, and read-only reference workspaces. Run
-`nonaut setup` later to edit the current directory's configuration.
+Edit the generated policy in place and keep its filename unchanged for automatic
+loading. Nonaut looks up the exact filename derived from the project directory;
+it does not discover other files by their `root` field. To use your own filename,
+launch with `nonaut --config /path/to/policy.json`.
+
+Run `nonaut config` to see the active entry and config path. Inside Nonaut,
+`/permissions` shows effective access; `/permissions full` includes runtime
+grants. Add explicit
+network domains, external paths or named references only when the project needs
+them.
 
 ## Project instructions
 

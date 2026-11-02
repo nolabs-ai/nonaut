@@ -1,7 +1,4 @@
-//! Sandbox settings from Nonaut's unified `config.json`.
-//!
-//! The file lives outside the workspace because sandboxed tools may write the
-//! workspace and must not be able to widen their own permissions.
+//! Resolved project policy, pinned for the lifetime of a session.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -20,13 +17,19 @@ use sha2::{Digest, Sha256};
 
 pub(crate) use crate::config::NetworkMode as Network;
 use crate::config::{
-    Config, FilesystemConfig, NetworkConfig, WorkspaceConfig, WorkspaceToolsConfig,
+    Config, FilesystemConfig, NetworkConfig, ReferenceAccess, WorkspaceToolsConfig,
 };
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Policy {
-    /// Canonical directory granted read/write access for this operation.
+    /// Canonical project identity; access is determined by explicit grants.
     pub workspace: PathBuf,
+    pub name: String,
+    pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
+    pub references: BTreeMap<String, (PathBuf, ReferenceAccess)>,
+    pub deny_paths: Vec<PathBuf>,
+    pub protected_paths: Vec<PathBuf>,
     pub network: Network,
     /// Upper bound for any tool call, `run_command` and `/exec`.
     pub tool_timeout_seconds: u64,
@@ -80,7 +83,8 @@ pub(crate) fn load_session(session_root: &Path) -> Result<Policy> {
         .context("could not determine the home directory")?
         .home_dir()
         .to_path_buf();
-    let mut policy = resolve(config, session_root, &home).with_context(|| {
+    let loaded = crate::workspace::load(session_root)?;
+    let mut policy = resolve(&config, loaded, session_root, &home).with_context(|| {
         crate::config::config_path().map_or_else(
             |_| "invalid Nonaut configuration".to_owned(),
             |path| format!("invalid {}", path.display()),
@@ -88,8 +92,111 @@ pub(crate) fn load_session(session_root: &Path) -> Result<Policy> {
     })?;
     crate::runtime_paths::prepare_private_directory(&policy.command_home)
         .context("could not prepare the private command home")?;
+    crate::runtime_paths::prepare_private_directory(&policy.command_home.join("tmp"))?;
     prepare_capability_file(&mut policy, &home)?;
     Ok(policy)
+}
+
+pub(crate) fn describe(session_root: &Path) -> Result<String> {
+    let policy = pin(session_root)?;
+    describe_resolved(&policy, false)
+}
+
+pub(crate) fn describe_full(session_root: &Path) -> Result<String> {
+    describe_resolved(pin(session_root)?.as_ref(), true)
+}
+
+fn describe_resolved(policy: &Policy, full: bool) -> Result<String> {
+    let mut lines = vec![
+        format!(
+            "Workspace  {} · {}",
+            policy.name,
+            crate::workspace::display_path(&policy.workspace)
+        ),
+        format!("Policy     {}", policy.source.display()),
+        String::new(),
+        "FILESYSTEM".into(),
+    ];
+    for (access, paths) in [
+        ("read", &policy.operation_read_paths),
+        ("read/write", &policy.operation_write_paths),
+        ("deny", &policy.deny_paths),
+    ] {
+        for path in paths {
+            lines.push(format!(
+                "  {:<44} {access}",
+                crate::workspace::display_path(path)
+            ));
+        }
+    }
+    lines.push(format!(
+        "Packs      {}",
+        if policy.profiles.is_empty() {
+            "none".into()
+        } else {
+            policy.profiles.join(", ")
+        }
+    ));
+    for (name, (path, access)) in &policy.references {
+        let access = match access {
+            ReferenceAccess::Read => "read",
+            ReferenceAccess::ReadWrite => "read/write",
+        };
+        lines.push(format!(
+            "Reference  {name} · {} · {access}",
+            crate::workspace::display_path(path)
+        ));
+    }
+    lines.push(format!("Network    {:?}", policy.network));
+    for host in &policy.allow_hosts {
+        lines.push(format!("  {host}"));
+    }
+    lines.push(format!(
+        "HOME       {} (isolated)",
+        crate::workspace::display_path(&policy.command_home)
+    ));
+    lines.push(format!(
+        "Sources    {}",
+        policy
+            .sources
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if full {
+        lines.push("\nNONO RUNTIME".into());
+        for (access, paths) in [
+            ("read", &policy.read_paths),
+            ("read/write", &policy.write_paths),
+        ] {
+            for path in paths {
+                lines.push(format!("  {}  {access}", path.display()));
+            }
+        }
+        for (access, paths) in [
+            ("read", crate::sandbox::platform::read_paths()),
+            ("write", crate::sandbox::platform::write_paths()),
+        ] {
+            for path in paths {
+                if Path::new(path).exists() {
+                    lines.push(format!("  {path}  {access} (system)"));
+                }
+            }
+        }
+        for (name, value) in &policy.environment {
+            lines.push(format!("  {name}={value}"));
+        }
+        for path in &policy.protected_paths {
+            lines.push(format!("  {}  protected from writes", path.display()));
+        }
+    } else {
+        lines.push(
+            "Runtime    isolated caches and platform support; /permissions full for all grants"
+                .into(),
+        );
+    }
+    Ok(lines.join("\n"))
 }
 
 #[cfg(feature = "control-plane")]
@@ -98,68 +205,158 @@ pub(crate) fn audit_context(session_root: &Path) -> Result<AuditContext> {
     Ok(policy.audit_context())
 }
 
-fn resolve(config: Config, session_root: &Path, home: &Path) -> Result<Policy> {
-    let session_root = canonicalize_nearest(session_root)?;
-    let configured = crate::workspace::config_for_root(&config, &session_root)?;
-    let mut network = config.sandbox.network;
-    let mut filesystem = config.sandbox.filesystem;
-    let mut tools = WorkspaceToolsConfig {
-        timeout_seconds: Some(config.tools.timeout_seconds),
-    };
-
-    let settings = configured.as_ref().map(|(_, settings)| settings);
-    let mut profiles = &[][..];
-    let mut references = Vec::new();
-    if let Some(extra) = settings {
-        profiles = &extra.profiles;
-        references = resolve_references(extra, &session_root)?;
-        if let Some(extra_network) = &extra.network {
-            network = extra_network.clone();
-        }
-        if let Some(extra_filesystem) = &extra.filesystem {
-            filesystem
-                .read
-                .extend(extra_filesystem.read.iter().cloned());
-            filesystem
-                .write
-                .extend(extra_filesystem.write.iter().cloned());
-        }
-        if let Some(timeout) = extra
-            .tools
-            .as_ref()
-            .and_then(|settings| settings.timeout_seconds)
-        {
-            tools.timeout_seconds = Some(timeout);
-        }
-    }
-
-    filesystem.read.extend(
-        references
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned()),
-    );
-
-    validate(session_root, network, filesystem, tools, profiles, home)
+pub(crate) fn validate_project(root: &Path, loaded: &crate::workspace::Loaded) -> Result<()> {
+    resolve(
+        &crate::config::load()?,
+        loaded.clone(),
+        root,
+        &crate::workspace::home()?,
+    )
+    .map(|_| ())
 }
 
-fn resolve_references(workspace: &WorkspaceConfig, root: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for (name, reference) in &workspace.references {
-        crate::workspace::validate_name(name)
-            .with_context(|| format!("invalid reference name `{name}`"))?;
-        let path = crate::workspace::reference_root(&reference.path)?;
-        if path.starts_with(root) || root.starts_with(&path) {
+fn resolve(
+    config: &Config,
+    loaded: crate::workspace::Loaded,
+    session_root: &Path,
+    home: &Path,
+) -> Result<Policy> {
+    let session_root = canonicalize_nearest(session_root)?;
+    let project = &loaded.config;
+    let mut filesystem = project.filesystem.clone();
+    // Filesystem entries describe project paths; references name external grants.
+    for path in filesystem.read.iter().chain(&filesystem.readwrite) {
+        let resolved = resolve_project_path(path, &session_root, home)?;
+        if !resolved.starts_with(&session_root) {
+            bail!("filesystem path {path} leaves the project; use a named reference");
+        }
+    }
+    let mut references = BTreeMap::new();
+    for (name, reference) in &project.references {
+        if name.trim().is_empty() {
+            bail!("reference name cannot be empty");
+        }
+        let path = resolve_project_path(&reference.path, &session_root, home)?;
+        references.insert(name.clone(), (path.clone(), reference.access));
+        let raw = path.to_string_lossy().into_owned();
+        match reference.access {
+            ReferenceAccess::Read => filesystem.read.push(raw),
+            ReferenceAccess::ReadWrite => filesystem.readwrite.push(raw),
+        }
+    }
+    for paths in [
+        &mut filesystem.read,
+        &mut filesystem.readwrite,
+        &mut filesystem.deny,
+    ] {
+        for raw in paths.iter_mut() {
+            *raw = resolve_project_path(raw, &session_root, home)?
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    let tools = project.tools.clone().unwrap_or(WorkspaceToolsConfig {
+        timeout_seconds: Some(config.tools.timeout_seconds),
+    });
+    let mut policy = validate(
+        session_root,
+        project.network.clone().unwrap_or_default(),
+        filesystem,
+        tools,
+        &project.packs,
+        home,
+    )?;
+    policy.name = project.name.clone().unwrap_or_else(|| {
+        policy
+            .workspace
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    });
+    policy.source = loaded.source;
+    policy.sources = loaded.sources;
+    policy.references = references;
+    policy.protected_paths = vec![canonicalize_nearest(&crate::config::config_dir()?)?];
+    policy.protected_paths.extend(policy.sources.clone());
+    for protected in &policy.protected_paths {
+        if (protected == &policy.protected_paths[0] || cfg!(target_os = "linux"))
+            && policy
+                .write_paths
+                .iter()
+                .any(|grant| protected.starts_with(grant) || grant.starts_with(protected))
+        {
             bail!(
-                "reference `{name}` overlaps writable workspace {}",
-                root.display()
+                "write grant overlaps protected Nonaut configuration {}",
+                protected.display()
             );
         }
-        if paths.contains(&path) {
-            bail!("reference `{name}` duplicates another reference path");
-        }
-        paths.push(path);
     }
-    Ok(paths)
+    validate_deny_overlaps(&policy, cfg!(target_os = "linux"))?;
+    Ok(policy)
+}
+
+fn resolve_project_path(raw: &str, root: &Path, home: &Path) -> Result<PathBuf> {
+    if raw.trim().is_empty() {
+        bail!("path cannot be empty");
+    }
+    if raw.contains('*') || raw.contains('?') {
+        bail!("filesystem paths must be literal paths, not glob patterns: {raw}");
+    }
+    let path = expand_home(raw, home);
+    canonicalize_nearest(&if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+fn validate_deny_overlaps(policy: &Policy, linux: bool) -> Result<()> {
+    if !linux {
+        return Ok(());
+    }
+    let runtime = crate::sandbox::platform::read_paths()
+        .iter()
+        .chain(crate::sandbox::platform::write_paths())
+        .map(PathBuf::from)
+        .chain(std::env::split_paths(
+            &crate::sandbox::platform::command_path(),
+        ))
+        .filter(|p| p.exists())
+        .collect::<Vec<_>>();
+    for denied in &policy.deny_paths {
+        for grant in policy
+            .read_paths
+            .iter()
+            .chain(&policy.write_paths)
+            .chain(&policy.path_entries)
+            .chain(&runtime)
+        {
+            let grant = canonicalize_nearest(grant)?;
+            if denied.starts_with(&grant) {
+                bail!(
+                    "Linux Landlock cannot enforce deny {} inside allowed {}; use narrower grants",
+                    denied.display(),
+                    grant.display()
+                );
+            }
+        }
+    }
+    for protected in &policy.protected_paths {
+        for grant in crate::sandbox::platform::write_paths() {
+            if Path::new(grant).exists() {
+                let grant = canonicalize_nearest(Path::new(grant))?;
+                if protected.starts_with(&grant) {
+                    bail!(
+                        "Linux runtime write grant {} covers protected configuration {}; place configuration outside that directory",
+                        grant.display(),
+                        protected.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate(
@@ -171,22 +368,7 @@ fn validate(
     home: &Path,
 ) -> Result<Policy> {
     validate_network_config(&network)?;
-    let network_mode = match (network.mode, network.allow_domains.is_empty()) {
-        (None, true) => Network::Blocked,
-        (None, false) | (Some(Network::Allowlist), false) => Network::Allowlist,
-        (Some(Network::Allowlist), true) => {
-            bail!("sandbox.network.mode = allowlist needs at least one allow_domains entry")
-        }
-        (Some(mode), false) => {
-            let mode = match mode {
-                Network::Open => "open",
-                Network::Blocked => "blocked",
-                Network::Allowlist => unreachable!(),
-            };
-            bail!("allow_domains only applies with sandbox.network.mode = allowlist, not {mode}")
-        }
-        (Some(mode), true) => mode,
-    };
+    let network_mode = network.mode;
     let tool_timeout_seconds = tools
         .timeout_seconds
         .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECONDS);
@@ -194,7 +376,17 @@ fn validate(
         bail!("tools.timeout_seconds must be between 1 and {MAX_TOOL_TIMEOUT_SECONDS}");
     }
     let mut read_paths = resolve_read_paths(&filesystem, home)?;
+    let deny_paths = resolve_paths(&filesystem.deny, home, "filesystem.deny")?;
     let mut write_paths = resolve_write_paths(&filesystem, home)?;
+    for path in read_paths.iter().chain(&write_paths) {
+        if !path.exists() {
+            bail!(
+                "granted path {} does not exist; create it before granting access",
+                path.display()
+            );
+        }
+    }
+    read_paths.extend(write_paths.iter().cloned());
     let operation_read_paths = read_paths.clone();
     let operation_write_paths = write_paths.clone();
     let command_home = crate::runtime_paths::workspace_cache(home, &["homes"], &workspace)?;
@@ -204,10 +396,16 @@ fn validate(
     write_paths.extend(profile.write_paths);
     Ok(Policy {
         command_home,
+        name: String::new(),
+        source: PathBuf::new(),
+        sources: Vec::new(),
+        references: BTreeMap::new(),
+        deny_paths,
+        protected_paths: Vec::new(),
         workspace,
         network: network_mode,
         tool_timeout_seconds,
-        allow_hosts: network.allow_domains,
+        allow_hosts: network.domains,
         read_paths,
         write_paths,
         operation_read_paths,
@@ -220,18 +418,18 @@ fn validate(
 }
 
 pub(crate) fn validate_network_config(network: &NetworkConfig) -> Result<()> {
-    match (network.mode, network.allow_domains.is_empty()) {
-        (Some(Network::Allowlist), true) => {
-            bail!("sandbox.network.mode = allowlist needs at least one allow_domains entry")
+    match (network.mode, network.domains.is_empty()) {
+        (Network::Allowlist, true) => {
+            bail!("network.mode = allowlist needs at least one domains entry")
         }
-        (Some(Network::Open | Network::Blocked), false) => {
-            bail!("allow_domains only applies with sandbox.network.mode = allowlist")
+        (Network::Open | Network::Blocked, false) => {
+            bail!("domains only applies with network.mode = allowlist")
         }
         _ => {}
     }
-    for host in &network.allow_domains {
+    for host in &network.domains {
         if host == "*" {
-            bail!("allow_domains may not contain \"*\"; list the domains the sandbox needs");
+            bail!("domains may not contain \"*\"; list the domains the sandbox needs");
         }
         validate_host_pattern(host).map_err(anyhow::Error::msg)?;
     }
@@ -247,9 +445,20 @@ impl Policy {
     ) -> Result<()> {
         let operation = canonicalize_nearest(operation)?;
         let _fallback_root = canonicalize_nearest(fallback_root)?;
-        let allowed = operation.starts_with(&self.workspace)
-            || (access == OperationAccess::Read
-                && self.capability_file.as_ref() == Some(&operation))
+        if self
+            .deny_paths
+            .iter()
+            .any(|path| operation.starts_with(path))
+            || (access == OperationAccess::Write
+                && self
+                    .protected_paths
+                    .iter()
+                    .any(|path| operation.starts_with(path)))
+        {
+            bail!("policy denies {:?} at {}", access, operation.display());
+        }
+        let allowed = (access == OperationAccess::Read
+            && self.capability_file.as_ref() == Some(&operation))
             || (access == OperationAccess::Read
                 && self
                     .operation_read_paths
@@ -296,9 +505,9 @@ impl Policy {
             Network::Blocked => "blocked",
             Network::Allowlist => "allowlist",
         };
-        let mut model_read = vec![self.workspace.clone()];
+        let mut model_read = Vec::new();
         model_read.extend(self.operation_read_paths.iter().cloned());
-        let mut model_write = vec![self.workspace.clone()];
+        let mut model_write = Vec::new();
         model_write.extend(self.operation_write_paths.iter().cloned());
         deduplicate_paths(&mut model_read);
         deduplicate_paths(&mut model_write);
@@ -332,6 +541,11 @@ impl Policy {
             "schema_version": 1,
             "enforced_by": "nono",
             "workspace": self.workspace,
+            "source": self.source,
+            "sources": self.sources,
+            "references": self.references,
+            "deny": self.deny_paths,
+            "protected_write": self.protected_paths,
             "model_access": {
                 "read": model_read,
                 "write": model_write
@@ -352,7 +566,7 @@ impl Policy {
                 "mode": network_mode,
                 "allow_hosts": self.allow_hosts
             },
-            "profiles": self.profiles,
+            "packs": self.profiles,
             "environment_names": environment_names,
             "tool_timeout_seconds": self.tool_timeout_seconds,
             "notes": [
@@ -414,11 +628,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn resolve_write_paths(filesystem: &FilesystemConfig, home: &Path) -> Result<Vec<PathBuf>> {
-    resolve_paths(&filesystem.write, home, "sandbox.filesystem.write")
+    resolve_paths(&filesystem.readwrite, home, "filesystem.readwrite")
 }
 
 fn resolve_read_paths(filesystem: &FilesystemConfig, home: &Path) -> Result<Vec<PathBuf>> {
-    resolve_paths(&filesystem.read, home, "sandbox.filesystem.read")
+    resolve_paths(&filesystem.read, home, "filesystem.read")
 }
 
 fn resolve_paths(paths: &[String], home: &Path, setting: &str) -> Result<Vec<PathBuf>> {
@@ -435,26 +649,33 @@ fn resolve_paths(paths: &[String], home: &Path, setting: &str) -> Result<Vec<Pat
         .collect()
 }
 
-fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).with_context(|| format!("could not canonicalize {}", path.display()))
-}
-
-/// Canonicalize the existing prefix while retaining a not-yet-created suffix.
-fn canonicalize_nearest(path: &Path) -> Result<PathBuf> {
-    let mut existing = path;
-    let mut suffix = Vec::new();
-    while !existing.exists() {
-        let name = existing
-            .file_name()
-            .context("operation path has no existing ancestor")?;
-        suffix.push(name.to_os_string());
-        existing = existing
-            .parent()
-            .context("operation path has no existing ancestor")?;
+pub(crate) fn canonicalize_nearest(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        bail!("expected an absolute path: {}", path.display());
     }
-    let mut resolved = canonicalize_existing(existing)?;
-    for component in suffix.iter().rev() {
-        resolved.push(component);
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::CurDir => {}
+            component => {
+                resolved.push(component.as_os_str());
+                match fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = fs::canonicalize(&resolved)
+                            .with_context(|| format!("could not resolve {}", resolved.display()))?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("could not inspect {}", resolved.display()));
+                    }
+                }
+            }
+        }
     }
     Ok(resolved)
 }
@@ -471,347 +692,174 @@ fn expand_home(raw: &str, home: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-
-    fn roots(name: &str) -> (PathBuf, PathBuf) {
-        let sequence = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn fixture(value: serde_json::Value) -> (PathBuf, Policy) {
         let root = std::env::temp_dir().join(format!(
-            "nonaut-policy-{name}-{}-{sequence}",
-            std::process::id()
+            "nonaut-policy-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        (root, workspace)
-    }
-
-    fn parse(text: &str, workspace: &Path, home: &Path) -> Result<Policy> {
-        resolve(serde_json::from_str(text)?, workspace, home)
-    }
-
-    fn resolve_authorized(
-        config: Config,
-        workspace: &Path,
-        operation: &Path,
-        access: OperationAccess,
-        home: &Path,
-    ) -> Result<Policy> {
-        let policy = resolve(config, workspace, home)?;
-        policy.authorize(operation, operation, access)?;
-        Ok(policy)
-    }
-
-    #[test]
-    fn applies_matching_workspace_rules_and_expands_home() {
-        let (root, workspace) = roots("matching");
-        let config = serde_json::json!({
-            "sandbox": {
-                "network": {"allow_domains": ["crates.io"]},
-                "filesystem": {"read": ["~/.cargo/registry"]}
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let policy = resolve(
+            &Config::default(),
+            crate::workspace::Loaded {
+                source: root.with_extension("json"),
+                sources: Vec::new(),
+                config: serde_json::from_value(value).unwrap(),
             },
-            "workspace": {"definitions": {
-                "app": {"path": workspace, "network": {"allow_domains": ["*.npmjs.org"]}}
-            }}
-        });
-        let policy = parse(&config.to_string(), &workspace, Path::new("/home/me")).unwrap();
-        assert_eq!(policy.network, Network::Allowlist);
-        assert_eq!(policy.allow_hosts, ["*.npmjs.org"]);
-        assert_eq!(
-            policy.read_paths,
-            [canonicalize_nearest(Path::new("/home/me/.cargo/registry")).unwrap()]
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rejects_bad_patterns_relative_paths_and_typos() {
-        let home = Path::new("/home/me");
-        let workspace = Path::new("/work");
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"allow_domains":["*"]}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"allow_domains":["foo*bar.com"]}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"filesystem":{"read":["relative/dir"]}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"allow_domain":["crates.io"]}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"mode":"allowlist"}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"mode":"open","allow_domains":["a.com"]}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-        assert!(
-            parse(
-                r#"{"sandbox":{"network":{"mode":"offline"}}}"#,
-                workspace,
-                home
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn tool_timeout_defaults_validates_and_can_be_overridden_per_workspace() {
-        let (root, work) = roots("timeout");
-        let home = Path::new("/home/me");
-        assert_eq!(parse("{}", &work, home).unwrap().tool_timeout_seconds, 120);
-        let policy = parse(
-            &format!(r#"{{
-                "tools": {{"timeout_seconds": 600}},
-                "workspace": {{"definitions": {{"test": {{"path": {}, "tools": {{"timeout_seconds": 900}}}}}}}}
-            }}"#, serde_json::to_string(&work.to_string_lossy()).unwrap()),
-            &work,
-            home,
+            &root,
+            &root,
         )
         .unwrap();
-        assert_eq!(policy.tool_timeout_seconds, 900);
-        assert!(parse(r#"{"tools":{"timeout_seconds":0}}"#, &work, home).is_err());
-        assert!(parse(r#"{"tools":{"timeout_seconds":3601}}"#, &work, home).is_err());
-        fs::remove_dir_all(root).unwrap();
+        (root, policy)
     }
-
     #[test]
-    fn network_is_blocked_by_default_and_workspaces_can_override_it() {
-        let (root, work) = roots("network");
-        let home = Path::new("/home/me");
-        let policy = parse("{}", &work, home).unwrap();
-        assert_eq!(policy.workspace, work.canonicalize().unwrap());
-        assert_eq!(policy.network, Network::Blocked);
-        assert_eq!(policy.tool_timeout_seconds, 120);
-        assert!(policy.allow_hosts.is_empty());
-        assert!(policy.read_paths.is_empty());
-        assert_ne!(policy.command_home, policy.workspace);
-        assert!(policy.write_paths.contains(&policy.command_home));
-        let config = serde_json::json!({
-            "sandbox": {"network": {"mode": "blocked"}},
-            "workspace": {"definitions": {
-                "test": {"path": work, "network": {"mode": "open"}}
-            }}
-        });
-        let policy = parse(&config.to_string(), &work, home).unwrap();
-        assert_eq!(policy.network, Network::Open);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_session_cannot_switch_to_another_configured_workspace() {
-        let (root, first) = roots("pinned");
-        let second = root.join("second");
-        fs::create_dir_all(&second).unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "workspace": {"definitions": {
-                "first": {"path": first},
-                "second": {"path": second}
-            }}
-        }))
-        .unwrap();
-        let result = resolve_authorized(
-            config,
-            &first,
-            &second.join("file"),
-            OperationAccess::Read,
-            Path::new("/home/me"),
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("outside workspace")
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn references_are_read_only() {
-        let (root, workspace) = roots("reference");
-        let reference = root.join("reference");
-        fs::create_dir_all(&reference).unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "workspace": {"definitions": {"test": {
-                "path": workspace,
-                "references": {"nono": {"path": reference}}
-            }}}
-        }))
-        .unwrap();
-        let read = resolve_authorized(
-            config.clone(),
-            &workspace,
-            &reference.join("src/lib.rs"),
-            OperationAccess::Read,
-            Path::new("/home/me"),
-        )
-        .unwrap();
-        assert!(read.read_paths.contains(&reference.canonicalize().unwrap()));
-        assert!(
-            resolve_authorized(
-                config,
-                &workspace,
-                &reference.join("src/lib.rs"),
-                OperationAccess::Write,
-                Path::new("/home/me"),
-            )
-            .is_err()
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn profile_paths_are_capabilities_not_model_addressable_grants() {
-        let (root, workspace) = roots("profile-scope");
-        let home = root.join("home");
-        let cargo_bin = home.join(".cargo/bin");
-        let rustup = home.join(".rustup");
-        fs::create_dir_all(&cargo_bin).unwrap();
-        fs::create_dir_all(&rustup).unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "workspace": {"definitions": {"test": {
-                "path": workspace,
-                "profiles": ["rust"]
-            }}}
-        }))
-        .unwrap();
-        let policy = resolve(config, &workspace, &home).unwrap();
-        assert!(policy.read_paths.contains(&cargo_bin));
+    fn project_access_is_explicit_and_read_only_stays_read_only() {
+        let (root, policy) = fixture(json!({"filesystem":{"read":["."]}}));
         assert!(
             policy
-                .authorize(&cargo_bin.join("cargo"), &cargo_bin, OperationAccess::Read)
+                .authorize(&root.join("file"), &root, OperationAccess::Read)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize(&root.join("file"), &root, OperationAccess::Write)
+                .is_err()
+        );
+        assert!(
+            policy
+                .authorize(
+                    &root.parent().unwrap().join("outside"),
+                    &root,
+                    OperationAccess::Read
+                )
                 .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
-    fn capability_manifest_is_sanitized_and_matches_the_audit_digest() {
-        let (root, workspace) = roots("manifest");
-        let outside = root.join("outside");
-        fs::create_dir_all(&outside).unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({
-            "sandbox": {
-                "network": {"allow_domains": ["crates.io"]},
-                "filesystem": {"read": [outside]}
-            }
-        }))
-        .unwrap();
-        let mut policy = resolve(config, &workspace, &root).unwrap();
-        policy
-            .environment
-            .insert("EXAMPLE_TOKEN".to_owned(), "never-disclose-this".to_owned());
-
-        let manifest = policy.capability_manifest();
-        let encoded = serde_json::to_string(&manifest).unwrap();
-        assert_eq!(manifest["enforced_by"], "nono");
-        assert_eq!(manifest["network"]["mode"], "allowlist");
+    fn empty_policy_grants_no_project_access() {
+        let (root, policy) = fixture(json!({}));
         assert!(
-            manifest["model_access"]["read"]
-                .as_array()
-                .unwrap()
-                .contains(&json!(outside.canonicalize().unwrap()))
+            policy
+                .authorize(&root, &root, OperationAccess::Read)
+                .is_err()
         );
-        assert!(encoded.contains("EXAMPLE_TOKEN"));
-        assert!(!encoded.contains("never-disclose-this"));
-        assert_eq!(
-            manifest["policy_digest"].as_str().unwrap(),
-            policy.audit_context().policy_digest
+        assert!(
+            policy
+                .authorize(&root, &root, OperationAccess::Write)
+                .is_err()
         );
         fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
-    fn explicit_external_reads_work_without_granting_external_writes() {
-        let (root, work) = roots("external");
-        let outside = root.join("outside");
-        fs::create_dir_all(&outside).unwrap();
-        let config: Config = serde_json::from_str(
-            &serde_json::json!({
-                "sandbox": {"filesystem": {"read": [outside]}}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let read = resolve_authorized(
-            config.clone(),
-            &work,
-            &outside.join("file"),
-            OperationAccess::Read,
-            Path::new("/home/me"),
-        )
-        .unwrap();
-        assert_eq!(read.workspace, work.canonicalize().unwrap());
-        let outside = outside.canonicalize().unwrap();
-        assert_eq!(read.read_paths, std::slice::from_ref(&outside));
+    fn reference_files_are_supported_without_inheriting_other_policies() {
+        let path = std::env::current_exe().unwrap();
+        let (root, policy) =
+            fixture(json!({"references":{"executable":{"path":path,"access":"read"}}}));
         assert!(
-            resolve_authorized(
-                config,
-                &work,
-                &outside.join("file"),
-                OperationAccess::Write,
-                Path::new("/home/me"),
+            policy
+                .authorize(&path, &root, OperationAccess::Read)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .authorize(&path, &root, OperationAccess::Write)
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn denies_override_all_model_grants_and_linux_conflicts_fail() {
+        let (root, mut policy) = fixture(json!({"filesystem":{"readwrite":["."]}}));
+        policy.deny_paths.push(root.join("secret.env"));
+        assert!(
+            policy
+                .authorize(&root.join("secret.env"), &root, OperationAccess::Read)
+                .is_err()
+        );
+        assert!(
+            policy
+                .authorize(&root.join("secret.env"), &root, OperationAccess::Write)
+                .is_err()
+        );
+        assert!(validate_deny_overlaps(&policy, true).is_err());
+        assert!(validate_deny_overlaps(&policy, false).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn canonicalization_resolves_missing_paths_and_parent_components() {
+        let root = std::env::current_dir().unwrap();
+        assert_eq!(
+            resolve_project_path("./missing/../secret", &root, &root).unwrap(),
+            root.join("secret")
+        );
+        let missing = root.join(format!("nonaut-missing-grant-{}", std::process::id()));
+        assert!(
+            validate(
+                root.clone(),
+                NetworkConfig::default(),
+                FilesystemConfig {
+                    read: vec![missing.to_string_lossy().into_owned()],
+                    ..Default::default()
+                },
+                WorkspaceToolsConfig::default(),
+                &[],
+                &root
             )
             .is_err()
         );
-
-        let writable: Config = serde_json::from_str(
-            &serde_json::json!({
-                "sandbox": {"filesystem": {"write": [outside]}}
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let write = resolve_authorized(
-            writable,
-            &work,
-            &outside.join("file"),
-            OperationAccess::Write,
-            Path::new("/home/me"),
-        )
-        .unwrap();
-        assert!(write.write_paths.contains(&outside));
-        assert!(write.write_paths.contains(&write.command_home));
-        fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
-    fn relative_workspace_paths_are_rejected() {
-        let config: Config = serde_json::from_str(
-            r#"{"workspace":{"definitions":{"test":{"path":"relative/path"}}}}"#,
-        )
-        .unwrap();
-        let result = crate::workspace::workspace_root(&config.workspace.definitions["test"]);
-        assert!(format!("{:#}", result.unwrap_err()).contains("must be absolute"));
+    fn invalid_network_and_timeout_are_rejected() {
+        for value in [
+            json!({"mode":"allowlist"}),
+            json!({"mode":"open","domains":["example.com"]}),
+            json!({"mode":"allowlist","domains":["*"]}),
+        ] {
+            let network: NetworkConfig = serde_json::from_value(value).unwrap();
+            assert!(validate_network_config(&network).is_err());
+        }
+        let root = std::env::current_dir().unwrap();
+        for timeout in [0, MAX_TOOL_TIMEOUT_SECONDS + 1] {
+            assert!(
+                validate(
+                    root.clone(),
+                    NetworkConfig::default(),
+                    FilesystemConfig::default(),
+                    WorkspaceToolsConfig {
+                        timeout_seconds: Some(timeout)
+                    },
+                    &[],
+                    &root
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn manifest_and_summary_report_the_pinned_policy() {
+        let (root, policy) = fixture(json!({"filesystem":{"readwrite":["."]}}));
+        let manifest = policy.capability_manifest();
+        assert_eq!(
+            manifest["model_access"]["write"][0],
+            root.to_string_lossy().as_ref()
+        );
+        assert!(
+            manifest["policy_digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        let summary = describe_resolved(&policy, false).unwrap();
+        assert!(summary.contains("/permissions full"));
+        assert!(!summary.contains("NONO RUNTIME"));
+        assert!(
+            describe_resolved(&policy, true)
+                .unwrap()
+                .contains("NONO RUNTIME")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -39,28 +39,29 @@ pub(crate) fn read_paths() -> &'static [&'static str] {
         "/usr/local/lib",
         "/usr/share",
         "/System/Library",
-        "/Library",
-        "/dev",
-        "/private/var/db",
+        "/Library/Apple/System/Library",
+        "/Library/Developer/CommandLineTools",
+        "/Applications/Xcode.app/Contents/Developer",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/fd",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
         "/private/etc/ssl",
+        "/private/var/select/sh",
         "/etc/ssl",
-        "/etc",
-        "/private/etc",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/localtime",
         "/usr/share/zoneinfo",
         "/usr/share/locale",
         "/var/db/timezone",
         "/usr/share/terminfo",
-        "/var",
-        "/private/var",
-        "/private",
-        "/tmp",
-        "/System/Volumes",
         "/System/Cryptexes",
-        "/Applications",
-        "/cores",
-        "/opt",
-        "/run",
-        "/nix",
     ]
 }
 
@@ -130,18 +131,18 @@ pub(crate) fn read_paths() -> &'static [&'static str] {
 #[cfg(target_os = "macos")]
 pub(crate) fn write_paths() -> &'static [&'static str] {
     &[
-        "/private/tmp",
-        "/tmp",
-        "/private/var/folders",
-        "/var/folders",
-        "/dev",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/tty",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/fd",
     ]
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn write_paths() -> &'static [&'static str] {
     &[
-        "/tmp",
         "/dev/null",
         "/dev/zero",
         "/dev/full",

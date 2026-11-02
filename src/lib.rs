@@ -79,12 +79,8 @@ pub fn workspace_root(requested: Option<&str>) -> Result<std::path::PathBuf> {
     Ok(workspace::select(&launch, requested)?.root)
 }
 
-pub fn run_workspace_command(args: Vec<String>) -> Result<()> {
-    workspace::run_command(args)
-}
-
-pub fn run_workspace_setup() -> Result<()> {
-    workspace_setup::configure_current()
+pub fn run_project_config(requested: Option<&str>) -> Result<()> {
+    workspace_setup::configure_current(requested)
 }
 
 pub async fn run_exec(
@@ -149,10 +145,6 @@ pub async fn run_session_worker(id: String, workspace: std::path::PathBuf) -> Re
 
 pub async fn run_tui() -> Result<()> {
     let cwd = std::env::current_dir().context("could not determine the working directory")?;
-    let warmup_workspace = cwd.clone();
-    tokio::spawn(async move {
-        let _ = tools::prewarm(&warmup_workspace).await;
-    });
     tui::init_theme();
     let no_auto_connect = std::env::var_os("NONAUT_NO_AUTO_CONNECT").is_some();
     let mut app = if no_auto_connect {
@@ -174,7 +166,7 @@ pub async fn run_tui() -> Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )
     .is_ok();
-    let mouse_capture = execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     // Without bracketed paste every newline in a paste arrives as Enter and
     // submits a fragment of it.
     let bracketed_paste = execute!(std::io::stdout(), EnableBracketedPaste).is_ok();
@@ -182,9 +174,7 @@ pub async fn run_tui() -> Result<()> {
     if bracketed_paste {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     }
-    if mouse_capture {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture);
-    }
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     if keyboard_enhancements {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }

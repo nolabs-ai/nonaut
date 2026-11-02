@@ -476,7 +476,7 @@ pub(crate) async fn execute_with_progress(
     let policy = crate::policy::pin(workspace)?;
     policy.authorize(&operation, &fallback_root, access)?;
     let operation_workspace = policy.workspace.clone();
-    if access == OperationAccess::Write {
+    if access == OperationAccess::Write || tool == "run_command" {
         crate::undo::checkpoint_before_mutation(workspace).await;
     }
     sandbox::execute(&operation_workspace, tool, &arguments, &policy, progress).await
@@ -553,7 +553,7 @@ fn operation_location(
 ) -> Result<(PathBuf, PathBuf, OperationAccess)> {
     if tool == "run_command" {
         let cwd = PathBuf::from(required_string(arguments, "cwd")?);
-        return Ok((cwd.clone(), cwd, OperationAccess::Write));
+        return Ok((cwd.clone(), cwd, OperationAccess::Read));
     }
     let path = arguments
         .get("path")

@@ -26,7 +26,7 @@ struct ProfileDefinition {
     resolve: ProfileResolver,
 }
 
-/// The single source of truth for built-in development profiles.
+/// The single source of truth for built-in development packs.
 const PROFILES: &[ProfileDefinition] = &[
     ProfileDefinition {
         name: "rust",
@@ -50,8 +50,21 @@ const PROFILES: &[ProfileDefinition] = &[
     },
 ];
 
-pub(crate) fn available_names() -> Vec<&'static str> {
-    PROFILES.iter().map(|profile| profile.name).collect()
+pub(crate) fn detect(root: &Path) -> Vec<String> {
+    PROFILES
+        .iter()
+        .filter(|profile| match profile.name {
+            "rust" => root.join("Cargo.toml").is_file(),
+            "python" => {
+                root.join("pyproject.toml").is_file() || root.join("requirements.txt").is_file()
+            }
+            "node" => root.join("package.json").is_file(),
+            "go" => root.join("go.mod").is_file(),
+            "bun" => root.join("bun.lock").is_file() || root.join("bun.lockb").is_file(),
+            _ => false,
+        })
+        .map(|profile| profile.name.to_owned())
+        .collect()
 }
 
 pub(crate) fn resolve(names: &[String], home: &Path, workspace: &Path) -> Result<ProfilePlan> {
@@ -357,6 +370,18 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), names.len());
+    }
+
+    #[test]
+    fn detection_records_every_matching_development_pack() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/profile-tests")
+            .join(format!("detect-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("Cargo.toml"), "[package]").unwrap();
+        fs::write(directory.join("package.json"), "{}").unwrap();
+        assert_eq!(detect(&directory), ["rust", "node"]);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

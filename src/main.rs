@@ -17,7 +17,7 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    let requested_workspace = extract_workspace(&mut args)?;
+    let requested_config = extract_config(&mut args)?;
     let mode = args.first().map(String::as_str);
     if mode == Some("__nonaut_sandbox") {
         return nonaut::run_sandbox();
@@ -79,25 +79,22 @@ fn run() -> anyhow::Result<()> {
             "this Nonaut build does not include control-plane support; rebuild with `--features control-plane`"
         );
     }
-    if mode == Some("workspace") {
-        return nonaut::run_workspace_command(args.into_iter().skip(1).collect());
-    }
-    if mode == Some("setup") {
+    if matches!(mode, Some("config")) {
         if matches!(
             args.get(1).map(String::as_str),
             Some("help" | "--help" | "-h")
         ) {
             nonaut::print_command_help(
-                "setup",
-                "nonaut setup",
-                "Configure the current directory as a named workspace.",
+                "config",
+                "nonaut config",
+                "Show the current project and configuration file.",
             );
             return Ok(());
         }
         if args.len() != 1 {
-            anyhow::bail!("usage: nonaut setup");
+            anyhow::bail!("usage: nonaut config");
         }
-        return nonaut::run_workspace_setup();
+        return nonaut::run_project_config(requested_config.as_deref());
     }
     if mode == Some("exec") {
         if matches!(
@@ -106,12 +103,12 @@ fn run() -> anyhow::Result<()> {
         ) {
             nonaut::print_command_help(
                 "exec",
-                "nonaut exec [--workspace NAME|.] [--cwd DIR] [--] <command>",
+                "nonaut exec [--config FILE] [--cwd DIR] [--] <command>",
                 "Run a shell command in a policy-pinned nono sandbox.",
             );
             return Ok(());
         }
-        let session_root = nonaut::workspace_root(requested_workspace.as_deref())?;
+        let session_root = nonaut::workspace_root(requested_config.as_deref())?;
         let mut cwd = session_root.clone();
         let mut command_args = Vec::new();
         let mut arguments = args.iter().skip(1);
@@ -142,7 +139,7 @@ fn run() -> anyhow::Result<()> {
         let command = command_args.join(" ");
         if command.trim().is_empty() {
             anyhow::bail!(
-                "missing command\n\nUsage: nonaut exec [--workspace NAME|.] [--cwd DIR] [--] <command>"
+                "missing command\n\nUsage: nonaut exec [--config FILE] [--cwd DIR] [--] <command>"
             );
         }
         let output = runtime.block_on(nonaut::run_exec(session_root, cwd, command))?;
@@ -152,23 +149,23 @@ fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    runtime.block_on(nonaut::run(args, requested_workspace))
+    runtime.block_on(nonaut::run(args, requested_config))
 }
 
-fn extract_workspace(args: &mut Vec<String>) -> anyhow::Result<Option<String>> {
+fn extract_config(args: &mut Vec<String>) -> anyhow::Result<Option<String>> {
     let mut selected = None;
     let mut index = 0;
     while index < args.len() {
         if args[index] == "--" {
             break;
         }
-        if matches!(args[index].as_str(), "--workspace" | "-w") {
+        if matches!(args[index].as_str(), "--config") {
             let value = args
                 .get(index + 1)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("{} needs a workspace name or .", args[index]))?;
+                .ok_or_else(|| anyhow::anyhow!("{} needs a policy file", args[index]))?;
             if selected.replace(value).is_some() {
-                anyhow::bail!("--workspace may be supplied only once");
+                anyhow::bail!("--config may be supplied only once");
             }
             args.drain(index..=index + 1);
             continue;
@@ -183,29 +180,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_selection_is_global_but_stops_at_command_separator() {
+    fn config_selection_is_global_but_stops_at_command_separator() {
         let mut args = vec![
             "exec".to_owned(),
-            "-w".to_owned(),
+            "--config".to_owned(),
             "project".to_owned(),
             "--".to_owned(),
-            "printf --workspace untouched".to_owned(),
+            "printf --config untouched".to_owned(),
         ];
         assert_eq!(
-            extract_workspace(&mut args).unwrap().as_deref(),
+            extract_config(&mut args).unwrap().as_deref(),
             Some("project")
         );
-        assert_eq!(args, ["exec", "--", "printf --workspace untouched"]);
+        assert_eq!(args, ["exec", "--", "printf --config untouched"]);
     }
 
     #[test]
-    fn workspace_selection_rejects_missing_and_duplicate_values() {
-        assert!(extract_workspace(&mut vec!["--workspace".to_owned()]).is_err());
+    fn config_selection_rejects_missing_and_duplicate_values() {
+        assert!(extract_config(&mut vec!["--config".to_owned()]).is_err());
         assert!(
-            extract_workspace(&mut vec![
-                "-w".to_owned(),
+            extract_config(&mut vec![
+                "--config".to_owned(),
                 "one".to_owned(),
-                "--workspace".to_owned(),
+                "--config".to_owned(),
                 "two".to_owned(),
             ])
             .is_err()

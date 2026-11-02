@@ -17,16 +17,17 @@ By default, a sandboxed operation receives:
 - No real-home credentials or ambient environment variables
 - No network access
 
-Development profiles add read-only toolchain paths and isolated writable
+Development packs add read-only toolchain paths and isolated writable
 caches. Explicit filesystem and network configuration can widen this boundary.
 
-The configuration file remains outside every workspace so an agent cannot
-edit its own permissions.
+Application settings and saved project policies live outside the workspace.
+Loaded policy files are protected from sandbox writes. Broad writable grants
+covering Nonaut's configuration directory are rejected.
 
 ## Sandbox lifetime
 
-At session start, Nonaut resolves the selected workspace, read-only
-references, development profiles, explicit filesystem grants, private runtime
+At session start, Nonaut resolves the selected project policy, explicit
+references, development packs, explicit filesystem grants, private runtime
 paths, and network policy into one capability set. Nono applies that immutable
 set once to a long-lived worker; every tool process inherits its Seatbelt or
 Landlock boundary.
@@ -40,7 +41,7 @@ At creation, Nonaut writes a sanitized JSON description of that capability
 set outside the writable workspace. Sandboxed commands receive its exact path
 as `NONAUT_CAP_FILE`, with read-only access to that file. The model can request
 the same data through `sandbox_info`. Both expose model-addressable paths,
-runtime-only support paths, network rules, profile names, environment variable
+runtime-only support paths, network rules, pack names, environment variable
 names, the tool timeout, and a policy digest; environment values and secrets
 are never included. The manifest describes the boundary, while Nono's
 Seatbelt or Landlock policy remains authoritative.
@@ -49,8 +50,14 @@ Seatbelt or Landlock policy remains authoritative.
 
 Nono enforces filesystem capabilities at the operating-system layer. Nonaut
 pins one primary workspace when the session starts and passes the resulting
-capabilities to Nono. Other configured workspaces remain inaccessible unless
-the active workspace names them as read-only references.
+capabilities to Nono. Other projects remain inaccessible. A reference specifies
+its path and `read` or `readwrite` access directly in the project policy.
+Referencing a project never inherits its permissions.
+
+There is no unconditional project grant. Read-only policies remain read-only
+even for shell commands. macOS enforces explicit denies inside allowed trees;
+Linux rejects these conflicts because Landlock cannot express them. This check
+includes grants from development packs and platform runtime paths.
 
 The real user home is not used as sandbox `HOME`. Provider credentials, SSH
 keys, shell history, cloud configuration, and unrelated projects therefore
@@ -61,7 +68,7 @@ allows the agent to change anything beneath that path; a readable grant can
 expose its contents to the provider and, when network is open, to remote
 destinations.
 
-A reference prevents writes to its source path. Read access cannot guarantee
+A read-only reference prevents writes to its source path. Read access cannot guarantee
 that source code is never executed: an agent can ask an interpreter to read it
 or copy it into the writable workspace. Treat references as readable context,
 not as a separate no-execute boundary.
@@ -84,8 +91,8 @@ receives.
 ## Environment and providers
 
 Sandboxed processes start from a cleared environment. Nonaut adds only the
-small runtime environment and explicit values produced by development
-profiles. Provider credentials remain in the control plane and are never
+small runtime environment and explicit values produced by development packs.
+Provider credentials remain in the control plane and are never
 copied into detached-session metadata.
 
 Provider inference itself is not sandboxed: prompts, approved project files,

@@ -63,6 +63,46 @@ pub(crate) fn notice(message: &str, detail: Option<&str>) {
     }
 }
 
+pub(crate) fn render_project_setup(
+    name: &str,
+    root: &str,
+    source: &str,
+    packs: &[String],
+    color: bool,
+) -> String {
+    let heading = |text| styled(text, MUTED, true, color);
+    let packs = if packs.is_empty() {
+        "none".to_owned()
+    } else {
+        format!("{} · isolated caches", packs.join(", "))
+    };
+    let (directory, filename) = source
+        .rsplit_once('/')
+        .map_or(("", source), |(directory, filename)| (directory, filename));
+    let location = if directory.is_empty() {
+        format!("    {filename}")
+    } else {
+        format!("    {directory}/\n    {filename}")
+    };
+    format!(
+        "\n{}\n{}\n\n  {}\n  {}\n\n{}\n    Project     read/write\n    Packs       {packs}\n    Network     blocked\n    References  none\n\n{}\n{location}\n\n{}\n\n{} Create policy and launch? {} ",
+        styled("⎔  nonaut", ACCENT, true, color),
+        styled("Set up this project", MUTED, false, color),
+        styled(name, ACCENT, true, color),
+        root,
+        heading("  ACCESS"),
+        heading("  SAVE POLICY"),
+        styled(
+            "  Edit the policy file whenever your workflow needs more access.",
+            MUTED,
+            false,
+            color
+        ),
+        styled("  ›", ACCENT, true, color),
+        styled("[Y/n]", ACCENT, true, color),
+    )
+}
+
 pub(crate) fn render_help(color: bool) -> String {
     let title = styled("⎔  nonaut", ACCENT, true, color);
     let subtitle = styled("security-first agent harness", MUTED, false, color);
@@ -70,16 +110,12 @@ pub(crate) fn render_help(color: bool) -> String {
     let command = |value| styled(value, ACCENT, false, color);
 
     let commands = vec![
-        (
-            "--workspace NAME|., -w NAME|.",
-            "Select the active workspace",
-        ),
+        ("--config FILE", "Use a project policy file"),
         (
             "exec [--cwd DIR] -- <command>",
             "Run a command in the nono sandbox",
         ),
-        ("setup", "Configure the current directory"),
-        ("workspace <command>", "Manage named workspaces"),
+        ("config", "Show the current project configuration"),
         ("ps", "List persistent sessions"),
         ("attach <session>", "Attach to a persistent session"),
         ("kill <session>", "Stop a persistent session"),
@@ -162,9 +198,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_setup_preserves_the_same_information_without_color() {
+        let render = |color| {
+            render_project_setup(
+                "service",
+                "~/Work/service",
+                "~/.config/nonaut/projects/service-123.json",
+                &["rust".into(), "python".into()],
+                color,
+            )
+        };
+        let plain = render(false);
+        for text in [
+            "service",
+            "~/Work/service",
+            "read/write",
+            "rust, python · isolated caches",
+            "blocked",
+            "References  none",
+            "~/.config/nonaut/projects/",
+            "service-123.json",
+            "Create policy and launch? [Y/n]",
+        ] {
+            assert!(plain.contains(text), "missing {text}");
+        }
+        assert!(!plain.contains('\u{1b}'));
+        let colored = render(true);
+        assert!(colored.contains("\u{1b}[1m"));
+        let mut unstyled = String::new();
+        let mut escape = false;
+        for ch in colored.chars() {
+            if ch == '\u{1b}' {
+                escape = true;
+            } else if escape {
+                escape = ch != 'm';
+            } else {
+                unstyled.push(ch);
+            }
+        }
+        assert_eq!(unstyled, plain);
+    }
+
+    #[test]
+    fn project_setup_handles_no_packs_and_a_bare_policy_filename() {
+        let rendered = render_project_setup("app", "/work/app", "policy.json", &[], false);
+        assert!(rendered.contains("Packs       none"));
+        assert!(rendered.contains("    policy.json\n"));
+        assert!(!rendered.contains("isolated caches"));
+    }
+
+    #[test]
     fn plain_help_lists_every_cli_command() {
         let help = render_help(false);
-        for command in ["exec", "setup", "workspace", "ps", "attach", "kill", "help"] {
+        for command in ["exec", "config", "ps", "attach", "kill", "help"] {
             assert!(help.contains(command));
         }
         #[cfg(feature = "control-plane")]

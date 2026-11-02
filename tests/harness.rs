@@ -74,7 +74,9 @@ fn exec_in_selected(
     fs::create_dir_all(config_dir(workspace)).unwrap();
     let mut process = Command::new(binary());
     if let Some(name) = selected_workspace {
-        process.args(["--workspace", name]);
+        process
+            .arg("--config")
+            .arg(config_dir(workspace).join(format!("{name}.json")));
     }
     process
         .arg("exec")
@@ -97,9 +99,8 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
 
     let root = TestRoot::new("workspace-policy");
     let session = root.workspace();
-    let mixed = session.join("nono");
-    let other = session.join("other");
-    fs::create_dir_all(&mixed).unwrap();
+    let mixed = session.clone();
+    let other = root.path.join("other");
     fs::create_dir_all(&other).unwrap();
 
     let cargo_bin = root.path.join(".cargo/bin");
@@ -150,22 +151,16 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).unwrap();
 
     let config = serde_json::json!({
-        "workspace": {
-            "default": "mixed",
-            "definitions": {
-                "mixed": {
-                    "path": mixed,
-                    "profiles": ["rust", "python", "node", "go", "bun"]
-                }
-            }
-        }
+        "root": mixed, "packs": ["rust", "python", "node", "go", "bun"],
+        "filesystem": {"readwrite": ["."]}
     });
-    write_config(&session, &serde_json::to_string(&config).unwrap());
+    write_named_policy(&session, "mixed", &config);
 
-    let allowed = exec_in(
+    let allowed = exec_in_selected(
         &session,
         &mixed,
         "cargo --version && printf ':' && python --version && printf ':' && node --version && printf ':' && go version && printf ':' && bun --version",
+        Some("mixed"),
     );
     assert!(allowed.status.success(), "{}", combined(&allowed));
     assert!(combined(&allowed).contains("rust-profile-ok"));
@@ -174,7 +169,7 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     assert!(combined(&allowed).contains("go-profile-ok"));
     assert!(combined(&allowed).contains("bun-profile-ok"));
 
-    let denied = exec_in(&session, &other, "printf should-not-run");
+    let denied = exec_in_selected(&session, &other, "printf should-not-run", Some("mixed"));
     assert!(
         !denied.status.success(),
         "unconfigured workspace was allowed"
@@ -300,7 +295,7 @@ fn headless_exec_blocks_network_connections() {
     }
     let root = TestRoot::new("exec-network");
     let workspace = root.workspace();
-    write_config(&workspace, r#"{"sandbox":{"network":{"mode":"blocked"}}}"#);
+    write_config(&workspace, r#"{"network":{"mode":"blocked"}}"#);
     assert!(
         !curl_reaches_listener(&workspace),
         "network access unexpectedly succeeded with \"network\": \"blocked\""
@@ -315,7 +310,7 @@ fn headless_exec_allows_network_when_explicitly_opened() {
     }
     let root = TestRoot::new("exec-network-open");
     let workspace = root.workspace();
-    write_config(&workspace, r#"{"sandbox":{"network":{"mode":"open"}}}"#);
+    write_config(&workspace, r#"{"network":{"mode":"open"}}"#);
     assert!(
         curl_reaches_listener(&workspace),
         "sandboxed command could not reach the listener with explicitly open network"
@@ -334,106 +329,71 @@ fn headless_exec_can_read_the_macos_tls_certificate_bundle() {
 
 #[test]
 #[ignore = "provider-free black-box integration test"]
-fn explicit_workspace_selection_uses_its_network_policy() {
-    if !curl_available() {
-        return;
-    }
-    let root = TestRoot::new("workspace-network");
-    let session = root.workspace();
-    let open = session.join("open");
-    let blocked = session.join("blocked");
-    fs::create_dir_all(&open).unwrap();
-    fs::create_dir_all(&blocked).unwrap();
-    let config = serde_json::json!({
-        "workspace": {
-            "definitions": {
-                "open": {
-                    "path": open,
-                    "network": {"mode": "open"}
-                },
-                "blocked": {
-                    "path": blocked,
-                    "network": {"mode": "blocked"}
-                }
-            }
-        }
-    });
-    write_config(&session, &serde_json::to_string(&config).unwrap());
-    assert!(curl_reaches_listener_in_selected(&session, &open, "open"));
-    assert!(!curl_reaches_listener_in_selected(
-        &session, &blocked, "blocked"
-    ));
-}
-
-#[test]
-#[ignore = "provider-free black-box integration test"]
-fn named_workspace_references_are_read_only_and_other_workspaces_stay_hidden() {
-    let root = TestRoot::new("workspace-references");
-    let session = root.workspace();
-    let primary = session.join("primary");
-    let reference = session.join("reference");
-    let unrelated = session.join("unrelated");
-    fs::create_dir_all(&primary).unwrap();
+fn named_references_are_self_contained_and_read_only() {
+    let root = TestRoot::new("project-references");
+    let workspace = root.workspace();
+    let reference = root.path.join("reference");
     fs::create_dir_all(&reference).unwrap();
-    fs::create_dir_all(&unrelated).unwrap();
     fs::write(reference.join("api.txt"), "reference-visible").unwrap();
-    fs::write(unrelated.join("secret.txt"), "must-stay-hidden").unwrap();
-    let config = serde_json::json!({
-        "workspace": {
-            "definitions": {
-                "primary": {
-                    "path": primary,
-                    "references": {"api": {"path": reference}}
-                },
-                "unrelated": {"path": unrelated}
-            }
-        }
-    });
-    write_config(&session, &serde_json::to_string(&config).unwrap());
-
-    let read = exec_in_selected(
-        &session,
-        &primary,
-        &format!("cat {}/api.txt", reference.display()),
-        Some("primary"),
+    let unrelated = root.path.join("secret.txt");
+    fs::write(&unrelated, "hidden").unwrap();
+    write_config(
+        &workspace,
+        &serde_json::json!({
+            "references": {"api": {"path": "../reference", "access": "read"}}
+        })
+        .to_string(),
     );
+    let read = exec(&workspace, &format!("cat {}/api.txt", reference.display()));
     assert!(read.status.success(), "{}", combined(&read));
     assert_eq!(
         String::from_utf8_lossy(&read.stdout).trim(),
         "reference-visible"
     );
-
-    let write = exec_in_selected(
-        &session,
-        &primary,
+    let write = exec(
+        &workspace,
         &format!("printf changed > {}/api.txt", reference.display()),
-        Some("primary"),
     );
-    assert!(
-        !write.status.success(),
-        "reference write unexpectedly succeeded"
-    );
+    assert!(!write.status.success());
     assert_eq!(
         fs::read_to_string(reference.join("api.txt")).unwrap(),
         "reference-visible"
     );
-
-    let unrelated_read = exec_in_selected(
-        &session,
-        &primary,
-        &format!("cat {}/secret.txt", unrelated.display()),
-        Some("primary"),
-    );
     assert!(
-        !unrelated_read.status.success(),
-        "configured sibling was implicitly readable"
+        !exec(&workspace, &format!("cat {}", unrelated.display()))
+            .status
+            .success()
     );
 }
 
+fn project_policy_path(workspace: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let root = workspace.canonicalize().unwrap();
+    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    let hash: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    config_dir(workspace).join("projects").join(format!(
+        "{}-{hash}.json",
+        root.file_name().unwrap().to_string_lossy()
+    ))
+}
+
+fn write_named_policy(workspace: &Path, name: &str, config: &serde_json::Value) {
+    fs::create_dir_all(config_dir(workspace)).unwrap();
+    fs::write(
+        config_dir(workspace).join(format!("{name}.json")),
+        config.to_string(),
+    )
+    .unwrap();
+}
+
 fn write_config(workspace: &Path, config_text: &str) {
-    let config = config_dir(workspace);
-    fs::create_dir_all(&config).unwrap();
-    fs::write(config.join("config.json"), config_text).unwrap();
+    let mut config: serde_json::Value = serde_json::from_str(config_text).unwrap();
+    if config.get("filesystem").is_none() {
+        config["filesystem"] = serde_json::json!({"readwrite": ["."]});
+    }
+    let path = project_policy_path(workspace);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, config.to_string()).unwrap();
 }
 
 fn config_dir(workspace: &Path) -> PathBuf {
@@ -652,7 +612,7 @@ fn tui_reuses_a_sandbox_worker_across_commands() {
     wait_for(&run.output, "Failed shell <shell-command>");
 
     let widened = serde_json::json!({
-        "sandbox": {"filesystem": {"read": [outside]}}
+        "references": {"outside": {"path": outside, "access": "read"}}
     });
     write_config(&workspace, &serde_json::to_string(&widened).unwrap());
     let offset = run.output.lock().unwrap().len();
@@ -720,7 +680,7 @@ fn tui_changes_view_shows_untracked_work_and_returns_to_agent() {
     .unwrap();
 
     let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
-    wait_for(&run.output, "2. Review (1)");
+    wait_for(&run.output, "Review");
     run.writer.write_all(b"\x1b2").unwrap();
     run.writer.flush().unwrap();
     wait_for(&run.output, "visible in the changes workspace");
@@ -734,22 +694,41 @@ fn tui_changes_view_shows_untracked_work_and_returns_to_agent() {
 fn first_launch_setup_saves_the_workspace_and_starts_the_tui() {
     let root = TestRoot::new("workspace-setup");
     let workspace = root.workspace();
+    fs::write(workspace.join("Cargo.toml"), "[package]\nname='demo'").unwrap();
     let mut run = spawn_pty(&workspace, &[], &root);
-    wait_for(&run.output, "Configure");
-    run.writer.write_all(b"\x1b[B\r\r\r\r\r\r\r").unwrap();
+    wait_for(&run.output, "Create policy and launch?");
+    run.writer.write_all(b"y\n").unwrap();
     run.writer.flush().unwrap();
     answer_cursor_position(&mut run);
     wait_for(&run.output, "Ask anything");
+    run.writer.write_all(b"/permissions\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "Workspace  workspace");
     run.writer.write_all(b"/q\r").unwrap();
     run.writer.flush().unwrap();
     wait_for_exit(&mut run.child);
 
-    let config = fs::read_to_string(root.path.join("config/nonaut/config.json")).unwrap();
+    let config = fs::read_to_string(project_policy_path(&workspace)).unwrap();
     let config: serde_json::Value = serde_json::from_str(&config).unwrap();
     assert_eq!(
-        config["workspace"]["definitions"]["workspace"]["path"],
-        "~/workspace"
+        config["root"],
+        serde_json::json!(workspace.canonicalize().unwrap())
     );
+    assert_eq!(config["filesystem"], serde_json::json!({"readwrite":["."]}));
+    assert!(config.get("references").is_none());
+    assert_eq!(config["packs"][0], "rust");
+
+    let shown = Command::new(binary())
+        .arg("config")
+        .current_dir(&workspace)
+        .env("HOME", &root.path)
+        .env("XDG_CONFIG_HOME", root.path.join("config"))
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{}", combined(&shown));
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("\"workspace\""), "{shown}");
+    assert!(shown.contains("\"rust\""), "{shown}");
 }
 
 #[test]
@@ -757,7 +736,8 @@ fn first_launch_setup_saves_the_workspace_and_starts_the_tui() {
 fn detached_session_can_be_listed_attached_and_killed() {
     let root = TestRoot::new("session-lifecycle");
     let workspace = root.workspace();
-    let mut run = spawn_pty(&workspace, &["--workspace", "."], &root);
+    write_config(&workspace, "{}");
+    let mut run = spawn_pty(&workspace, &[], &root);
     answer_cursor_position(&mut run);
     wait_for(&run.output, "Ask anything");
     run.writer.write_all(b"/detach\r").unwrap();
@@ -801,4 +781,242 @@ fn detached_session_can_be_listed_attached_and_killed() {
     let killed = kill.output().unwrap();
     assert!(killed.status.success(), "{}", combined(&killed));
     assert!(String::from_utf8_lossy(&killed.stdout).contains("Killed 1 persistent session"));
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn supplied_rootless_policy_is_selected_without_merging_saved_grants() {
+    let root = TestRoot::new("supplied-policy");
+    let workspace = root.workspace();
+    fs::write(workspace.join("input.txt"), "visible").unwrap();
+    write_config(&workspace, "{}");
+    write_named_policy(
+        &workspace,
+        "readonly",
+        &serde_json::json!({"filesystem":{"read":["."]}}),
+    );
+    let read = exec_in_selected(&workspace, &workspace, "cat input.txt", Some("readonly"));
+    assert!(read.status.success(), "{}", combined(&read));
+    let write = exec_in_selected(
+        &workspace,
+        &workspace,
+        "printf x > output.txt",
+        Some("readonly"),
+    );
+    assert!(
+        !write.status.success(),
+        "saved write permissions leaked into explicit config"
+    );
+    write_named_policy(
+        &workspace,
+        "wrong",
+        &serde_json::json!({"root": workspace.parent().unwrap()}),
+    );
+    let mismatch = exec_in_selected(&workspace, &workspace, "printf unexpected", Some("wrong"));
+    assert!(!mismatch.status.success());
+    assert!(combined(&mismatch).contains("does not match active project"));
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn policies_and_application_settings_cannot_be_modified_from_commands() {
+    let root = TestRoot::new("protected-config");
+    let workspace = root.workspace();
+    write_config(&workspace, "{}");
+    let source = project_policy_path(&workspace);
+    let denied = exec(
+        &workspace,
+        &format!("printf tampered > '{}'", source.display()),
+    );
+    assert!(!denied.status.success());
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(source).unwrap()).is_ok()
+    );
+    let denied = exec(
+        &workspace,
+        &format!(
+            "printf tampered > '{}'",
+            config_dir(&workspace).join("config.json").display()
+        ),
+    );
+    assert!(!denied.status.success());
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn deny_within_project_is_enforced_or_rejected_before_launch() {
+    let root = TestRoot::new("project-deny");
+    let workspace = root.workspace();
+    fs::write(workspace.join("credentials.env"), "secret").unwrap();
+    fs::write(workspace.join("ordinary.txt"), "ordinary").unwrap();
+    write_config(
+        &workspace,
+        r#"{"filesystem":{"readwrite":["."],"deny":["./credentials.env"]}}"#,
+    );
+    let denied = exec(&workspace, "cat credentials.env");
+    assert!(!denied.status.success());
+    #[cfg(target_os = "linux")]
+    assert!(combined(&denied).contains("Linux Landlock cannot enforce deny"));
+    #[cfg(target_os = "macos")]
+    {
+        let ordinary = exec(&workspace, "cat ordinary.txt");
+        assert!(ordinary.status.success(), "{}", combined(&ordinary));
+        assert!(
+            !exec(&workspace, "printf leaked > credentials.env")
+                .status
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("credentials.env")).unwrap(),
+            "secret"
+        );
+        std::os::unix::fs::symlink(workspace.join("credentials.env"), workspace.join("alias"))
+            .unwrap();
+        assert!(!exec(&workspace, "cat alias").status.success());
+        assert!(
+            !exec(&workspace, "ln credentials.env hardlink && cat hardlink")
+                .status
+                .success()
+        );
+        assert!(
+            !exec(&workspace, "mv credentials.env renamed && cat renamed")
+                .status
+                .success()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn platform_runtime_does_not_expose_unrelated_private_tmp_files() {
+    let root = TestRoot::new("runtime-private");
+    let workspace = root.workspace();
+    let secret = root.runtime.join("secret");
+    fs::write(&secret, "hidden").unwrap();
+    let denied = exec(&workspace, &format!("cat '{}'", secret.display()));
+    assert!(
+        !denied.status.success(),
+        "broad runtime grant exposed private temporary files"
+    );
+    let denied = exec(
+        &workspace,
+        &format!("printf tampered > '{}'", secret.display()),
+    );
+    assert!(
+        !denied.status.success(),
+        "shared temporary directories were writable"
+    );
+    assert_eq!(fs::read_to_string(secret).unwrap(), "hidden");
+}
+
+#[test]
+#[ignore = "provider-free real toolchain integration test"]
+fn rust_pack_runs_real_offline_cargo_tests() {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+    if !home.join(".cargo/bin/cargo").exists() {
+        return;
+    }
+    let root = TestRoot::new("real-cargo");
+    let workspace = root.workspace();
+    fs::create_dir(workspace.join("src")).unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[package]\nname = 'sandbox-probe'\nversion = '0.1.0'\nedition = '2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("src/lib.rs"),
+        "#[test] fn inside_sandbox() { assert_eq!(2 + 2, 4); }\n",
+    )
+    .unwrap();
+    write_named_policy(
+        &workspace,
+        "rust",
+        &serde_json::json!({
+            "packs": ["rust"], "filesystem": {"readwrite":["."]}
+        }),
+    );
+    let output = Command::new(binary())
+        .args(["--config"])
+        .arg(config_dir(&workspace).join("rust.json"))
+        .args(["exec", "--", "cargo test --offline"])
+        .current_dir(&workspace)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", root.path.join("config"))
+        .env("XDG_CACHE_HOME", root.path.join("cache"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(combined(&output).contains("1 passed"));
+    assert!(workspace.join("target").is_dir());
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
+fn cancelling_first_setup_writes_no_project_policy() {
+    let root = TestRoot::new("cancel-setup");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &[], &root);
+    wait_for(&run.output, "Create policy and launch?");
+    run.writer.write_all(b"n\n").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
+    assert!(!project_policy_path(&workspace).exists());
+    assert!(!workspace.join("nonaut.json").exists());
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn imported_policy_resolves_permission_paths_from_project_root() {
+    let root = TestRoot::new("imported-policy");
+    let workspace = root.workspace();
+    fs::write(workspace.join("input.txt"), "project-input").unwrap();
+    let directory = config_dir(&workspace).join("shared");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("base.json"),
+        r#"{"filesystem":{"read":["."]}}"#,
+    )
+    .unwrap();
+    write_named_policy(
+        &workspace,
+        "imported",
+        &serde_json::json!({"extends":["shared/base.json"]}),
+    );
+    let output = exec_in_selected(&workspace, &workspace, "cat input.txt", Some("imported"));
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "project-input"
+    );
+    assert!(
+        !exec_in_selected(
+            &workspace,
+            &workspace,
+            "printf unexpected > output.txt",
+            Some("imported")
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
+fn tui_pastes_multiline_commands_without_submitting_them() {
+    let root = TestRoot::new("literal-paste");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
+    wait_for(&run.output, "Ask anything");
+    run.writer
+        .write_all(b"\x1b[200~/exec printf unexpected > pasted.txt\nsecond-line\x1b[201~")
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "second-line");
+    assert!(!workspace.join("pasted.txt").exists());
+    assert!(!String::from_utf8_lossy(&run.output.lock().unwrap()).contains("Running shell"));
+    run.writer.write_all(b"\x03").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
 }

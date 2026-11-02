@@ -12,8 +12,8 @@ behavior of the current MVP.
 
 ## Configure the sandbox
 
-- [Configuration](configuration.md) — XDG config, global defaults, and workspace rules
-- [Development profiles](profiles.md) — toolchains, private caches, and profile composition
+- [Configuration](configuration.md) — application settings and self-contained project policies
+- [Development packs](profiles.md) — toolchains, private caches, and pack composition
 - [Sandbox and security](security.md) — trust boundaries, filesystem, network, and undo
 
 ## Contribute

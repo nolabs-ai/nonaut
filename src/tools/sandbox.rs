@@ -28,6 +28,8 @@ const CAPABILITY_FILE_ENV: &str = "NONAUT_CAP_FILE";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Runtime {
+    deny_paths: Vec<PathBuf>,
+    protected_paths: Vec<PathBuf>,
     read_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
     path_entries: Vec<PathBuf>,
@@ -87,6 +89,8 @@ impl Runtime {
             .chain(std::env::split_paths(&base))
             .collect();
         Self {
+            deny_paths: policy.deny_paths.clone(),
+            protected_paths: policy.protected_paths.clone(),
             read_paths: policy.read_paths.clone(),
             write_paths: policy.write_paths.clone(),
             path_entries,
@@ -129,7 +133,7 @@ pub(super) fn process(
         .env_clear()
         .env("PATH", &command_path)
         .env("HOME", &runtime.home)
-        .env("TMPDIR", workspace)
+        .env("TMPDIR", runtime.home.join("tmp"))
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
         .env(CAPABILITY_FILE_ENV, &runtime.capability_file)
@@ -437,7 +441,7 @@ fn run_worker(workspace: &Path, runtime: &Runtime) -> Result<()> {
 
 fn worker_call(workspace: &Path, runtime: &Runtime, request: WorkerRequest) -> WorkerResponse {
     let result = if request.tool == "run_command" {
-        run_worker_command(workspace, runtime, &request.arguments)
+        run_worker_command(runtime, &request.arguments)
     } else {
         super::execute_tool_local(workspace, &request.tool, &request.arguments)
     };
@@ -468,7 +472,7 @@ fn worker_call(workspace: &Path, runtime: &Runtime, request: WorkerRequest) -> W
     }
 }
 
-fn run_worker_command(workspace: &Path, runtime: &Runtime, arguments: &Value) -> Result<String> {
+fn run_worker_command(runtime: &Runtime, arguments: &Value) -> Result<String> {
     let program = super::required_string(arguments, "program")?;
     let args = arguments["args"]
         .as_array()
@@ -497,7 +501,7 @@ fn run_worker_command(workspace: &Path, runtime: &Runtime, arguments: &Value) ->
         .env_clear()
         .env("PATH", runtime.command_path())
         .env("HOME", &runtime.home)
-        .env("TMPDIR", workspace)
+        .env("TMPDIR", runtime.home.join("tmp"))
         .env("LANG", "C.UTF-8")
         .env("TERM", "dumb")
         .env(CAPABILITY_FILE_ENV, &runtime.capability_file)
@@ -547,9 +551,23 @@ fn capabilities(workspace: &Path, runtime: &Runtime) -> Result<CapabilitySet> {
     for path in &runtime.path_entries {
         capabilities = allow_existing(capabilities, path, AccessMode::Read)?;
     }
-    capabilities
-        .allow_path(workspace, AccessMode::ReadWrite)
-        .context("could not grant workspace access")
+    #[cfg(target_os = "macos")]
+    {
+        for path in &runtime.deny_paths {
+            capabilities.add_platform_rule(format!(
+                "(deny file-read-data file-write* (subpath {}))",
+                serde_json::to_string(&path.to_string_lossy())?
+            ))?;
+        }
+        for path in &runtime.protected_paths {
+            capabilities.add_platform_rule(format!(
+                "(deny file-write* (subpath {}))",
+                serde_json::to_string(&path.to_string_lossy())?
+            ))?;
+        }
+    }
+    let _ = workspace;
+    Ok(capabilities)
 }
 
 fn allow_existing(

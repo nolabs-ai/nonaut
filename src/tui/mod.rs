@@ -11,7 +11,10 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use crossterm::{Command, clipboard::CopyToClipboard};
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
+};
 use futures_util::StreamExt;
 use nono::undo::ChangeType;
 use ratatui::{
@@ -30,6 +33,7 @@ use tokio::{
 use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 
 mod changes;
+mod clipboard;
 mod commands;
 mod theme;
 
@@ -170,9 +174,7 @@ struct MarkdownResult {
 }
 
 #[derive(Clone, Copy)]
-struct ConversationSelection {
-    /// Columns are relative to the conversation text area; rows are in the
-    /// fully wrapped conversation document.
+struct TextSelection {
     anchor: (u16, u16),
     cursor: (u16, u16),
     dragging: bool,
@@ -220,10 +222,77 @@ enum ConnectionEvent {
     Failed(u64, String),
 }
 
+enum SandboxState {
+    Preparing,
+    Ready(PathBuf),
+    Failed,
+}
+
+fn provider_label(provider: ProviderKind) -> &'static str {
+    let name = provider.display_name();
+    name.split(" / ").next().unwrap_or(name)
+}
+
+fn fit_context(text: &str, width: usize, keep_end: bool) -> String {
+    if Line::from(text).width() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if keep_end {
+        for (index, _) in text.char_indices() {
+            let suffix = &text[index..];
+            if Line::from(suffix).width() < width {
+                return format!("…{suffix}");
+            }
+        }
+    } else {
+        for (index, _) in text.char_indices().rev() {
+            let prefix = &text[..index];
+            if Line::from(prefix).width() < width {
+                return format!("{prefix}…");
+            }
+        }
+    }
+    "…".into()
+}
+
+fn startup_status(
+    sandbox: &SandboxState,
+    provider: Option<ProviderKind>,
+    connecting: bool,
+    connected: bool,
+) -> (String, Style) {
+    if matches!(sandbox, SandboxState::Failed) {
+        return (
+            "● Sandbox unavailable · tools blocked".into(),
+            Style::new().fg(palette().removed),
+        );
+    }
+    if connecting || (connected && matches!(sandbox, SandboxState::Preparing)) {
+        return ("●".into(), Style::new().fg(palette().accent));
+    }
+    if connected {
+        return ("●".into(), Style::new().fg(palette().added));
+    }
+    let message = if provider.is_some() {
+        "● Sign in or retry with /provider"
+    } else {
+        "● Choose a provider with /provider"
+    };
+    (message.into(), Style::new().fg(palette().removed))
+}
+
 pub struct App {
     input: TextArea<'static>,
     messages: Vec<Message>,
     cwd: PathBuf,
+    workspace_name: String,
+    sandbox_state: SandboxState,
+    sandbox_tx: mpsc::UnboundedSender<Result<PathBuf, String>>,
+    sandbox_rx: mpsc::UnboundedReceiver<Result<PathBuf, String>>,
+    sandbox_warmup: Option<JoinHandle<()>>,
     provider: Option<Provider>,
     active_provider: Option<ProviderKind>,
     provider_name: String,
@@ -261,7 +330,14 @@ pub struct App {
     conversation_max_scroll: u16,
     follow_output: bool,
     conversation_area: Rect,
-    conversation_selection: Option<ConversationSelection>,
+    conversation_selection: Option<TextSelection>,
+    screen_selection: Option<TextSelection>,
+    screen_area: Rect,
+    pending_copy: Option<String>,
+    pending_paste: bool,
+    copy_screen: bool,
+    native_selection: bool,
+    pending_mouse_capture: Option<bool>,
     command_selection: usize,
     workspace_view: WorkspaceView,
     changes_diff: String,
@@ -296,7 +372,6 @@ impl App {
         if let Some(provider) = default_provider {
             app.begin_connect(provider);
         } else {
-            app.push(Role::System, "Choose a default provider to get started.");
             app.open_provider_picker();
         }
         app
@@ -307,10 +382,22 @@ impl App {
         let (connection_tx, connection_rx) = mpsc::unbounded_channel();
         let (changes_tx, changes_rx) = mpsc::unbounded_channel();
         let (markdown_tx, markdown_rx) = mpsc::unbounded_channel();
+        let (sandbox_tx, sandbox_rx) = mpsc::unbounded_channel();
+        let workspace_name = crate::workspace::name_for_root(&cwd).unwrap_or_else(|| {
+            cwd.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace")
+                .to_owned()
+        });
         Self {
             input: Self::new_input(),
             messages: Vec::new(),
             cwd,
+            workspace_name,
+            sandbox_state: SandboxState::Preparing,
+            sandbox_tx,
+            sandbox_rx,
+            sandbox_warmup: None,
             provider: None,
             active_provider: None,
             provider_name: "no provider".to_owned(),
@@ -348,6 +435,13 @@ impl App {
             follow_output: true,
             conversation_area: Rect::default(),
             conversation_selection: None,
+            screen_selection: None,
+            screen_area: Rect::default(),
+            pending_copy: None,
+            pending_paste: false,
+            copy_screen: false,
+            native_selection: false,
+            pending_mouse_capture: None,
             command_selection: 0,
             workspace_view: WorkspaceView::Agent,
             changes_diff: String::new(),
@@ -377,12 +471,38 @@ impl App {
         let mut changes_refresh = time::interval(CHANGES_REFRESH);
         changes_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
         self.begin_changes_summary();
+        self.begin_sandbox_warmup();
         while !self.should_quit {
             if self.force_redraw {
                 terminal.clear()?;
                 self.force_redraw = false;
             }
             terminal.draw(|frame| self.render(frame))?;
+            if let Some(capture) = self.pending_mouse_capture.take() {
+                let result = if capture {
+                    execute!(std::io::stdout(), EnableMouseCapture)
+                } else {
+                    execute!(std::io::stdout(), DisableMouseCapture)
+                };
+                if let Err(error) = result {
+                    self.native_selection = capture;
+                    self.push(Role::Error, format!("Could not change mouse mode: {error}"));
+                }
+            }
+            if let Some(text) = self.pending_copy.take()
+                && let Err(error) = clipboard::write(&text).await
+            {
+                self.push(Role::Error, format!("Could not copy text: {error:#}"));
+            }
+            if std::mem::take(&mut self.pending_paste) {
+                match clipboard::read().await {
+                    Ok(text) => self.insert_paste(&text),
+                    Err(error) => {
+                        self.push(Role::Error, format!("Could not paste text: {error:#}"))
+                    }
+                }
+                continue;
+            }
             tokio::select! {
                 _ = blink.tick() => {
                     self.cursor_visible = !self.cursor_visible;
@@ -411,6 +531,9 @@ impl App {
                 connection_event = self.connection_rx.recv() => {
                     if let Some(event) = connection_event { self.handle_connection_event(event); }
                 }
+                sandbox = self.sandbox_rx.recv() => {
+                    if let Some(result) = sandbox { self.handle_sandbox_ready(result); }
+                }
                 snapshot = self.changes_rx.recv() => {
                     if let Some(snapshot) = snapshot { self.apply_changes_snapshot(snapshot); }
                 }
@@ -428,7 +551,38 @@ impl App {
         if let Some(connection) = self.connection.take() {
             connection.abort();
         }
+        if let Some(warmup) = self.sandbox_warmup.take() {
+            warmup.abort();
+        }
         Ok(())
+    }
+
+    fn begin_sandbox_warmup(&mut self) {
+        let cwd = self.cwd.clone();
+        let sender = self.sandbox_tx.clone();
+        self.sandbox_warmup = Some(tokio::spawn(async move {
+            let result = async {
+                crate::tools::prewarm(&cwd).await?;
+                Ok(crate::policy::pin(&cwd)?.source.clone())
+            }
+            .await
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            let _ = sender.send(result);
+        }));
+    }
+
+    fn handle_sandbox_ready(&mut self, result: Result<PathBuf, String>) {
+        self.sandbox_warmup = None;
+        self.sandbox_state = match result {
+            Ok(source) => SandboxState::Ready(source),
+            Err(error) => {
+                self.push(
+                    Role::Error,
+                    format!("Could not prepare the sandbox: {error}"),
+                );
+                SandboxState::Failed
+            }
+        };
     }
 
     fn new_input() -> TextArea<'static> {
@@ -479,6 +633,111 @@ impl App {
             .padding(Padding::new(4, 1, 0, 0))
     }
 
+    fn header_status(&self) -> String {
+        if self.provider.is_none() {
+            return String::new();
+        }
+        format!(
+            "{} · {} · {}  ",
+            self.active_provider
+                .map(provider_label)
+                .unwrap_or(&self.provider_name),
+            self.model_name,
+            self.reasoning_effort
+        )
+    }
+
+    fn render_project_status(&self, frame: &mut Frame, area: Rect) {
+        let area = Rect::new(
+            area.x.saturating_add(2),
+            area.y,
+            area.width.saturating_sub(4),
+            area.height,
+        );
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let muted = Style::new().fg(palette().muted);
+        let source = match &self.sandbox_state {
+            SandboxState::Ready(source) => crate::workspace::display_policy_path(source),
+            SandboxState::Preparing => "Loading policy…".into(),
+            SandboxState::Failed => "Unavailable".into(),
+        };
+        let (status, style) = startup_status(
+            &self.sandbox_state,
+            self.active_provider,
+            self.connection.is_some(),
+            self.provider.is_some(),
+        );
+        let status_width = u16::try_from(Line::from(status.as_str()).width()).unwrap_or(u16::MAX);
+        let inline = status_width.saturating_add(24) <= area.width;
+        let project_width = if inline {
+            area.width.saturating_sub(status_width + 2)
+        } else {
+            area.width
+        };
+        let path = crate::workspace::display_path(&self.cwd);
+        let identity = if self.cwd.file_name().and_then(|name| name.to_str())
+            == Some(self.workspace_name.as_str())
+        {
+            path
+        } else {
+            format!("{} · {path}", self.workspace_name)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Project  ", muted),
+                Span::styled(
+                    fit_context(
+                        &identity,
+                        usize::from(project_width.saturating_sub(9)),
+                        true,
+                    ),
+                    Style::new().fg(palette().foreground),
+                ),
+            ])),
+            Rect::new(area.x, area.y, project_width, 1),
+        );
+        let status_y = if inline {
+            area.y
+        } else {
+            area.y.saturating_add(2)
+        };
+        if status_y < area.bottom() {
+            frame.render_widget(
+                Paragraph::new(status).style(style),
+                Rect::new(
+                    if inline {
+                        area.right() - status_width
+                    } else {
+                        area.x
+                    },
+                    status_y,
+                    if inline { status_width } else { area.width },
+                    1,
+                ),
+            );
+        }
+        if area.height > 1 {
+            let link_width = area.width.min(12);
+            let source_width = area.width.saturating_sub(link_width + 1);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Policy   ", muted),
+                    Span::styled(
+                        fit_context(&source, usize::from(source_width.saturating_sub(9)), true),
+                        muted,
+                    ),
+                ])),
+                Rect::new(area.x, area.y + 1, source_width, 1),
+            );
+            frame.render_widget(
+                Paragraph::new("/permissions").style(Style::new().fg(palette().accent)),
+                Rect::new(area.right() - link_width, area.y + 1, link_width, 1),
+            );
+        }
+    }
+
     fn render(&mut self, frame: &mut Frame) {
         frame.render_widget(
             Block::new().style(Style::new().bg(palette().background)),
@@ -494,17 +753,17 @@ impl App {
         } else {
             2
         };
-        let [header, content, footer] = Layout::vertical([
+        let [header, project, content, footer] = Layout::vertical([
             Constraint::Length(3),
-            Constraint::Min(5),
+            Constraint::Length(3),
+            Constraint::Min(3),
             Constraint::Length(prompt_height),
         ])
         .areas(frame.area());
         frame.render_widget(
             Block::new()
                 .borders(Borders::BOTTOM)
-                .border_style(palette().border)
-                .style(Style::new().bg(palette().background)),
+                .border_style(palette().border),
             header,
         );
         let [_, header_content, _] = Layout::vertical([
@@ -514,8 +773,8 @@ impl App {
         ])
         .areas(header);
         let [brand, tabs, status] = Layout::horizontal([
-            Constraint::Length(18),
-            Constraint::Length(40),
+            Constraint::Length(14),
+            Constraint::Length(if self.changes_file_count > 0 { 30 } else { 14 }),
             Constraint::Min(1),
         ])
         .areas(header_content);
@@ -529,17 +788,16 @@ impl App {
         );
         self.render_workspace_tabs(frame, tabs);
         frame.render_widget(
-            Paragraph::new(format!(
-                "{}   {}   reasoning {}   sandboxed  ",
-                self.provider_name, self.model_name, self.reasoning_effort
-            ))
-            .alignment(Alignment::Right)
-            .style(Style::new().fg(palette().muted).bg(palette().background)),
+            Paragraph::new(self.header_status())
+                .alignment(Alignment::Right)
+                .style(Style::new().fg(palette().muted).bg(palette().background)),
             status,
         );
+        self.render_project_status(frame, project);
 
         if self.workspace_view == WorkspaceView::Changes {
             self.render_changes(frame, content, footer);
+            self.finish_screen_selection(frame);
             return;
         }
 
@@ -691,11 +949,7 @@ impl App {
             self.changes_file_count > 0,
         ));
         frame.render_widget(&self.input, prompt);
-        if self.model_picker.is_none()
-            && self.reasoning_picker.is_none()
-            && self.provider_picker.is_none()
-            && self.theme_picker.is_none()
-        {
+        if !self.picker_open() {
             self.render_command_menu(frame, prompt);
         }
         if let Some(picker) = &self.model_picker {
@@ -710,6 +964,7 @@ impl App {
         if let Some(picker) = &self.theme_picker {
             self.render_theme_picker(frame, picker);
         }
+        self.finish_screen_selection(frame);
     }
 
     fn render_workspace_tabs(&self, frame: &mut Frame, area: Rect) {
@@ -1250,7 +1505,192 @@ impl App {
         );
     }
 
+    fn insert_paste(&mut self, text: &str) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.workspace_view == WorkspaceView::Changes && self.changes_searching {
+            self.changes_query.push_str(&text.replace('\n', " "));
+            self.changes_match = None;
+            return;
+        }
+        self.workspace_view = WorkspaceView::Agent;
+        self.model_picker = None;
+        self.reasoning_picker = None;
+        self.provider_picker = None;
+        self.theme_picker = None;
+        self.screen_selection = None;
+        self.conversation_selection = None;
+        self.input.insert_str(text);
+        self.command_selection = 0;
+        self.history_index = None;
+    }
+
+    fn request_copy(&mut self) {
+        let prompt = self.workspace_view == WorkspaceView::Agent && !self.picker_open();
+        if let Some(selection) = &mut self.screen_selection {
+            selection.copy_pending = true;
+        } else if let Some(selection) = &mut self.conversation_selection {
+            selection.copy_pending = true;
+        } else if prompt && self.input.selection_range().is_some() {
+            let mut input = self.input.clone();
+            input.copy();
+            self.pending_copy = Some(input.yank_text());
+        } else if prompt && !self.input.is_empty() {
+            self.pending_copy = Some(self.input.lines().join("\n"));
+        } else {
+            self.copy_screen = true;
+        }
+    }
+
+    fn handle_clipboard_key(&mut self, key: KeyEvent) -> bool {
+        let clipboard = key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::META)
+            || key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('c' | 'C') if clipboard => self.request_copy(),
+            KeyCode::Char('c')
+                if key.modifiers == KeyModifiers::CONTROL
+                    && (self.screen_selection.is_some()
+                        || self.conversation_selection.is_some()
+                        || self.input.selection_range().is_some()) =>
+            {
+                self.request_copy()
+            }
+            KeyCode::Char('v' | 'V') if clipboard || key.modifiers == KeyModifiers::CONTROL => {
+                self.pending_paste = true
+            }
+            KeyCode::Insert if key.modifiers == KeyModifiers::CONTROL => self.request_copy(),
+            KeyCode::Insert if key.modifiers == KeyModifiers::SHIFT => self.pending_paste = true,
+            KeyCode::Char('a' | 'A')
+                if clipboard && self.workspace_view == WorkspaceView::Agent =>
+            {
+                self.screen_selection = None;
+                self.conversation_selection = None;
+                self.input.select_all();
+            }
+            KeyCode::Char('m') if key.modifiers == KeyModifiers::ALT => {
+                self.native_selection = !self.native_selection;
+                self.pending_mouse_capture = Some(!self.native_selection);
+                self.screen_selection = None;
+                self.conversation_selection = None;
+                self.push(Role::System, if self.native_selection {
+                    "Native selection enabled. Drag to select, then use your terminal's copy shortcut. Alt+M restores app mouse controls."
+                } else { "App mouse controls restored." });
+            }
+            KeyCode::Esc
+                if self.request.is_none()
+                    && (self.screen_selection.is_some()
+                        || self.conversation_selection.is_some()) =>
+            {
+                self.screen_selection = None;
+                self.conversation_selection = None;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn handle_text_selection(&mut self, mouse: MouseEvent) -> bool {
+        if self.native_selection || self.screen_area.is_empty() {
+            return false;
+        }
+        let area = self.screen_area;
+        let point = (
+            mouse.column.clamp(area.x, area.right() - 1),
+            mouse.row.clamp(area.y, area.bottom() - 1),
+        );
+        let conversation = self.workspace_view == WorkspaceView::Agent && !self.picker_open();
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.screen_selection = None;
+                self.conversation_selection = None;
+                self.follow_output = false;
+                if conversation && self.conversation_area.contains(point.into()) {
+                    self.handle_conversation_mouse(mouse);
+                } else {
+                    self.screen_selection = Some(TextSelection {
+                        anchor: point,
+                        cursor: point,
+                        dragging: true,
+                        copy_pending: false,
+                    });
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(selection) = &mut self.screen_selection {
+                    selection.cursor = point;
+                    if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                        selection.dragging = false;
+                        selection.copy_pending = selection.anchor != selection.cursor;
+                        if !selection.copy_pending {
+                            self.screen_selection = None;
+                        }
+                    }
+                } else if self.conversation_selection.is_some() {
+                    self.handle_conversation_mouse(mouse);
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn finish_screen_selection(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        if self.screen_area != area {
+            self.screen_selection = None;
+        }
+        self.screen_area = area;
+        if area.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.copy_screen) {
+            self.pending_copy = Some(selected_text(
+                frame.buffer_mut(),
+                area,
+                (area.x, area.y),
+                (area.right() - 1, area.bottom() - 1),
+            ));
+        }
+        if let Some(selection) = &mut self.screen_selection {
+            let (start, end) = ordered_selection(selection.anchor, selection.cursor);
+            if std::mem::take(&mut selection.copy_pending) {
+                let text = selected_text(frame.buffer_mut(), area, start, end);
+                if !text.is_empty() {
+                    self.pending_copy = Some(text);
+                }
+            }
+            highlight_selection(frame.buffer_mut(), area, start, end);
+        }
+    }
+
+    fn picker_open(&self) -> bool {
+        self.model_picker.is_some()
+            || self.reasoning_picker.is_some()
+            || self.provider_picker.is_some()
+            || self.theme_picker.is_some()
+    }
+
     fn handle_terminal_event(&mut self, event: Event) {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && self.handle_clipboard_key(key)
+        {
+            return;
+        }
+        if let Event::Paste(text) = &event {
+            self.insert_paste(text);
+            return;
+        }
+        if let Event::Mouse(mouse) = event
+            && self.handle_text_selection(mouse)
+        {
+            return;
+        }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
             && self.handle_workspace_shortcut(key)
@@ -1293,14 +1733,6 @@ impl App {
             }
             return;
         }
-        if let Event::Paste(text) = &event {
-            // Terminals send CR or CRLF line ends; the prompt stores LF.
-            let text = text.replace("\r\n", "\n").replace('\r', "\n");
-            self.input.insert_str(text);
-            self.command_selection = 0;
-            self.history_index = None;
-            return;
-        }
         if let Event::Mouse(mouse) = event {
             self.handle_conversation_mouse(mouse);
             return;
@@ -1311,6 +1743,8 @@ impl App {
         {
             return;
         }
+        self.screen_selection = None;
+        self.conversation_selection = None;
         self.input.input(event);
         self.command_selection = 0;
         self.history_index = None;
@@ -1319,11 +1753,15 @@ impl App {
     fn handle_workspace_shortcut(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('1'), KeyModifiers::ALT) => {
+                self.screen_selection = None;
+                self.conversation_selection = None;
                 self.workspace_view = WorkspaceView::Agent;
                 self.changes_searching = false;
                 true
             }
             (KeyCode::Char('2'), KeyModifiers::ALT) => {
+                self.screen_selection = None;
+                self.conversation_selection = None;
                 if self.changes_file_count == 0 {
                     return false;
                 }
@@ -1836,7 +2274,7 @@ impl App {
                     .contains((mouse.column, mouse.row).into()) =>
             {
                 self.follow_output = false;
-                self.conversation_selection = Some(ConversationSelection {
+                self.conversation_selection = Some(TextSelection {
                     anchor: screen_to_document(
                         self.conversation_area,
                         self.conversation_scroll,
@@ -1901,7 +2339,7 @@ impl App {
         let (start, end) = ordered_selection(selection.anchor, selection.cursor);
         let text = selected_document_text(lines, width, start, end);
         if !text.is_empty() {
-            let _ = copy_to_clipboard(&text);
+            self.pending_copy = Some(text);
         }
         selection.copy_pending = false;
     }
@@ -1963,6 +2401,17 @@ impl App {
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
             "/exec" => self.push(Role::System, "Usage: /exec [--cwd DIR] <command>"),
+            "/permissions" | "/permissions full" => match if content == "/permissions full" {
+                crate::policy::describe_full(&self.cwd)
+            } else {
+                crate::policy::describe(&self.cwd)
+            } {
+                Ok(permissions) => self.push(Role::System, permissions),
+                Err(error) => self.push(
+                    Role::Error,
+                    format!("Could not resolve permissions: {error:#}"),
+                ),
+            },
             "/detach" => match crate::sessions::request_detach() {
                 Ok(()) => self.push(Role::System, "Session detached."),
                 Err(error) => self.push(Role::Error, format!("Could not detach: {error:#}")),
@@ -2043,6 +2492,8 @@ impl App {
     }
 
     fn open_theme_picker(&mut self) {
+        self.screen_selection = None;
+        self.conversation_selection = None;
         let selected = Theme::ALL
             .iter()
             .position(|option| *option == theme())
@@ -2078,7 +2529,9 @@ impl App {
             .map(|command| format!("{:<12} {}", command.name, command.description))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("## Commands\n\n{commands}")
+        format!(
+            "## Commands\n\n{commands}\n\nDrag any visible text to copy. Cmd+C or Ctrl+Shift+C copies; Cmd+V or Ctrl+Shift+V pastes. Alt+M toggles native terminal selection."
+        )
     }
 
     fn interrupt_active(&self) {
@@ -2105,6 +2558,8 @@ impl App {
     }
 
     fn open_provider_picker(&mut self) {
+        self.screen_selection = None;
+        self.conversation_selection = None;
         let providers = ProviderKind::ALL.to_vec();
         let selected = self
             .active_provider
@@ -2120,6 +2575,8 @@ impl App {
     }
 
     fn open_model_picker(&mut self) {
+        self.screen_selection = None;
+        self.conversation_selection = None;
         // Providers may learn better names as they run, so ask for fresh ones.
         if let Some(provider) = &self.provider {
             self.models = provider.models();
@@ -2144,6 +2601,8 @@ impl App {
     }
 
     fn open_reasoning_picker(&mut self) {
+        self.screen_selection = None;
+        self.conversation_selection = None;
         let options = self.reasoning_options.clone();
         if options.is_empty() {
             self.push(
@@ -2325,7 +2784,7 @@ impl App {
         self.provider_name = provider.display_name().to_owned();
         self.models.clear();
         self.model_id = "none".to_owned();
-        self.model_name = "connecting…".to_owned();
+        self.model_name = "none".to_owned();
         self.reasoning_effort = "none".to_owned();
         self.reasoning_options.clear();
         self.connection_generation = self.connection_generation.wrapping_add(1);
@@ -2342,14 +2801,6 @@ impl App {
                 None
             }
         };
-        self.push(
-            Role::System,
-            format!(
-                "Connecting to {}… {}",
-                provider.display_name(),
-                provider.connect_hint()
-            ),
-        );
         self.connection = Some(tokio::spawn(async move {
             let event = match Provider::connect(provider, &cwd).await {
                 Ok(provider) => {
@@ -2390,10 +2841,6 @@ impl App {
                 self.reasoning_options = model.reasoning_efforts;
                 self.provider = Some(provider);
                 self.restore_reasoning_for_model();
-                self.push(
-                    Role::Success,
-                    "Provider connected. Type /help for commands.",
-                );
                 if let Some(warning) = warning {
                     self.push(Role::System, warning);
                 }
@@ -2410,7 +2857,10 @@ impl App {
                 self.model_name = "connection failed".to_owned();
                 self.reasoning_effort = "none".to_owned();
                 self.reasoning_options.clear();
-                self.push(Role::System, format!("Provider connection failed: {error}"));
+                self.push(
+                    Role::Error,
+                    format!("Could not connect to {}: {error}", self.provider_name),
+                );
                 self.open_provider_picker();
             }
         }
@@ -3030,8 +3480,19 @@ fn selected_text(
     for row in start.1..=end.1 {
         let (first, last) = selection_columns(area, start, end, row);
         let line_start = output.len();
-        for column in first..=last {
-            output.push_str(buffer[(column, row)].symbol());
+        let mut column = area.x;
+        while column <= last {
+            let symbol = buffer[(column, row)].symbol();
+            let width = u16::try_from(Line::from(symbol).width())
+                .unwrap_or(1)
+                .max(1);
+            if column.saturating_add(width) > first {
+                output.push_str(symbol);
+            }
+            let Some(next) = column.checked_add(width) else {
+                break;
+            };
+            column = next;
         }
         output.truncate(line_start + output[line_start..].trim_end().len());
         if row != end.1 {
@@ -3065,20 +3526,6 @@ fn selected_document_text(
     )
 }
 
-fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let mut sequence = String::new();
-    CopyToClipboard::to_clipboard_from(text)
-        .write_ansi(&mut sequence)
-        .map_err(|error| error.to_string())?;
-    let mut stdout = std::io::stdout().lock();
-    stdout
-        .write_all(sequence.as_bytes())
-        .and_then(|()| stdout.flush())
-        .map_err(|error| error.to_string())
-}
-
 fn markdown_lines(content: &str, width: u16) -> Vec<Line<'static>> {
     let options = MarkdownOptions::new(NonautMarkdown).table_width(width);
     from_str_with_options(content, &options)
@@ -3103,6 +3550,291 @@ fn own_line(line: Line<'_>) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn draw_clipboard_app(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+    }
+
+    fn select_visible(app: &mut App, needle: &str) -> String {
+        let mut terminal = draw_clipboard_app(app);
+        let buffer = terminal.backend().buffer();
+        let (column, row) = (0..30)
+            .find_map(|row| {
+                let line: String = (0..100)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect();
+                line.find(needle).map(|index| {
+                    (
+                        u16::try_from(Line::from(&line[..index]).width()).unwrap(),
+                        row,
+                    )
+                })
+            })
+            .unwrap_or_else(|| panic!("missing visible text {needle}"));
+        let end = column + u16::try_from(needle.len()).unwrap() - 1;
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), column),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            app.handle_terminal_event(Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.pending_copy
+            .take()
+            .expect("selection was not queued for copying")
+    }
+
+    #[test]
+    fn visible_paths_prompt_and_dialog_text_can_be_selected_and_copied() {
+        let mut app = App::new_shell(PathBuf::from("/work/project"));
+        app.sandbox_state = SandboxState::Ready("/policies/project.json".into());
+        assert_eq!(select_visible(&mut app, "/work/project"), "/work/project");
+        assert_eq!(
+            select_visible(&mut app, "/policies/project.json"),
+            "/policies/project.json"
+        );
+        app.input.insert_str("unsent prompt");
+        assert_eq!(select_visible(&mut app, "unsent prompt"), "unsent prompt");
+        app.open_theme_picker();
+        assert!(app.screen_selection.is_none());
+        assert_eq!(select_visible(&mut app, "light"), "light");
+        assert!(app.theme_picker.is_some());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn review_selection_copies_rendered_text_instead_of_a_hidden_draft() {
+        let mut app = App::new_shell(PathBuf::from("/work/project"));
+        app.input.insert_str("hidden draft");
+        app.workspace_view = WorkspaceView::Changes;
+        app.changes_diff = "review-copy\n".into();
+        app.changes_file_count = 1;
+        assert_eq!(select_visible(&mut app, "review-copy"), "review-copy");
+        app.screen_selection = None;
+        app.request_copy();
+        draw_clipboard_app(&mut app);
+        let text = app.pending_copy.take().unwrap();
+        assert!(text.contains("review-copy"));
+        assert!(!text.contains("hidden draft"));
+    }
+
+    #[test]
+    fn keyboard_copy_preserves_prompt_selection_and_plain_control_c_still_quits() {
+        let mut app = app_with_input("first\n项目");
+        app.input.select_all();
+        let selection = app.input.selection_range();
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER,
+        )));
+        assert_eq!(app.pending_copy.take().unwrap(), "first\n项目");
+        assert_eq!(app.input.selection_range(), selection);
+        assert_eq!(app.input.lines(), ["first", "项目"]);
+        assert!(!app.should_quit);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!app.should_quit);
+        let mut empty = app_with_input("");
+        empty.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(empty.should_quit);
+    }
+
+    #[test]
+    fn paste_is_literal_across_views_and_never_submits() {
+        let mut app = app_with_input("");
+        app.open_theme_picker();
+        app.handle_terminal_event(Event::Paste("one\r\ntwo\rthree".into()));
+        assert_eq!(app.input.lines(), ["one", "two", "three"]);
+        assert!(app.theme_picker.is_none());
+        assert!(app.messages.is_empty());
+        assert!(app.request.is_none());
+        app.workspace_view = WorkspaceView::Changes;
+        app.changes_searching = true;
+        app.handle_terminal_event(Event::Paste("needle".into()));
+        assert_eq!(app.changes_query, "needle");
+        assert_eq!(app.workspace_view, WorkspaceView::Changes);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER,
+        )));
+        assert!(app.pending_paste);
+    }
+
+    #[test]
+    fn native_selection_mode_can_be_toggled_without_changing_the_prompt() {
+        let mut app = app_with_input("draft");
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::ALT,
+        )));
+        assert!(app.native_selection);
+        assert_eq!(app.pending_mouse_capture.take(), Some(false));
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::ALT,
+        )));
+        assert!(!app.native_selection);
+        assert_eq!(app.pending_mouse_capture.take(), Some(true));
+        assert_eq!(app.input.lines(), ["draft"]);
+    }
+
+    #[test]
+    fn copied_unicode_does_not_include_wide_cell_padding() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer.set_string(0, 0, "项目🙂end", Style::default());
+        assert_eq!(selected_text(&buffer, area, (0, 0), (19, 0)), "项目🙂end");
+        assert_eq!(selected_text(&buffer, area, (1, 0), (3, 0)), "项目");
+    }
+
+    #[test]
+    fn ready_requires_both_a_connected_provider_and_a_prepared_sandbox() {
+        let status = |sandbox, connecting, connected| {
+            startup_status(sandbox, Some(ProviderKind::Codex), connecting, connected).0
+        };
+        let ready = SandboxState::Ready("/policies/project.json".into());
+        assert_eq!(status(&ready, true, false), "●");
+        assert_eq!(status(&SandboxState::Preparing, false, true), "●");
+        assert_eq!(status(&ready, false, true), "●");
+        let ready_style = startup_status(&ready, Some(ProviderKind::Codex), false, true).1;
+        assert!(matches!(
+            ready_style.fg,
+            Some(ratatui::style::Color::Rgb(62, 245, 140) | ratatui::style::Color::Rgb(0, 135, 58))
+        ));
+        assert!(status(&SandboxState::Failed, false, true).contains("Sandbox unavailable"));
+        assert!(status(&ready, false, false).contains("/provider"));
+        assert_eq!(
+            startup_status(&ready, None, false, false).0,
+            "● Choose a provider with /provider"
+        );
+        for (sandbox, connecting) in [(&ready, true), (&SandboxState::Preparing, false)] {
+            let (text, style) =
+                startup_status(sandbox, Some(ProviderKind::Codex), connecting, !connecting);
+            assert_eq!(text, "●");
+            assert!(matches!(
+                style.fg,
+                Some(
+                    ratatui::style::Color::Rgb(232, 115, 74)
+                        | ratatui::style::Color::Rgb(196, 80, 27)
+                )
+            ));
+        }
+        let (text, style) = startup_status(&SandboxState::Preparing, None, false, false);
+        assert!(text.contains("/provider"));
+        assert!(matches!(
+            style.fg,
+            Some(ratatui::style::Color::Rgb(255, 69, 69) | ratatui::style::Color::Rgb(217, 0, 27))
+        ));
+    }
+
+    #[test]
+    fn first_launch_without_a_provider_opens_the_picker_without_startup_messages() {
+        let app = App::new(PathBuf::from("."), None, None);
+        assert!(app.provider_picker.is_some());
+        assert!(app.messages.is_empty());
+        assert!(app.connection.is_none());
+    }
+
+    #[test]
+    fn startup_panel_is_compact_and_keeps_status_visible_in_narrow_terminals() {
+        for width in [40, 80, 160] {
+            let mut app = App::new_shell(PathBuf::from("/a/very/long/path/to/a/project/service"));
+            app.workspace_name = "service".into();
+            app.sandbox_state = SandboxState::Ready("/policies/project.json".into());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let visible: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(visible.contains("service"));
+            assert!(visible.contains("Project"));
+            assert!(visible.contains("/permissions"));
+            assert!(visible.contains("Choose a provider"));
+            assert!(!visible.contains("sandboxed"));
+            assert!(!visible.contains("Provider connected"));
+            assert!(app.messages.is_empty());
+            assert!(app.conversation_area.height > 0);
+        }
+    }
+
+    #[test]
+    fn sandbox_warmup_updates_context_without_success_messages() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.handle_sandbox_ready(Ok("/policies/project.json".into()));
+        assert!(
+            matches!(&app.sandbox_state, SandboxState::Ready(source) if source == &PathBuf::from("/policies/project.json"))
+        );
+        assert!(app.messages.is_empty());
+        app.handle_sandbox_ready(Err("permission denied".into()));
+        assert!(matches!(app.sandbox_state, SandboxState::Failed));
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, Role::Error));
+        assert!(app.messages[0].content.contains("permission denied"));
+    }
+
+    #[test]
+    fn project_identity_is_not_repeated_as_branding() {
+        let mut app = App::new_shell(PathBuf::from("/work/nonaut"));
+        app.workspace_name = "nonaut".into();
+        app.sandbox_state = SandboxState::Ready("/policies/project.json".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..100).map(|x| buffer[(x, 3)].symbol()).collect();
+        assert!(row.contains("Project  /work/nonaut"));
+        assert_eq!(row.matches("nonaut").count(), 1);
+        assert!(!row.contains("nonaut ·"));
+        let policy_row: String = (0..100).map(|x| buffer[(x, 4)].symbol()).collect();
+        assert!(policy_row.contains("Policy   /policies/project.json"));
+        assert!(policy_row.contains("/permissions"));
+        assert!(!policy_row.contains("network"));
+    }
+
+    #[test]
+    fn context_elision_preserves_unicode_paths_and_fits_available_columns() {
+        for width in [0, 1, 8, 12, 40] {
+            for keep_end in [false, true] {
+                let fitted = fit_context("/work/项目/service", width, keep_end);
+                assert!(Line::from(fitted.as_str()).width() <= width);
+            }
+        }
+        assert!(fit_context("/a/long/path/service", 10, true).ends_with("service"));
+    }
+
+    #[test]
+    fn provider_connection_errors_remain_actionable_and_stale_events_are_ignored() {
+        let mut app = App::new_shell(PathBuf::from("."));
+        app.active_provider = Some(ProviderKind::Codex);
+        app.provider_name = ProviderKind::Codex.display_name().into();
+        app.connection_generation = 2;
+        app.handle_connection_event(ConnectionEvent::Failed(1, "old error".into()));
+        assert!(app.messages.is_empty());
+        app.handle_connection_event(ConnectionEvent::Failed(2, "sign in and retry".into()));
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(app.messages[0].role, Role::Error));
+        assert!(app.messages[0].content.contains("sign in and retry"));
+        assert!(app.provider_picker.is_some());
+    }
     fn app_with_input(value: &str) -> App {
         let mut app = App::new_shell(PathBuf::from("."));
         app.input.insert_str(value);
@@ -3366,6 +4098,7 @@ mod tests {
         assert!(help.contains("/provider"));
         assert!(help.contains("/reasoning"));
         assert!(help.contains("/exec"));
+        assert!(help.contains("/permissions"));
         assert!(help.contains("/q"));
         assert!(help.contains("/detach"));
         assert!(!help.lines().any(|line| line.starts_with("/quit")));
@@ -3641,7 +4374,7 @@ mod tests {
         let mut app = App::new_shell(PathBuf::from("."));
         app.conversation_scroll = 20;
         app.conversation_max_scroll = 40;
-        app.conversation_selection = Some(ConversationSelection {
+        app.conversation_selection = Some(TextSelection {
             anchor: (2, 18),
             cursor: (4, 24),
             dragging: false,
@@ -3669,7 +4402,7 @@ mod tests {
         let mut app = App::new_shell(PathBuf::from("."));
         app.conversation_scroll = 10;
         app.conversation_max_scroll = 30;
-        app.conversation_selection = Some(ConversationSelection {
+        app.conversation_selection = Some(TextSelection {
             anchor: (1, 8),
             cursor: (2, 12),
             dragging: true,

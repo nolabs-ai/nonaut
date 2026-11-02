@@ -7,7 +7,7 @@ pub(super) struct SlashCommand {
     pub visible: bool,
 }
 
-pub(super) const SLASH_COMMANDS: [SlashCommand; 14] = [
+pub(super) const SLASH_COMMANDS: [SlashCommand; 15] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -31,6 +31,11 @@ pub(super) const SLASH_COMMANDS: [SlashCommand; 14] = [
     SlashCommand {
         name: "/exec",
         description: "run a command directly in nono",
+        visible: true,
+    },
+    SlashCommand {
+        name: "/permissions",
+        description: "show permissions; add full for runtime grants",
         visible: true,
     },
     SlashCommand {

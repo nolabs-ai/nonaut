@@ -1,5 +1,14 @@
 # Commands and keyboard controls
 
+The project panel shows the project directory, the policy source file and
+connection status. Use `/permissions` for the full resolved boundary;
+capabilities are not summarized in the panel.
+An amber dot indicates connection or sandbox preparation. A green dot appears
+only after both are ready, with no success text. When disconnected, a red dot
+points to `/provider` to select a provider or sign in. First launch opens the
+provider picker automatically when no provider is saved. Failures stay explicit;
+routine startup status does not add messages to the conversation.
+
 ## TUI commands
 
 | Command | Action |
@@ -9,6 +18,7 @@
 | `/reasoning` | Select reasoning effort |
 | `/new` | Start a fresh provider session |
 | `/exec [--cwd DIR] <command>` | Run a command directly in Nono |
+| `/permissions [full]` | Show effective access; expand runtime grants with `full` |
 | `/undo` | Restore files to before the previous turn |
 | `/theme` | Choose the interface theme |
 | `/clear` | Clear visible conversation output |
@@ -29,14 +39,28 @@ policy and sandbox as model-requested commands.
 | `Esc` | Interrupt an active response |
 | `Alt+1` | Open the Agent view |
 | `Alt+2` | Open the Review view when changes exist |
+| `Cmd+C` / `Ctrl+Shift+C` | Copy the selection, prompt, or visible screen |
+| `Cmd+V` / `Ctrl+Shift+V` | Paste text without submitting |
+| `Alt+M` | Toggle native terminal selection |
 
 Submitting another prompt while a response is streaming interrupts the active
 response first.
 
-The mouse wheel scrolls conversation history. Dragging across conversation text
-highlights it and copies the selection to the system clipboard, including text
-selected while scrolling beyond the viewport. On exit, Nonaut clears its
-alternate screen and saved terminal scrollback.
+Drag across any visible text to select and automatically copy it: project and
+policy paths, conversation, prompt, dialogs, or Review. Conversation selection
+also includes text selected while scrolling beyond the viewport. Keyboard copy
+uses the active selection; without one it copies the prompt, or the visible
+screen if the prompt is empty. `Ctrl+C` copies an active selection and otherwise
+retains its interrupt/quit behavior. `Esc` clears a selection when idle.
+
+Some terminals consume `Cmd+C` or `Ctrl+Shift+C` before Nonaut receives them.
+Use `Alt+M` to release mouse capture, then drag and use the terminal's native
+copy shortcut. Press `Alt+M` again to restore app scrolling and selection.
+On macOS, Nonaut uses the native clipboard. On Linux it tries `wl-copy` /
+`wl-paste` or `xclip`; copying falls back to OSC 52, including over SSH.
+Terminal paste works through bracketed paste even without a clipboard helper.
+
+On exit, Nonaut clears its alternate screen and saved terminal scrollback.
 
 ## Agent tools
 
@@ -79,29 +103,25 @@ nonaut exec --cwd crates/service -- "cargo test"
 
 This is useful for validating workspace policy and reproducing denials.
 
-## Workspaces
+## Project policies
 
-An interactive launch from an unconfigured directory offers a one-time session
-or a guided saved configuration. Run the same editor explicitly with:
-
-```sh
-nonaut setup
-nonaut workspace edit nonaut
-```
-
-Manage and select named workspaces from any directory:
+The first interactive launch proposes and saves a minimal project policy after
+confirmation. Print the resolved policy and its source path with:
 
 ```sh
-nonaut workspace list
-nonaut workspace show nonaut
-nonaut workspace add ~/Work/nonaut --name nonaut --profile rust
-nonaut workspace default nonaut
-nonaut --workspace nonaut
-nonaut --workspace .
+nonaut config
 ```
 
-The selected workspace remains pinned for the session. `.` means the exact
-current directory and bypasses named/default selection.
+Normal launches discover the project root from the current directory.
+Use a supplied policy instead of the saved project policy with:
+
+```sh
+nonaut --config ~/policies/rust.json
+nonaut exec --config ~/policies/rust.json -- "cargo test"
+```
+
+The selected policy remains pinned for the session. An optional `root` must
+match the canonical discovered project root. See [configuration](configuration.md).
 
 ## Persistent sessions
 

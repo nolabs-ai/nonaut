@@ -123,11 +123,7 @@ pub(crate) async fn run_cli(args: Vec<String>, requested_workspace: Option<&str>
 async fn start(requested_workspace: Option<&str>) -> Result<()> {
     let launch = env::current_dir().context("could not determine the working directory")?;
     let selected = crate::workspace::select(&launch, requested_workspace)?;
-    let workspace = if requested_workspace.is_none() && !selected.configured {
-        crate::workspace_setup::prompt(&launch)?.root
-    } else {
-        selected.root
-    };
+    let workspace = selected.root;
     let id = format!("{}-{}", unix_seconds(), std::process::id());
     let paths = Paths::discover()?;
     let socket = paths.socket(&id);
@@ -137,6 +133,7 @@ async fn start(requested_workspace: Option<&str>) -> Result<()> {
         .arg("__nonaut_session")
         .arg(&id)
         .arg(&workspace)
+        .env(crate::workspace::CONFIG_ENV, &selected.source)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -249,7 +246,7 @@ fn render_session_list(sessions: &[Metadata], color: bool, terminal_width: usize
                 false,
                 color
             ),
-            shorten(&display_workspace(&session.workspace), workspace_width)
+            shorten_workspace(&display_workspace(&session.workspace), workspace_width)
         ));
     }
     output
@@ -261,14 +258,24 @@ fn pad(value: &str, width: usize) -> String {
 }
 
 fn display_workspace(workspace: &Path) -> String {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        return workspace.display().to_string();
-    };
-    match workspace.strip_prefix(home) {
-        Ok(relative) if relative.as_os_str().is_empty() => "~".to_owned(),
-        Ok(relative) => format!("~/{}", relative.display()),
-        Err(_) => workspace.display().to_string(),
+    let path = crate::workspace::display_path(workspace);
+    let name = crate::workspace::name_for_root(workspace);
+    match name {
+        Some(name) => format!("{name} · {path}"),
+        None => path,
     }
+}
+
+fn shorten_workspace(value: &str, width: usize) -> String {
+    let Some((name, path)) = value.split_once(" · ") else {
+        return shorten(value, width);
+    };
+    let prefix = format!("{name} · ");
+    let remaining = width.saturating_sub(prefix.chars().count());
+    if remaining < 2 {
+        return shorten(value, width);
+    }
+    format!("{prefix}{}", shorten(path, remaining))
 }
 
 fn shorten(value: &str, width: usize) -> String {
@@ -831,5 +838,9 @@ mod tests {
     #[test]
     fn long_workspaces_are_shortened_from_the_left() {
         assert_eq!(shorten("~/Work/a/very/long/project", 12), "…ong/project");
+        assert_eq!(
+            shorten_workspace("nonaut · ~/Work/a/very/long/nonaut", 24),
+            "nonaut · …ry/long/nonaut"
+        );
     }
 }

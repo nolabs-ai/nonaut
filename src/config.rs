@@ -18,32 +18,14 @@ const CONFIG_FILE: &str = "config.json";
 const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 120;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Config {
+    #[serde(skip_serializing_if = "UiConfig::is_default")]
     pub ui: UiConfig,
     pub agent: AgentConfig,
+    #[serde(skip_serializing_if = "ToolsConfig::is_default")]
     pub tools: ToolsConfig,
-    pub workspace: WorkspaceSettings,
-    pub sandbox: SandboxConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            ui: UiConfig::default(),
-            agent: AgentConfig::default(),
-            tools: ToolsConfig::default(),
-            workspace: WorkspaceSettings::default(),
-            sandbox: SandboxConfig {
-                network: NetworkConfig {
-                    mode: Some(NetworkMode::Blocked),
-                    allow_domains: Vec::new(),
-                },
-                ..SandboxConfig::default()
-            },
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,38 +77,68 @@ impl Default for ToolsConfig {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct SandboxConfig {
-    pub network: NetworkConfig,
-    pub filesystem: FilesystemConfig,
+impl UiConfig {
+    fn is_default(&self) -> bool {
+        self.theme == "dark"
+    }
 }
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct WorkspaceSettings {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
-    pub prompt_on_unconfigured: bool,
-    pub definitions: BTreeMap<String, WorkspaceConfig>,
-}
-
-impl Default for WorkspaceSettings {
-    fn default() -> Self {
-        Self {
-            default: None,
-            prompt_on_unconfigured: true,
-            definitions: BTreeMap::new(),
-        }
+impl ToolsConfig {
+    fn is_default(&self) -> bool {
+        self.timeout_seconds == DEFAULT_TOOL_TIMEOUT_SECONDS
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct NetworkConfig {
+pub(crate) struct ProjectConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<NetworkMode>,
-    pub allow_domains: Vec<String>,
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extends: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub packs: Vec<String>,
+    pub filesystem: FilesystemConfig,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub references: BTreeMap<String, ReferenceConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<WorkspaceToolsConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct FilesystemConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub readwrite: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReferenceConfig {
+    pub path: String,
+    pub access: ReferenceAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReferenceAccess {
+    Read,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct NetworkConfig {
+    pub mode: NetworkMode,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -136,33 +148,6 @@ pub(crate) enum NetworkMode {
     #[default]
     Blocked,
     Allowlist,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct FilesystemConfig {
-    pub read: Vec<String>,
-    pub write: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct WorkspaceConfig {
-    pub path: String,
-    pub profiles: Vec<String>,
-    pub references: BTreeMap<String, ReferenceConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filesystem: Option<FilesystemConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<WorkspaceToolsConfig>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct ReferenceConfig {
-    pub path: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -294,7 +279,10 @@ pub(crate) fn update(change: impl FnOnce(&mut Config)) -> Result<()> {
 }
 
 fn write(config: &Config) -> Result<()> {
-    let path = config_path()?;
+    write_json(&config_path()?, config)
+}
+
+pub(crate) fn write_json(path: &std::path::Path, value: &impl Serialize) -> Result<()> {
     let directory = path.parent().context("configuration path has no parent")?;
     fs::create_dir_all(directory)
         .with_context(|| format!("could not create {}", directory.display()))?;
@@ -312,12 +300,12 @@ fn write(config: &Config) -> Result<()> {
             .open(&temporary)
             .with_context(|| format!("could not create {}", temporary.display()))?;
         let mut encoded =
-            serde_json::to_vec_pretty(config).context("could not encode Nonaut configuration")?;
+            serde_json::to_vec_pretty(value).context("could not encode Nonaut configuration")?;
         encoded.push(b'\n');
         file.write_all(&encoded)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &path)
+        fs::rename(&temporary, path)
             .with_context(|| format!("could not replace {}", path.display()))?;
         Ok(())
     })();
@@ -330,79 +318,68 @@ fn write(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn parses_known_provider() {
-        for &provider in ProviderKind::ALL {
-            assert_eq!(ProviderKind::parse(provider.id()).unwrap(), provider);
+    fn application_settings_do_not_accept_project_policy() {
+        for key in ["workspaces", "references", "sandbox", "filesystem"] {
+            assert!(serde_json::from_value::<Config>(serde_json::json!({key: {}})).is_err());
         }
-    }
-
-    #[test]
-    fn rejects_unknown_provider() {
-        assert!(ProviderKind::parse("surprise").is_err());
-    }
-
-    #[test]
-    fn default_config_is_one_readable_document() {
         let value = serde_json::to_value(Config::default()).unwrap();
-        assert_eq!(value["ui"]["theme"], "dark");
-        assert_eq!(value["tools"]["timeout_seconds"], 120);
-        assert_eq!(value["workspace"]["prompt_on_unconfigured"], true);
-        assert!(
-            value["workspace"]["definitions"]
-                .as_object()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(value["sandbox"]["network"]["mode"], "blocked");
-        assert!(value["agent"].get("provider").is_none());
+        assert_eq!(value, serde_json::json!({"agent": {"providers": {}}}));
     }
-
     #[test]
-    fn config_rejects_unknown_settings() {
-        assert!(serde_json::from_str::<Config>(r#"{"mystery": true}"#).is_err());
-        assert!(
-            serde_json::from_str::<Config>(r#"{"ui":{"theme":"dark","mystery":true}}"#).is_err()
-        );
-    }
-
-    #[test]
-    fn parses_openai_compatible_endpoint_settings() {
-        let config: Config = serde_json::from_str(
-            r#"{"agent":{"providers":{"openai-compatible":{"base_url":"http://localhost:8080/v1","api_key_env":"LOCAL_API_KEY"}}}}"#,
-        )
+    fn project_policy_is_explicit_and_compact() {
+        let policy: ProjectConfig = serde_json::from_value(serde_json::json!({
+            "filesystem": {"readwrite": ["."]},
+            "references": {"docs": {"path": "../docs", "access": "read"}}
+        }))
         .unwrap();
-        let provider = &config.agent.providers["openai-compatible"];
-        assert_eq!(
-            provider.base_url.as_deref(),
-            Some("http://localhost:8080/v1")
+        let value = serde_json::to_value(policy).unwrap();
+        assert_eq!(value["filesystem"], serde_json::json!({"readwrite": ["."]}));
+        assert!(value.get("packs").is_none());
+        assert!(
+            serde_json::from_value::<ProjectConfig>(serde_json::json!({
+                "references": {"docs": {"path": "../docs"}}
+            }))
+            .is_err()
         );
-        assert_eq!(provider.api_key_env.as_deref(), Some("LOCAL_API_KEY"));
-    }
-
-    #[test]
-    fn xdg_config_home_is_used_on_every_platform() {
-        assert_eq!(
-            config_dir_from(
-                Some(OsStr::new("/custom/config")),
-                Some(OsStr::new("/home/me"))
-            )
-            .unwrap(),
-            PathBuf::from("/custom/config/nonaut")
+        assert!(
+            serde_json::from_str::<ProjectConfig>(r#"{"filesystem":{"write":["."]}}"#).is_err()
         );
     }
-
     #[test]
-    fn config_falls_back_to_dot_config_under_home() {
+    fn config_paths_follow_xdg() {
+        assert_eq!(
+            config_dir_from(Some(OsStr::new("/custom")), None).unwrap(),
+            PathBuf::from("/custom/nonaut")
+        );
         assert_eq!(
             config_dir_from(None, Some(OsStr::new("/home/me"))).unwrap(),
             PathBuf::from("/home/me/.config/nonaut")
         );
+        assert!(config_dir_from(Some(OsStr::new("relative")), None).is_err());
     }
 
     #[test]
-    fn relative_xdg_config_home_is_rejected() {
-        assert!(config_dir_from(Some(OsStr::new("relative")), None).is_err());
+    fn atomic_writes_are_private_and_leave_no_temporary_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("nonaut-config-write-{}", std::process::id()));
+        let path = directory.join("project.json");
+        write_json(&path, &serde_json::json!({"first":true})).unwrap();
+        write_json(&path, &serde_json::json!({"second":true})).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap(),
+            serde_json::json!({"second":true})
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

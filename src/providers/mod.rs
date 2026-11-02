@@ -258,18 +258,6 @@ impl ProviderKind {
         }
     }
 
-    pub const fn connect_hint(self) -> &'static str {
-        match self {
-            Self::Codex => "Browser sign-in opens if needed.",
-            Self::Claude => "Browser sign-in opens if needed.",
-            Self::Gemini => "Uses GEMINI_API_KEY.",
-            Self::Copilot => "Uses the installed `copilot` CLI login.",
-            Self::OpenRouter => "Uses OPENROUTER_API_KEY.",
-            Self::Ollama => "Uses the local Ollama server by default.",
-            Self::OpenAiCompatible => "Configure base_url and api_key_env first.",
-        }
-    }
-
     pub(crate) fn parse(value: &str) -> Result<Self> {
         let provider = match value.trim() {
             "codex" => Self::Codex,
