@@ -322,7 +322,9 @@ fn validate_deny_overlaps(policy: &Policy, linux: bool) -> Result<()> {
         .chain(std::env::split_paths(
             &crate::sandbox::platform::command_path(),
         ))
-        .filter(|p| p.exists())
+        // Match the filesystem grants installed by sandbox::allow_existing.
+        // Linux descriptor links to pipes or sockets have no canonical path.
+        .filter_map(|path| fs::canonicalize(path).ok())
         .collect::<Vec<_>>();
     for denied in &policy.deny_paths {
         for grant in policy
@@ -344,15 +346,14 @@ fn validate_deny_overlaps(policy: &Policy, linux: bool) -> Result<()> {
     }
     for protected in &policy.protected_paths {
         for grant in crate::sandbox::platform::write_paths() {
-            if Path::new(grant).exists() {
-                let grant = canonicalize_nearest(Path::new(grant))?;
-                if protected.starts_with(&grant) {
-                    bail!(
-                        "Linux runtime write grant {} covers protected configuration {}; place configuration outside that directory",
-                        grant.display(),
-                        protected.display()
-                    );
-                }
+            if let Ok(grant) = fs::canonicalize(grant)
+                && (protected.starts_with(&grant) || grant.starts_with(protected))
+            {
+                bail!(
+                    "Linux runtime write grant {} overlaps protected configuration {}; place configuration outside that directory",
+                    grant.display(),
+                    protected.display()
+                );
             }
         }
     }
@@ -750,6 +751,43 @@ mod tests {
             policy
                 .authorize(&root, &root, OperationAccess::Write)
                 .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_descriptor_grants_support_pipes_but_check_real_files() {
+        use std::process::Command;
+
+        let child = || {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "policy::tests::empty_policy_grants_no_project_access",
+                "--nocapture",
+            ]);
+            command
+        };
+        let output = child().output().unwrap();
+        assert!(
+            output.status.success(),
+            "policy validation failed with piped stdout/stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (root, _) = fixture(json!({}));
+        let config = root.join("nonaut");
+        fs::create_dir_all(&config).unwrap();
+        let output = child()
+            .env("XDG_CONFIG_HOME", &root)
+            .stdout(fs::File::create(config.join("output")).unwrap())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Linux runtime write grant"),
+            "a stdout file inside protected configuration must be rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
         fs::remove_dir_all(root).unwrap();
     }

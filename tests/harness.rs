@@ -655,7 +655,8 @@ fn tui_command_card_streams_progress_and_elapsed_time() {
     wait_for(&run.output, "first");
     wait_for(&run.output, "1 output lines");
     wait_for(&run.output, "00:00 / 02:00");
-    wait_for(&run.output, "Completed shell <shell-command> · 00:02");
+    // The displayed duration is rounded down and depends on event delivery.
+    wait_for(&run.output, "Completed shell <shell-command> · 00:");
     run.writer.write_all(b"/q\r").unwrap();
     run.writer.flush().unwrap();
     wait_for_exit(&mut run.child);
