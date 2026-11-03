@@ -1647,6 +1647,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "ratatui-textarea",
+ "regex",
  "reqwest",
  "rmcp",
  "serde",

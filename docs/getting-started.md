@@ -51,7 +51,7 @@ login, while API-backed providers read credentials from environment variables.
 The provider choice is persisted only after the connection succeeds.
 
 On first launch, Nonaut finds the project root and proposes a minimal policy
-with detected development packs, project read/write access and blocked network.
+with automatic runtime detection, project read/write access and blocked network.
 After confirmation, it saves the file under `~/.config/nonaut/projects/`.
 Later launches preserve manual changes. The real user home remains isolated.
 

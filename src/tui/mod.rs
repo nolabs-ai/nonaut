@@ -36,9 +36,13 @@ mod changes;
 mod clipboard;
 mod commands;
 mod theme;
+mod tool_details;
+mod tool_output;
 
 use commands::{SLASH_COMMANDS, SlashCommand, parse_exec};
 use theme::{Theme, palette, select as select_theme, selected as theme};
+use tool_details::ToolDetails;
+use tool_output::{RunningTool, ToolOutput};
 
 use crate::{
     config::{
@@ -158,12 +162,6 @@ impl Message {
         self.rendered_markdown = None;
         self.markdown_job = None;
     }
-
-    fn set_role(&mut self, role: Role) {
-        self.role = role;
-        self.rendered_markdown = None;
-        self.markdown_job = None;
-    }
 }
 
 struct MarkdownResult {
@@ -187,15 +185,6 @@ struct ToolSummary {
     succeeded: usize,
     failed: usize,
     last_error: String,
-}
-
-struct RunningTool {
-    message_index: usize,
-    title: String,
-    started_at: Instant,
-    timeout_seconds: Option<u64>,
-    latest_line: String,
-    line_count: usize,
 }
 
 struct ModelPicker {
@@ -324,7 +313,8 @@ pub struct App {
     streaming_message: Option<usize>,
     tool_summaries: HashMap<String, ToolSummary>,
     running_tools: HashMap<String, RunningTool>,
-    last_tool_output: Option<(String, String)>,
+    last_tool_output: Option<ToolOutput>,
+    tool_details: Option<ToolDetails>,
     session_tokens: u64,
     conversation_scroll: u16,
     conversation_max_scroll: u16,
@@ -429,6 +419,7 @@ impl App {
             tool_summaries: HashMap::new(),
             running_tools: HashMap::new(),
             last_tool_output: None,
+            tool_details: None,
             session_tokens: 0,
             conversation_scroll: 0,
             conversation_max_scroll: 0,
@@ -468,6 +459,8 @@ impl App {
         let mut terminal_events = EventStream::new();
         let mut blink = time::interval(CURSOR_BLINK);
         blink.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut tool_animation = time::interval(tool_output::ANIMATION_TICK);
+        tool_animation.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut changes_refresh = time::interval(CHANGES_REFRESH);
         changes_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
         self.begin_changes_summary();
@@ -506,6 +499,9 @@ impl App {
             tokio::select! {
                 _ = blink.tick() => {
                     self.cursor_visible = !self.cursor_visible;
+                },
+                // Animate active tools independently of the slower cursor blink.
+                _ = tool_animation.tick(), if !self.running_tools.is_empty() => {
                     self.refresh_running_tools();
                 },
                 _ = changes_refresh.tick() => {
@@ -797,6 +793,9 @@ impl App {
 
         if self.workspace_view == WorkspaceView::Changes {
             self.render_changes(frame, content, footer);
+            if let Some(details) = &mut self.tool_details {
+                details.render(frame);
+            }
             self.finish_screen_selection(frame);
             return;
         }
@@ -881,13 +880,14 @@ impl App {
                         _ => palette().border,
                     };
                     let rows = message.content.lines().enumerate().map(|(index, line)| {
+                        let detail = line.trim_start();
                         let style = if message.role == Role::Error && index == 0 {
                             Style::new().fg(palette().removed)
                         } else if (message.role == Role::Success && index == 0)
-                            || (line.starts_with('+') && !line.starts_with("+++"))
+                            || (detail.starts_with('+') && !detail.starts_with("+++"))
                         {
                             Style::new().fg(palette().added)
-                        } else if line.starts_with('-') && !line.starts_with("---") {
+                        } else if detail.starts_with('-') && !detail.starts_with("---") {
                             Style::new().fg(palette().removed)
                         } else {
                             Style::new().fg(palette().muted)
@@ -949,7 +949,7 @@ impl App {
             self.changes_file_count > 0,
         ));
         frame.render_widget(&self.input, prompt);
-        if !self.picker_open() {
+        if !self.overlay_open() {
             self.render_command_menu(frame, prompt);
         }
         if let Some(picker) = &self.model_picker {
@@ -963,6 +963,9 @@ impl App {
         }
         if let Some(picker) = &self.theme_picker {
             self.render_theme_picker(frame, picker);
+        }
+        if let Some(details) = &mut self.tool_details {
+            details.render(frame);
         }
         self.finish_screen_selection(frame);
     }
@@ -1506,6 +1509,9 @@ impl App {
     }
 
     fn insert_paste(&mut self, text: &str) {
+        if self.tool_details.is_some() {
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.workspace_view == WorkspaceView::Changes && self.changes_searching {
             self.changes_query.push_str(&text.replace('\n', " "));
@@ -1525,9 +1531,11 @@ impl App {
     }
 
     fn request_copy(&mut self) {
-        let prompt = self.workspace_view == WorkspaceView::Agent && !self.picker_open();
+        let prompt = self.workspace_view == WorkspaceView::Agent && !self.overlay_open();
         if let Some(selection) = &mut self.screen_selection {
             selection.copy_pending = true;
+        } else if let Some(details) = &self.tool_details {
+            self.pending_copy = Some(details.content());
         } else if let Some(selection) = &mut self.conversation_selection {
             selection.copy_pending = true;
         } else if prompt && self.input.selection_range().is_some() {
@@ -1596,17 +1604,31 @@ impl App {
         if self.native_selection || self.screen_area.is_empty() {
             return false;
         }
-        let area = self.screen_area;
+        let area = self
+            .tool_details
+            .as_ref()
+            .map_or(self.screen_area, ToolDetails::area);
+        if area.is_empty() {
+            return false;
+        }
+        if self.tool_details.is_some()
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && !area.contains((mouse.column, mouse.row).into())
+        {
+            return true;
+        }
         let point = (
             mouse.column.clamp(area.x, area.right() - 1),
             mouse.row.clamp(area.y, area.bottom() - 1),
         );
-        let conversation = self.workspace_view == WorkspaceView::Agent && !self.picker_open();
+        let conversation = self.workspace_view == WorkspaceView::Agent && !self.overlay_open();
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.screen_selection = None;
                 self.conversation_selection = None;
-                self.follow_output = false;
+                if self.tool_details.is_none() {
+                    self.follow_output = false;
+                }
                 if conversation && self.conversation_area.contains(point.into()) {
                     self.handle_conversation_mouse(mouse);
                 } else {
@@ -1656,6 +1678,11 @@ impl App {
                 (area.right() - 1, area.bottom() - 1),
             ));
         }
+        let area = self.tool_details.as_ref().map_or(area, ToolDetails::area);
+        if area.is_empty() {
+            self.screen_selection = None;
+            return;
+        }
         if let Some(selection) = &mut self.screen_selection {
             let (start, end) = ordered_selection(selection.anchor, selection.cursor);
             if std::mem::take(&mut selection.copy_pending) {
@@ -1668,14 +1695,19 @@ impl App {
         }
     }
 
-    fn picker_open(&self) -> bool {
+    fn overlay_open(&self) -> bool {
         self.model_picker.is_some()
             || self.reasoning_picker.is_some()
             || self.provider_picker.is_some()
             || self.theme_picker.is_some()
+            || self.tool_details.is_some()
     }
 
     fn handle_terminal_event(&mut self, event: Event) {
+        if self.tool_details.is_some() {
+            self.handle_tool_details_event(event);
+            return;
+        }
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
             && self.handle_clipboard_key(key)
@@ -1748,6 +1780,37 @@ impl App {
         self.input.input(event);
         self.command_selection = 0;
         self.history_index = None;
+    }
+
+    fn handle_tool_details_event(&mut self, event: Event) {
+        if let Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+            && (matches!(key.code, KeyCode::Char('c' | 'C'))
+                || key.code == KeyCode::Insert && key.modifiers == KeyModifiers::CONTROL)
+            && self.handle_clipboard_key(key)
+        {
+            return;
+        }
+        if let Event::Mouse(mouse) = event
+            && self.handle_text_selection(mouse)
+        {
+            return;
+        }
+        let action = self
+            .tool_details
+            .as_mut()
+            .expect("details modal is open")
+            .handle_event(event);
+        match action {
+            tool_details::Action::Close => {
+                self.tool_details = None;
+                self.screen_selection = None;
+            }
+            tool_details::Action::Copy => self.request_copy(),
+            tool_details::Action::Scroll => self.screen_selection = None,
+            tool_details::Action::Redraw => self.force_redraw = true,
+            tool_details::Action::None => {}
+        }
     }
 
     fn handle_workspace_shortcut(&mut self, key: KeyEvent) -> bool {
@@ -2364,7 +2427,9 @@ impl App {
             }
             return;
         }
-        self.follow_latest_output();
+        if content != "/details" {
+            self.follow_latest_output();
+        }
         self.input = Self::new_input();
         if self.prompt_history.last() != Some(&content) {
             self.prompt_history.push(content.clone());
@@ -2384,24 +2449,18 @@ impl App {
                 self.conversation_scroll = 0;
                 self.conversation_max_scroll = 0;
             }
-            "/details" => match self.last_tool_output.clone() {
-                Some((title, output)) if !output.trim().is_empty() => {
-                    self.push(
-                        Role::System,
-                        format!("Full output: {title}\n{}", output.trim_end()),
-                    );
-                }
-                Some((title, _)) => {
-                    self.push(Role::System, format!("{title} produced no output."));
-                }
-                None => self.push(Role::System, "No tool output is available yet."),
-            },
+            "/details" => {
+                self.screen_selection = None;
+                self.conversation_selection = None;
+                self.tool_details = Some(ToolDetails::new(self.last_tool_output.as_ref()));
+            }
             "/provider" => self.open_provider_picker(),
             "/model" => self.open_model_picker(),
             "/reasoning" => self.open_reasoning_picker(),
             "/new" => self.begin_new_session(),
             "/exec" => self.push(Role::System, "Usage: /exec [--cwd DIR] <command>"),
-            "/permissions" | "/permissions full" => match if content == "/permissions full" {
+            "/permissions" | "/permissions full" | "/runtime" => match if content != "/permissions"
+            {
                 crate::policy::describe_full(&self.cwd)
             } else {
                 crate::policy::describe(&self.cwd)
@@ -2888,13 +2947,8 @@ impl App {
             }
             ProviderEvent::ToolStarted(context) => {
                 self.audit_tool_started(&context);
-                let tool = context.tool.clone();
                 self.streaming_message = None;
-                if Self::compact_tool(&tool) {
-                    self.start_compact_tool(&tool);
-                } else {
-                    self.start_running_tool(context);
-                }
+                self.start_running_tool(context);
             }
             ProviderEvent::ToolProgress {
                 call_id,
@@ -2916,70 +2970,36 @@ impl App {
             } => {
                 self.audit_tool_finished(&call_id, &tool, success, &output, failure.as_ref());
                 self.streaming_message = None;
-                if Self::compact_tool(&tool) && self.finish_compact_tool(&tool, success, &output) {
-                    return;
-                }
                 let running = self.running_tools.remove(&call_id);
-                let title = running
-                    .as_ref()
-                    .map(|running| running.title.clone())
-                    .unwrap_or_else(|| Self::tool_title(&tool, &[]));
-                let elapsed = running.as_ref().map(|running| running.started_at.elapsed());
-                self.last_tool_output = Some((title.clone(), output.clone()));
-                if let Some(running) = running {
-                    let role = if success { Role::Success } else { Role::Error };
-                    let status = if success { "Completed" } else { "Failed" };
-                    let content = Self::completed_tool_content(
-                        status,
-                        &title,
-                        elapsed.unwrap_or_default(),
-                        &output,
-                        failure.as_ref(),
-                    );
-                    if let Some(message) = self.messages.get_mut(running.message_index) {
-                        message.replace(role, content);
-                    }
-                } else if let Some(message) = self
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|message| message.role == Role::Running)
-                {
-                    message.set_role(Role::System);
-                }
-                if tool == "run_command" || tool == "exec" {
-                    if success {
-                        self.begin_changes_refresh();
-                    }
+                let result = ToolOutput {
+                    context: running.as_ref().map_or_else(
+                        || ToolContext::minimal(&call_id, &tool),
+                        |running| running.context.clone(),
+                    ),
+                    elapsed: running.as_ref().map(|running| running.started_at.elapsed()),
+                    success,
+                    output,
+                    failure,
+                };
+                let content = result.content();
+                let compact = Self::compact_tool(&tool)
+                    && self.finish_compact_tool(&tool, success, &result.output);
+                self.last_tool_output = Some(result);
+                if compact {
                     return;
                 }
-                if success {
-                    if matches!(
-                        tool.as_str(),
-                        "write_file" | "edit_file" | "delete_file" | "exec"
-                    ) && !output.trim().is_empty()
-                    {
-                        let label = if tool == "exec" {
-                            "Command completed".to_owned()
-                        } else {
-                            format!("Completed {tool}")
-                        };
-                        self.push(Role::Success, format!("{label}\n{}", output.trim_end()));
-                    } else {
-                        self.push(Role::Success, format!("Completed {tool}"));
-                    }
+                let role = if success { Role::Success } else { Role::Error };
+                if let Some(message) =
+                    running.and_then(|running| self.messages.get_mut(running.message_index))
+                {
+                    message.replace(role, content);
                 } else {
-                    let label = if tool == "exec" {
-                        "Command failed".to_owned()
-                    } else {
-                        format!("Failed {tool}")
-                    };
-                    self.push(Role::Error, format!("{label}\n{}", output.trim_end()));
+                    self.push(role, content);
                 }
                 if success
                     && matches!(
                         tool.as_str(),
-                        "write_file" | "edit_file" | "delete_file" | "exec"
+                        "write_file" | "edit_file" | "delete_file" | "run_command" | "exec"
                     )
                 {
                     self.begin_changes_refresh();
@@ -3110,19 +3130,26 @@ impl App {
     }
 
     fn start_running_tool(&mut self, context: ToolContext) {
-        let title = Self::tool_title(&context.tool, &context.argv_display);
-        let message_index = self.messages.len();
+        let message_index = if Self::compact_tool(&context.tool) {
+            self.start_compact_tool(&context.tool);
+            self.tool_summaries[&context.tool].message_index
+        } else {
+            self.messages.len()
+        };
+        let compact = Self::compact_tool(&context.tool);
+        let call_id = context.call_id.clone();
         let running = RunningTool {
             message_index,
-            title,
+            context,
             started_at: Instant::now(),
-            timeout_seconds: context.timeout_seconds,
             latest_line: String::new(),
             line_count: 0,
         };
-        let content = Self::running_tool_content(&running, self.conversation_area.width);
-        self.push(Role::Running, content);
-        self.running_tools.insert(context.call_id, running);
+        if !compact {
+            let content = running.content(self.conversation_area.width);
+            self.push(Role::Running, content);
+        }
+        self.running_tools.insert(call_id, running);
     }
 
     fn refresh_running_tools(&mut self) {
@@ -3134,11 +3161,7 @@ impl App {
 
     fn finish_running_tools(&mut self, status: &str) {
         for (_, running) in self.running_tools.drain() {
-            let content = format!(
-                "{status} {} · {}",
-                running.title,
-                Self::format_duration(running.started_at.elapsed())
-            );
+            let content = running.stopped_content(status);
             if let Some(message) = self.messages.get_mut(running.message_index) {
                 message.replace(Role::Error, content);
             }
@@ -3149,113 +3172,18 @@ impl App {
         let Some(running) = self.running_tools.get(call_id) else {
             return;
         };
-        let content = Self::running_tool_content(running, self.conversation_area.width);
+        let content = if let Some(summary) = self.tool_summaries.get(&running.context.tool) {
+            let mut content = Self::running_summary(&running.context.tool, summary.started);
+            let elapsed = running.started_at.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                content.push_str(&format!(" · {}", tool_output::duration(elapsed)));
+            }
+            content
+        } else {
+            running.content(self.conversation_area.width)
+        };
         if let Some(message) = self.messages.get_mut(running.message_index) {
             message.replace(Role::Running, content);
-        }
-    }
-
-    fn tool_title(tool: &str, argv: &[String]) -> String {
-        if !argv.is_empty() {
-            return argv.join(" ");
-        }
-        if tool == "exec" || tool == "run_command" {
-            "command".to_owned()
-        } else {
-            tool.to_owned()
-        }
-    }
-
-    fn running_tool_content(running: &RunningTool, width: u16) -> String {
-        let elapsed = running.started_at.elapsed();
-        let timing = running.timeout_seconds.map_or_else(
-            || Self::format_duration(elapsed),
-            |timeout| {
-                format!(
-                    "{} / {}",
-                    Self::format_duration(elapsed),
-                    Self::format_duration(Duration::from_secs(timeout))
-                )
-            },
-        );
-        let title = format!("Running {} in nono…", running.title);
-        let mut content = Self::right_aligned_status(&title, &timing, width);
-        if !running.latest_line.is_empty() {
-            content.push_str("\n  ");
-            content.push_str(&running.latest_line);
-        }
-        if running.line_count > 0 {
-            content.push_str(&format!(
-                "\n  {} output lines · Esc cancel",
-                running.line_count
-            ));
-        }
-        content
-    }
-
-    fn completed_tool_content(
-        status: &str,
-        title: &str,
-        elapsed: Duration,
-        output: &str,
-        failure: Option<&crate::tools::ToolFailure>,
-    ) -> String {
-        let mut content = format!("{status} {title} · {}", Self::format_duration(elapsed));
-        if let Some(summary) = failure.and_then(Self::failure_summary) {
-            content.push_str("\n  ");
-            content.push_str(summary);
-        }
-        let (detail, hidden) = Self::compact_tool_output(output, 10);
-        if !detail.is_empty() {
-            content.push('\n');
-            content.push_str(&detail);
-        }
-        if hidden > 0 {
-            content.push_str(&format!(
-                "\n… {hidden} lines hidden · /details for full output"
-            ));
-        }
-        content
-    }
-
-    fn failure_summary(failure: &crate::tools::ToolFailure) -> Option<&'static str> {
-        match failure.reason {
-            "sandbox_denied" | "workspace_denied" => {
-                Some("The configured sandbox policy denied this operation.")
-            }
-            "timeout" => Some("The command exceeded its configured deadline."),
-            "tls_error" => Some("TLS setup or certificate verification failed."),
-            "network_error" => Some("A network connection or download failed."),
-            "command_not_found" => Some("The executable was not found in the sandbox PATH."),
-            "command_not_executable" => Some("The executable could not be started."),
-            _ => None,
-        }
-    }
-
-    fn compact_tool_output(output: &str, visible: usize) -> (String, usize) {
-        let lines = output.lines().collect::<Vec<_>>();
-        let hidden = lines.len().saturating_sub(visible);
-        let detail = lines
-            .iter()
-            .skip(hidden)
-            .map(|line| line.chars().take(240).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        (detail, hidden)
-    }
-
-    fn format_duration(duration: Duration) -> String {
-        let seconds = duration.as_secs();
-        format!("{:02}:{:02}", seconds / 60, seconds % 60)
-    }
-
-    fn right_aligned_status(title: &str, timing: &str, width: u16) -> String {
-        let width = usize::from(width);
-        let padding = width.saturating_sub(title.chars().count() + timing.chars().count());
-        if padding < 2 {
-            format!("{title} · {timing}")
-        } else {
-            format!("{title}{}{timing}", " ".repeat(padding))
         }
     }
 
@@ -3290,7 +3218,7 @@ impl App {
             summary.succeeded += 1;
         } else {
             summary.failed += 1;
-            summary.last_error = output.trim_end().to_owned();
+            summary.last_error = tool_output::preview(output, 10);
         }
 
         let role = if summary.failed == 0 {
@@ -3307,9 +3235,9 @@ impl App {
 
     fn running_summary(tool: &str, count: usize) -> String {
         let action = match tool {
-            "read_file" => "Reading files in nono…",
-            "list_directory" => "Listing directories in nono…",
-            _ => return format!("Running {tool} in nono…"),
+            "read_file" => "Reading files…",
+            "list_directory" => "Listing directories…",
+            _ => return format!("Running {tool}…"),
         };
         if count == 1 {
             action.to_owned()
@@ -3609,6 +3537,112 @@ mod tests {
         assert_eq!(select_visible(&mut app, "light"), "light");
         assert!(app.theme_picker.is_some());
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn details_preserve_the_conversation_and_its_scroll_position() {
+        let mut app = app_with_input("");
+        app.push(
+            Role::System,
+            (0..80)
+                .map(|index| format!("conversation {index}\n"))
+                .collect::<String>(),
+        );
+        draw_clipboard_app(&mut app);
+        app.follow_output = false;
+        app.conversation_scroll = 8;
+        let messages = app
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        app.input.insert_str("/details");
+        app.submit();
+        draw_clipboard_app(&mut app);
+        assert!(app.tool_details.is_some());
+        assert_eq!(app.conversation_scroll, 8);
+        assert!(!app.follow_output);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        draw_clipboard_app(&mut app);
+        assert!(app.tool_details.is_none());
+        assert!(!app.should_quit);
+        assert_eq!(app.conversation_scroll, 8);
+        assert!(!app.follow_output);
+        assert_eq!(
+            app.messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>(),
+            messages
+        );
+    }
+
+    #[test]
+    fn details_capture_input_and_copy_their_contents_instead_of_the_prompt() {
+        let mut app = app_with_input("hidden draft");
+        let output = ToolOutput {
+            context: ToolContext::minimal("details", "read_file"),
+            elapsed: None,
+            success: true,
+            output: "modal-copy-output\nsecond-output-line".into(),
+            failure: None,
+        };
+        app.tool_details = Some(ToolDetails::new(Some(&output)));
+        app.changes_file_count = 1;
+        draw_clipboard_app(&mut app);
+        for event in [
+            Event::Paste("should not reach prompt".into()),
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT)),
+            Event::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT)),
+        ] {
+            app.handle_terminal_event(event);
+        }
+        app.insert_paste("also ignored");
+        assert!(!app.pending_paste);
+        assert_eq!(app.workspace_view, WorkspaceView::Agent);
+        assert_eq!(app.input.lines(), ["hidden draft"]);
+        assert!(app.messages.is_empty());
+        assert_eq!(
+            select_visible(&mut app, "modal-copy-output"),
+            "modal-copy-output"
+        );
+        assert!(app.follow_output);
+        app.screen_selection = None;
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        let copied = app.pending_copy.take().unwrap();
+        assert!(copied.contains("Tool: read_file\n"));
+        assert!(copied.contains("modal-copy-output\nsecond-output-line"));
+        assert!(!copied.contains("hidden draft"));
+        app.screen_selection = Some(TextSelection {
+            anchor: (4, 4),
+            cursor: (6, 4),
+            dragging: false,
+            copy_pending: false,
+        });
+        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.tool_details.is_none());
+        assert!(app.screen_selection.is_none());
+        assert_eq!(app.input.lines(), ["hidden draft"]);
+    }
+
+    #[tokio::test]
+    async fn closing_details_does_not_interrupt_the_active_request() {
+        let mut app = app_with_input("");
+        app.request = Some(tokio::spawn(std::future::pending()));
+        app.tool_details = Some(ToolDetails::new(None));
+        app.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.tool_details.is_none());
+        assert!(!app.request.as_ref().unwrap().is_finished());
+        assert!(app.events_rx.try_recv().is_err());
+        assert!(!app.should_quit);
+        app.request.take().unwrap().abort();
     }
 
     #[test]
@@ -4183,12 +4217,9 @@ mod tests {
         context.argv_display = vec!["make".to_owned(), "check".to_owned()];
         context.timeout_seconds = Some(120);
         app.handle_provider_event(0, ProviderEvent::ToolStarted(context));
-        assert!(
-            app.messages[0]
-                .content
-                .contains("Running make check in nono…")
-        );
-        assert!(app.messages[0].content.contains("00:00 / 02:00"));
+        assert!(app.messages[0].content.contains("Running make check"));
+        assert!(!app.messages[0].content.contains("00:00"));
+        assert!(app.messages[0].content.contains("Esc cancel"));
 
         app.handle_provider_event(
             0,
@@ -4199,7 +4230,7 @@ mod tests {
             },
         );
         assert!(app.messages[0].content.contains("Checking nonaut v0.0.3"));
-        assert!(app.messages[0].content.contains("42 output lines"));
+        assert!(!app.messages[0].content.contains("42 output lines"));
 
         let output = (1..=20)
             .map(|line| format!("diagnostic {line}"))
@@ -4219,17 +4250,24 @@ mod tests {
             },
         );
         assert_eq!(app.messages[0].role, Role::Error);
-        assert!(
-            app.messages[0]
-                .content
-                .contains("Failed make check · 00:00")
-        );
-        assert!(app.messages[0].content.contains("10 lines hidden"));
-        assert!(!app.messages[0].content.contains("diagnostic 1\n"));
+        assert!(app.messages[0].content.starts_with("✗ make check"));
+        assert!(app.messages[0].content.contains("exit 1"));
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].content.contains("10 more lines"));
+        assert!(app.messages[0].content.contains("diagnostic 1\n"));
+        assert!(app.messages[0].content.contains("diagnostic 20"));
+        assert!(!app.messages[0].content.contains("diagnostic 10\n"));
 
         app.input.insert_str("/details");
         app.submit();
-        assert!(app.messages.last().unwrap().content.contains(&output));
+        assert_eq!(app.messages.len(), 1);
+        assert!(
+            app.tool_details
+                .as_ref()
+                .unwrap()
+                .content()
+                .contains(&output)
+        );
     }
 
     #[test]
@@ -4256,6 +4294,110 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert_eq!(app.messages[0].role, Role::Success);
         assert_eq!(app.messages[0].content, "Read 3 files");
+    }
+
+    #[tokio::test]
+    async fn tool_completions_update_one_card_for_file_commands_and_other_tools() {
+        for tool in [
+            "write_file",
+            "edit_file",
+            "delete_file",
+            "run_command",
+            "fetch_report",
+        ] {
+            let mut app = app_with_input("");
+            let context = ToolContext::minimal("call-1", tool);
+            app.handle_provider_event(0, ProviderEvent::ToolStarted(context));
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolFinished {
+                    call_id: "call-1".into(),
+                    tool: tool.into(),
+                    success: true,
+                    output: "actual result".into(),
+                    failure: None,
+                },
+            );
+            assert_eq!(app.messages.len(), 1, "duplicated completion for {tool}");
+            assert_eq!(app.messages[0].role, Role::Success);
+            assert!(app.messages[0].content.starts_with("✓ "));
+            assert!(app.messages[0].content.contains("actual result"));
+            assert!(app.running_tools.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn details_follow_the_most_recent_tool_including_grouped_reads() {
+        let mut app = app_with_input("");
+        for (call_id, tool, output) in [
+            ("command", "run_command", "previous result"),
+            ("read", "read_file", "file contents"),
+        ] {
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolStarted(ToolContext::minimal(call_id, tool)),
+            );
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolFinished {
+                    call_id: call_id.into(),
+                    tool: tool.into(),
+                    success: true,
+                    output: output.into(),
+                    failure: None,
+                },
+            );
+        }
+        app.input.insert_str("/details");
+        app.submit();
+        let details = app.tool_details.as_ref().unwrap().content();
+        assert!(details.contains("Tool: read_file"));
+        assert!(details.contains("file contents"));
+        assert!(!details.contains("previous result"));
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolStarted(ToolContext::minimal("next", "read_file")),
+        );
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                call_id: "next".into(),
+                tool: "read_file".into(),
+                success: true,
+                output: "newer background output".into(),
+                failure: None,
+            },
+        );
+        assert_eq!(app.tool_details.as_ref().unwrap().content(), details);
+    }
+
+    #[test]
+    fn interleaved_tools_keep_their_own_card_and_details() {
+        let mut app = app_with_input("");
+        for call_id in ["first", "second"] {
+            app.handle_provider_event(
+                0,
+                ProviderEvent::ToolStarted(ToolContext::minimal(call_id, "fetch_report")),
+            );
+        }
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolFinished {
+                call_id: "first".into(),
+                tool: "fetch_report".into(),
+                success: true,
+                output: "first result".into(),
+                failure: None,
+            },
+        );
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].role, Role::Success);
+        assert_eq!(app.messages[1].role, Role::Running);
+        assert_eq!(
+            app.last_tool_output.as_ref().unwrap().context.call_id,
+            "first"
+        );
+        assert!(app.running_tools.contains_key("second"));
     }
 
     #[test]

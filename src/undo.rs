@@ -38,7 +38,6 @@ pub(crate) struct Undo {
 
 impl Undo {
     pub(crate) fn open(workspace: &Path) -> Result<Self> {
-        remove_empty_legacy_stores(workspace);
         Self::open_in(workspace, &state_dir()?)
     }
 
@@ -101,27 +100,6 @@ impl Undo {
             .restore_to(&manifest)
             .map(Some)
             .context("could not restore the snapshot")
-    }
-}
-
-fn remove_empty_legacy_stores(workspace: &Path) {
-    let Ok(entries) = fs::read_dir(workspace) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.starts_with("nonaut-undo-store-")
-            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
-        {
-            continue;
-        }
-        let path = entry.path();
-        if fs::read_dir(&path).is_ok_and(|mut contents| contents.next().is_none()) {
-            let _ = fs::remove_dir(path);
-        }
     }
 }
 
@@ -232,22 +210,6 @@ mod tests {
         assert!(workspace.join("target/build.bin").exists());
         assert!(undo.undo().unwrap().is_none());
         fs::remove_dir_all(&workspace).unwrap();
-    }
-
-    #[test]
-    fn removes_only_empty_legacy_workspace_stores() {
-        let workspace = temp("legacy");
-        let empty = workspace.join("nonaut-undo-store-1");
-        let populated = workspace.join("nonaut-undo-store-2");
-        fs::create_dir_all(&empty).unwrap();
-        fs::create_dir_all(&populated).unwrap();
-        fs::write(populated.join("snapshot"), "keep").unwrap();
-
-        remove_empty_legacy_stores(&workspace);
-
-        assert!(!empty.exists());
-        assert!(populated.exists());
-        fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]

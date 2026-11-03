@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     io::{BufRead, Write},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::atomic::{AtomicU64, Ordering},
@@ -9,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use nono::{AccessMode, CapabilitySet, Sandbox};
+use nono::{CapabilitySet, Sandbox};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -25,6 +26,7 @@ const PROXY_PORT_ENV: &str = "NONAUT_PROXY_PORT";
 const NETWORK_BLOCKED_ENV: &str = "NONAUT_NETWORK_BLOCKED";
 const SANDBOX_RUNTIME_ENV: &str = "NONAUT_SANDBOX_RUNTIME";
 const CAPABILITY_FILE_ENV: &str = "NONAUT_CAP_FILE";
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Runtime {
@@ -33,6 +35,7 @@ struct Runtime {
     read_paths: Vec<PathBuf>,
     write_paths: Vec<PathBuf>,
     path_entries: Vec<PathBuf>,
+    runtime_grants: Vec<crate::runtime::requirements::Grant>,
     home: PathBuf,
     environment: BTreeMap<String, String>,
     capability_file: PathBuf,
@@ -72,7 +75,10 @@ struct CallGuard {
     armed: bool,
 }
 
-struct CaptureFile(Option<PathBuf>);
+struct CaptureFile {
+    path: PathBuf,
+    file: Arc<fs::File>,
+}
 
 type WorkerPool = HashMap<PathBuf, Arc<Mutex<Worker>>>;
 
@@ -81,19 +87,13 @@ static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(0);
 
 impl Runtime {
     fn from_policy(policy: &crate::policy::Policy) -> Self {
-        let base = crate::sandbox::platform::command_path();
-        let path_entries = policy
-            .path_entries
-            .iter()
-            .cloned()
-            .chain(std::env::split_paths(&base))
-            .collect();
         Self {
             deny_paths: policy.deny_paths.clone(),
             protected_paths: policy.protected_paths.clone(),
             read_paths: policy.read_paths.clone(),
             write_paths: policy.write_paths.clone(),
-            path_entries,
+            path_entries: policy.path_entries.clone(),
+            runtime_grants: policy.runtime.grants.clone(),
             home: policy.command_home.clone(),
             environment: policy.environment.clone(),
             capability_file: policy
@@ -163,15 +163,14 @@ pub(super) async fn execute(
     let worker = worker(workspace, policy).await?;
 
     let mut arguments = arguments.clone();
-    let capture = CaptureFile((tool == "run_command").then(|| {
-        policy.command_home.join(format!(
-            ".nonaut-output-{}-{}",
-            std::process::id(),
-            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
-        ))
-    }));
-    if let Some(path) = capture.0.as_ref() {
-        arguments["_capture_path"] = Value::String(path.to_string_lossy().into_owned());
+    let capture = (tool == "run_command")
+        .then(|| CaptureFile::create(&policy.command_home))
+        .transpose()?;
+    if let Some(capture) = &capture {
+        let metadata = capture.file.metadata()?;
+        arguments["_capture_path"] = Value::String(capture.path.to_string_lossy().into_owned());
+        arguments["_capture_device"] = metadata.dev().into();
+        arguments["_capture_inode"] = metadata.ino().into();
     }
     let seconds = arguments["timeout_seconds"]
         .as_u64()
@@ -182,9 +181,8 @@ pub(super) async fn execute(
         arguments,
     };
     let limit = Duration::from_secs(seconds);
-    let progress_task = capture.0.as_ref().zip(progress).map(|(path, report)| {
-        let path = path.clone();
-        tokio::spawn(report_command_progress(path, report))
+    let progress_task = capture.as_ref().zip(progress).map(|(capture, report)| {
+        tokio::spawn(report_command_progress(Arc::clone(&capture.file), report))
     });
     let response = {
         let mut worker = worker.lock().await;
@@ -193,9 +191,8 @@ pub(super) async fn execute(
             Err(_) => {
                 let _ = worker.child.kill().await;
                 let partial = capture
-                    .0
                     .as_ref()
-                    .and_then(|path| fs::read_to_string(path).ok())
+                    .and_then(|capture| read_capture(&capture.file).ok())
                     .unwrap_or_default();
                 let detail = if partial.trim().is_empty() {
                     String::new()
@@ -256,7 +253,7 @@ fn command_progress(output: &str) -> super::CommandProgress {
     }
 }
 
-async fn report_command_progress(path: PathBuf, report: super::ProgressReporter) {
+async fn report_command_progress(file: Arc<fs::File>, report: super::ProgressReporter) {
     let mut updates = interval(Duration::from_millis(350));
     updates.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous = super::CommandProgress {
@@ -265,7 +262,7 @@ async fn report_command_progress(path: PathBuf, report: super::ProgressReporter)
     };
     loop {
         updates.tick().await;
-        if let Ok(output) = fs::read_to_string(&path) {
+        if let Ok(output) = read_capture(&file) {
             let current = command_progress(&output);
             if current != previous {
                 report(current.clone());
@@ -374,12 +371,63 @@ impl Drop for CallGuard {
     }
 }
 
+impl CaptureFile {
+    fn create(home: &Path) -> Result<Self> {
+        let path = home.join(format!(
+            ".nonaut-output-{}-{}",
+            std::process::id(),
+            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+            .open(&path)
+            .context("could not create command output capture")?;
+        Ok(Self {
+            path,
+            file: Arc::new(file),
+        })
+    }
+}
+
 impl Drop for CaptureFile {
     fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(&self.path);
     }
+}
+
+fn read_capture(file: &fs::File) -> Result<String> {
+    let length = file.metadata()?.len();
+    if length <= MAX_CAPTURE_BYTES as u64 {
+        return Ok(
+            String::from_utf8_lossy(&read_capture_range(file, 0, length as usize)?).into_owned(),
+        );
+    }
+    let half = MAX_CAPTURE_BYTES / 2;
+    let head = read_capture_range(file, 0, half)?;
+    let tail = read_capture_range(file, length - half as u64, half)?;
+    Ok(format!(
+        "{}\n[output truncated by Nonaut: middle omitted]\n{}",
+        String::from_utf8_lossy(&head),
+        String::from_utf8_lossy(&tail)
+    ))
+}
+
+fn read_capture_range(file: &fs::File, offset: u64, length: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0; length];
+    let mut read = 0;
+    while read < length {
+        let count = file.read_at(&mut bytes[read..], offset + read as u64)?;
+        if count == 0 {
+            break;
+        }
+        read += count;
+    }
+    bytes.truncate(read);
+    Ok(bytes)
 }
 
 pub(crate) fn run() -> Result<()> {
@@ -490,7 +538,19 @@ fn run_worker_command(runtime: &Runtime, arguments: &Value) -> Result<String> {
         capture.parent() == Some(runtime.home.as_path()),
         "invalid command output capture path"
     );
-    let output = fs::File::create(&capture).context("could not create command output capture")?;
+    let output = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&capture)
+        .context("could not open command output capture")?;
+    let metadata = output.metadata()?;
+    anyhow::ensure!(
+        Some(metadata.dev()) == arguments["_capture_device"].as_u64()
+            && Some(metadata.ino()) == arguments["_capture_inode"].as_u64(),
+        "command output capture was replaced"
+    );
+    let reader = output.try_clone()?;
     let error = output
         .try_clone()
         .context("could not clone command output capture")?;
@@ -517,7 +577,7 @@ fn run_worker_command(runtime: &Runtime, arguments: &Value) -> Result<String> {
     let status = command
         .status()
         .with_context(|| format!("could not execute `{program}`"))?;
-    let output = fs::read_to_string(&capture).context("command output was not UTF-8")?;
+    let output = read_capture(&reader)?;
     super::status_result(program, status, output)
 }
 
@@ -536,21 +596,12 @@ fn capabilities(workspace: &Path, runtime: &Runtime) -> Result<CapabilitySet> {
         }
         None => CapabilitySet::new(),
     };
-    for path in &runtime.read_paths {
-        capabilities = allow_existing(capabilities, path, AccessMode::Read)?;
-    }
-    for path in &runtime.write_paths {
-        capabilities = allow_existing(capabilities, path, AccessMode::ReadWrite)?;
-    }
-    for path in crate::sandbox::platform::read_paths() {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Read)?;
-    }
-    for path in crate::sandbox::platform::write_paths() {
-        capabilities = allow_existing(capabilities, Path::new(path), AccessMode::Write)?;
-    }
-    for path in &runtime.path_entries {
-        capabilities = allow_existing(capabilities, path, AccessMode::Read)?;
-    }
+    capabilities = crate::sandbox::apply_filesystem(
+        capabilities,
+        &runtime.read_paths,
+        &runtime.write_paths,
+        &runtime.runtime_grants,
+    )?;
     #[cfg(target_os = "macos")]
     {
         for path in &runtime.deny_paths {
@@ -570,24 +621,6 @@ fn capabilities(workspace: &Path, runtime: &Runtime) -> Result<CapabilitySet> {
     Ok(capabilities)
 }
 
-fn allow_existing(
-    capabilities: CapabilitySet,
-    path: &Path,
-    access: AccessMode,
-) -> Result<CapabilitySet> {
-    if path.is_dir() {
-        capabilities
-            .allow_path(path, access)
-            .with_context(|| format!("could not grant access to {}", path.display()))
-    } else if fs::canonicalize(path).is_ok() {
-        capabilities
-            .allow_file(path, access)
-            .with_context(|| format!("could not grant access to {}", path.display()))
-    } else {
-        Ok(capabilities)
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn landlock_filters_network() -> bool {
     nono::sandbox::detect_abi().is_ok_and(|abi| abi.has_network())
@@ -605,6 +638,26 @@ fn proxy_port() -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_capture_retains_both_ends_and_marks_missing_output() {
+        let directory =
+            std::env::temp_dir().join(format!("nonaut-capture-test-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let capture = CaptureFile::create(&directory).unwrap();
+        capture.file.write_at(b"capture-head", 0).unwrap();
+        capture
+            .file
+            .write_at(b"capture-tail", MAX_CAPTURE_BYTES as u64 + 64)
+            .unwrap();
+        let output = read_capture(&capture.file).unwrap();
+        assert!(output.starts_with("capture-head"));
+        assert!(output.ends_with("capture-tail"));
+        assert!(output.contains("[output truncated by Nonaut: middle omitted]"));
+        assert!(output.len() < MAX_CAPTURE_BYTES + 128);
+        drop(capture);
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn command_progress_reports_the_latest_meaningful_line() {

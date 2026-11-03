@@ -73,6 +73,7 @@ fn exec_in_selected(
     let config = home.join("config");
     fs::create_dir_all(config_dir(workspace)).unwrap();
     let mut process = Command::new(binary());
+    isolate_toolchain_environment(&mut process);
     if let Some(name) = selected_workspace {
         process
             .arg("--config")
@@ -151,7 +152,7 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
     fs::set_permissions(&bun, fs::Permissions::from_mode(0o755)).unwrap();
 
     let config = serde_json::json!({
-        "root": mixed, "packs": ["rust", "python", "node", "go", "bun"],
+        "root": mixed, "runtime": {"mode":"auto", "packs":["rust", "python", "node", "go", "bun"]},
         "filesystem": {"readwrite": ["."]}
     });
     write_named_policy(&session, "mixed", &config);
@@ -163,7 +164,11 @@ fn workspace_rules_follow_command_cwd_and_combine_development_profiles() {
         Some("mixed"),
     );
     assert!(allowed.status.success(), "{}", combined(&allowed));
-    assert!(combined(&allowed).contains("rust-profile-ok"));
+    assert!(
+        combined(&allowed).contains("rust-profile-ok"),
+        "{}",
+        combined(&allowed)
+    );
     assert!(combined(&allowed).contains("python-profile-ok"));
     assert!(combined(&allowed).contains("node-profile-ok"));
     assert!(combined(&allowed).contains("go-profile-ok"));
@@ -185,6 +190,373 @@ fn combined(output: &Output) -> String {
     )
 }
 
+fn runtime_command(workspace: &Path, name: &str, action: &str) -> Command {
+    let mut command = Command::new(binary());
+    isolate_toolchain_environment(&mut command);
+    command
+        .args(["runtime", action, "--json", "--config"])
+        .arg(config_dir(workspace).join(format!("{name}.json")))
+        .current_dir(workspace)
+        .env("HOME", workspace.parent().unwrap())
+        .env(
+            "XDG_CONFIG_HOME",
+            workspace.parent().unwrap().join("config"),
+        );
+    command
+}
+
+fn isolate_toolchain_environment(command: &mut Command) {
+    for name in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "PYENV_ROOT",
+        "NVM_DIR",
+        "FNM_DIR",
+        "BUN_INSTALL",
+        "GOROOT",
+    ] {
+        command.env_remove(name);
+    }
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_custom_mode_disables_every_builtin() {
+    let root = TestRoot::new("runtime-custom");
+    let workspace = root.workspace();
+    fs::write(workspace.join("Cargo.toml"), "[package]").unwrap();
+    write_named_policy(
+        &workspace,
+        "custom",
+        &serde_json::json!({"filesystem":{"readwrite":["."]}, "runtime":{"mode":"custom","environment":{"COMPANY_OPTION":"private-value"}}}),
+    );
+    let output = runtime_command(&workspace, "custom", "show")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let manifest: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &manifest["runtime_support"]["plan"];
+    assert_eq!(plan["mode"], "custom");
+    assert_eq!(plan["packs"], serde_json::json!([]));
+    assert_eq!(plan["path_entries"], serde_json::json!([]));
+    assert!(
+        plan["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|grant| grant["source"] == "executor")
+    );
+    assert_eq!(
+        plan["environment_sources"],
+        serde_json::json!({"COMPANY_OPTION":"runtime.environment"})
+    );
+    assert!(!combined(&output).contains("private-value"));
+    let denied = exec_in_selected(
+        &workspace,
+        &workspace,
+        "/bin/sh -c 'printf must-not-run'",
+        Some("custom"),
+    );
+    assert!(!denied.status.success());
+    assert!(
+        combined(&denied).contains("could not execute"),
+        "{}",
+        combined(&denied)
+    );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_manual_system_pack_runs_commands_and_checks_without_detecting_project_packs() {
+    let root = TestRoot::new("runtime-manual");
+    let workspace = root.workspace();
+    fs::write(workspace.join("Cargo.toml"), "[package]").unwrap();
+    write_named_policy(
+        &workspace,
+        "manual",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"manual","packs":["system"],"environment":{"COMPANY_OPTION":"configured"}}}),
+    );
+    let output = exec_in_selected(
+        &workspace,
+        &workspace,
+        "test -z \"$CARGO_HOME\" && printf '%s' \"$COMPANY_OPTION\"",
+        Some("manual"),
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "configured\n");
+    let check = runtime_command(&workspace, "manual", "check")
+        .output()
+        .unwrap();
+    assert!(check.status.success(), "{}", combined(&check));
+    let document: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+    assert_eq!(document["checks"].as_array().unwrap().len(), 1);
+    assert_eq!(document["checks"][0]["status"], "passed");
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_auto_detects_custom_toolchain_locations_and_isolates_their_state() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestRoot::new("runtime-auto");
+    let workspace = root.workspace();
+    let installation = root.path.join("company-cargo");
+    fs::create_dir_all(installation.join("bin")).unwrap();
+    let cargo = installation.join("bin/cargo");
+    fs::write(
+        &cargo,
+        "#!/bin/sh\nprintf 'custom-cargo:%s' \"$CARGO_HOME\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    write_named_policy(
+        &workspace,
+        "auto",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"auto"}}),
+    );
+    let output = runtime_command(&workspace, "auto", "show")
+        .env("CARGO_HOME", &installation)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        document["runtime_support"]["plan"]["packs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pack| pack["name"] == "rust" && pack["reason"] == "host installation")
+    );
+    let output = Command::new(binary())
+        .args(["exec", "--config"])
+        .arg(config_dir(&workspace).join("auto.json"))
+        .args(["--", "cargo --version"])
+        .current_dir(&workspace)
+        .env("HOME", &root.path)
+        .env("XDG_CONFIG_HOME", root.path.join("config"))
+        .env("CARGO_HOME", &installation)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(combined(&output).contains("custom-cargo:"));
+    assert!(!combined(&output).contains(&format!("custom-cargo:{}", installation.display())));
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_imports_replace_selection_environment_and_grants_while_preserving_denials() {
+    let root = TestRoot::new("runtime-import");
+    let workspace = root.workspace();
+    write_named_policy(
+        &workspace,
+        "base",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"manual","packs":["system","rust"],"filesystem":{"read":[root.path],"deny":[root.path.join("secret")]},"environment":{"INHERITED":"must-disappear"}}}),
+    );
+    write_named_policy(
+        &workspace,
+        "child",
+        &serde_json::json!({"extends":["base.json"],"runtime":{"mode":"custom","environment":{"FINAL":"configured"}}}),
+    );
+    let output = runtime_command(&workspace, "child", "show")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &document["runtime_support"]["plan"];
+    assert_eq!(plan["packs"], serde_json::json!([]));
+    assert_eq!(
+        plan["environment_sources"],
+        serde_json::json!({"FINAL":"runtime.environment"})
+    );
+    assert_eq!(
+        document["deny"][0],
+        root.path.join("secret").to_str().unwrap()
+    );
+    assert!(
+        plan["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|grant| grant["kind"] == "executor")
+    );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_custom_explicit_grants_can_replace_system_support_without_hidden_packs() {
+    let root = TestRoot::new("runtime-explicit");
+    let workspace = root.workspace();
+    write_named_policy(
+        &workspace,
+        "system",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"manual","packs":["system"]}}),
+    );
+    let output = runtime_command(&workspace, "system", "show")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let plan = &document["runtime_support"]["plan"];
+    let grants = plan["grants"].as_array().unwrap();
+    let paths = |writable| {
+        grants
+            .iter()
+            .filter(|grant| grant["source"] == "system" && (grant["access"] != "read") == writable)
+            .map(|grant| grant["path"].clone())
+            .collect::<Vec<_>>()
+    };
+    let bins = plan["path_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| PathBuf::from(entry.as_str().unwrap()))
+        .collect::<Vec<_>>();
+    write_named_policy(
+        &workspace,
+        "custom",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"custom","filesystem":{"read":paths(false),"readwrite":paths(true)},"environment":{"PATH":std::env::join_paths(bins).unwrap().to_str().unwrap()}}}),
+    );
+    fs::write(root.path.join("outside-secret"), "must-stay-private").unwrap();
+    let output = exec_in_selected(
+        &workspace,
+        &workspace,
+        "printf explicit-runtime-ok",
+        Some("custom"),
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "explicit-runtime-ok\n"
+    );
+    let denied = exec_in_selected(
+        &workspace,
+        &workspace,
+        "cat ../outside-secret",
+        Some("custom"),
+    );
+    assert!(!denied.status.success());
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn runtime_detects_custom_homebrew_prefixes_but_ignores_project_controlled_prefixes() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let root = TestRoot::new("runtime-homebrew");
+    let workspace = root.workspace();
+    let prefix = root.path.join("company-brew");
+    for directory in ["Cellar/company/bin", "opt", "bin"] {
+        fs::create_dir_all(prefix.join(directory)).unwrap();
+    }
+    let tool = prefix.join("Cellar/company/bin/company-tool");
+    fs::write(&tool, "#!/bin/sh\nprintf custom-brew-ok\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&tool, prefix.join("bin/company-tool")).unwrap();
+    write_named_policy(
+        &workspace,
+        "auto",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"auto"}}),
+    );
+    let output = Command::new(binary())
+        .args(["exec", "--config"])
+        .arg(config_dir(&workspace).join("auto.json"))
+        .args(["--", "company-tool"])
+        .current_dir(&workspace)
+        .env("HOME", &root.path)
+        .env("XDG_CONFIG_HOME", root.path.join("config"))
+        .env("HOMEBREW_PREFIX", &prefix)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "custom-brew-ok\n");
+    let untrusted = workspace.join("malicious-brew");
+    fs::create_dir_all(untrusted.join("Cellar")).unwrap();
+    fs::create_dir_all(untrusted.join("opt")).unwrap();
+    let output = runtime_command(&workspace, "auto", "show")
+        .env("HOMEBREW_PREFIX", &untrusted)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", combined(&output));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !document["runtime_support"]["plan"]["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| Path::new(grant["path"].as_str().unwrap()).starts_with(&untrusted))
+    );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn replacing_command_capture_with_a_secret_symlink_never_exposes_host_data() {
+    let root = TestRoot::new("capture-symlink");
+    let workspace = root.workspace();
+    let secret = root.path.join("host-secret");
+    fs::write(&secret, "private-host-data-must-not-appear").unwrap();
+    write_config(&workspace, r#"{"tools":{"timeout_seconds":1}}"#);
+    let output = exec(
+        &workspace,
+        &format!(
+            "printf captured-before-timeout; for f in \"$HOME\"/.nonaut-output-*; do rm -f \"$f\"; ln -s '{}' \"$f\"; done; sleep 3",
+            secret.display()
+        ),
+    );
+    assert!(!output.status.success());
+    let text = combined(&output);
+    assert!(text.contains("timed out"), "{text}");
+    assert!(text.contains("captured-before-timeout"), "{text}");
+    assert!(
+        !text.contains("private-host-data-must-not-appear"),
+        "{text}"
+    );
+}
+
+#[test]
+#[ignore = "provider-free black-box integration test"]
+fn broad_runtime_writes_cannot_make_the_capability_manifest_writable() {
+    let root = TestRoot::new("manifest-write-grant");
+    let workspace = root.workspace();
+    let cache = root.path.join(".cache");
+    fs::create_dir_all(&cache).unwrap();
+    write_named_policy(
+        &workspace,
+        "broad",
+        &serde_json::json!({"filesystem":{"readwrite":["."]},"runtime":{"mode":"custom","filesystem":{"readwrite":[cache]}}}),
+    );
+    let output = runtime_command(&workspace, "broad", "show")
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        combined(&output).contains("read-only capability manifest directory"),
+        "{}",
+        combined(&output)
+    );
+}
+
+#[test]
+#[ignore = "provider-free native runtime integration test"]
+fn runtime_auto_builds_native_code_and_runs_python_without_startup_warnings() {
+    let root = TestRoot::new("native-runtime");
+    let workspace = root.workspace();
+    fs::write(
+        workspace.join("native.c"),
+        "#include <stdio.h>\nint main(void) { puts(\"native-ok\"); return 0; }\n",
+    )
+    .unwrap();
+    write_config(&workspace, r#"{"runtime":{"mode":"auto"}}"#);
+    let output = exec(
+        &workspace,
+        "cc native.c -o native && ./native && python3 -c 'print(\"python-ok\")'",
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "native-ok\npython-ok\n"
+    );
+    assert!(output.stderr.is_empty(), "{}", combined(&output));
+}
+
 #[test]
 #[ignore = "provider-free black-box integration test"]
 fn headless_exec_runs_and_writes_inside_the_workspace() {
@@ -200,6 +572,11 @@ fn headless_exec_runs_and_writes_inside_the_workspace() {
 
     let output = exec(&workspace, "printf 'sandboxed write' > created.txt");
     assert!(output.status.success(), "{}", combined(&output));
+    assert!(
+        output.stdout.is_empty(),
+        "silent command returned fabricated output: {}",
+        combined(&output)
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("created.txt")).unwrap(),
         "sandboxed write"
@@ -216,6 +593,49 @@ fn headless_exec_uses_a_private_writable_home_outside_the_workspace() {
         r#"test "$HOME" != "$PWD" && printf private > "$HOME/state" && test ! -e state"#,
     );
     assert!(output.status.success(), "{}", combined(&output));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "provider-free Apple toolchain integration test"]
+fn macos_sdk_lookup_uses_a_private_cache_without_sandbox_warnings() {
+    if !Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        return;
+    }
+    let root = TestRoot::new("sdk-cache");
+    let workspace = root.workspace();
+    let output = exec(
+        &workspace,
+        r#"case "$xcrun_db" in "$HOME"/tmp/*) ;; *) exit 1 ;; esac; xcrun --show-sdk-path && cc --version"#,
+    );
+    let text = combined(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("MacOSX"), "{text}");
+    assert!(!text.contains("couldn't create cache file"), "{text}");
+    assert!(!text.contains("Operation not permitted"), "{text}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "provider-free Homebrew runtime integration test"]
+fn macos_homebrew_tools_can_load_their_installed_libraries() {
+    let Some(git) = ["/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    else {
+        return;
+    };
+    let root = TestRoot::new("homebrew-runtime");
+    let workspace = root.workspace();
+    let output = exec(&workspace, &format!("{git} --version"));
+    assert!(output.status.success(), "{}", combined(&output));
+    assert!(combined(&output).contains("git version"));
 }
 
 #[test]
@@ -396,6 +816,27 @@ fn write_config(workspace: &Path, config_text: &str) {
     fs::write(path, config.to_string()).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "provider-free Homebrew runtime integration test"]
+fn macos_homebrew_node_can_load_openssl_configuration_without_ambient_home_access() {
+    let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file());
+    let Some(node) = node else {
+        return;
+    };
+    let root = TestRoot::new("node-openssl");
+    let workspace = root.workspace();
+    write_config(&workspace, r#"{"runtime":{"mode":"auto"}}"#);
+    let output = exec(
+        &workspace,
+        &format!("{node} -e 'console.log(\"node-openssl-ok\")'"),
+    );
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "node-openssl-ok\n");
+}
+
 fn config_dir(workspace: &Path) -> PathBuf {
     let home = workspace.parent().unwrap();
     home.join("config/nonaut")
@@ -531,7 +972,14 @@ fn wait_for_after(output: &Arc<Mutex<Vec<u8>>>, offset: usize, needle: &str) {
         drop(bytes);
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("timed out waiting for {needle:?} after output offset {offset}");
+    let bytes = output.lock().unwrap();
+    let start = offset
+        .max(bytes.len().saturating_sub(12_000))
+        .min(bytes.len());
+    panic!(
+        "timed out waiting for {needle:?} after output offset {offset}\n{}",
+        String::from_utf8_lossy(&bytes[start..])
+    );
 }
 
 fn wait_for_file(path: &Path) {
@@ -572,7 +1020,7 @@ fn tui_exec_interrupts_and_restores_terminal_modes() {
     wait_for(&run.output, "Ask anything");
     run.writer.write_all(b"/exec sleep 30\r").unwrap();
     run.writer.flush().unwrap();
-    wait_for(&run.output, "Running shell <shell-command> in nono");
+    wait_for(&run.output, "Running shell <shell-command>");
     run.writer.write_all(b"\x1b").unwrap();
     run.writer.flush().unwrap();
     wait_for(&run.output, "Command interrupted");
@@ -602,25 +1050,28 @@ fn tui_reuses_a_sandbox_worker_across_commands() {
         .write_all(b"/exec printf $PPID > first-parent.txt\r")
         .unwrap();
     run.writer.flush().unwrap();
-    wait_for(&run.output, "Completed shell <shell-command>");
+    wait_for(&run.output, "✓ shell <shell-command>");
     let outside = root.path.join("outside.txt");
     fs::write(&outside, "hidden").unwrap();
     run.writer
         .write_all(format!("/exec cat {}\r", outside.display()).as_bytes())
         .unwrap();
     run.writer.flush().unwrap();
-    wait_for(&run.output, "Failed shell <shell-command>");
+    wait_for(&run.output, "✗ shell <shell-command>");
 
     let widened = serde_json::json!({
         "references": {"outside": {"path": outside, "access": "read"}}
     });
     write_config(&workspace, &serde_json::to_string(&widened).unwrap());
+    fs::create_dir(workspace.join("nested")).unwrap();
     let offset = run.output.lock().unwrap().len();
     run.writer
-        .write_all(format!("/exec cat {}\r", outside.display()).as_bytes())
+        .write_all(format!("/exec --cwd nested cat {}\r", outside.display()).as_bytes())
         .unwrap();
     run.writer.flush().unwrap();
-    wait_for_after(&run.output, offset, "Failed shell <shell-command>");
+    // A distinct directory gives this execution a unique heading, so a repaint
+    // of the first failure cannot be mistaken for the second completion.
+    wait_for_after(&run.output, offset, "✗ shell <shell-command> · nested");
 
     run.writer
         .write_all(b"/exec printf $PPID > second-parent.txt\r")
@@ -647,16 +1098,55 @@ fn tui_command_card_streams_progress_and_elapsed_time() {
     let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
     wait_for(&run.output, "Ask anything");
     run.writer
-        .write_all(b"/exec printf first-line; sleep 2; printf second-line\r")
+        .write_all(b"/exec printf first-%s line; sleep 2; printf second-%s line\r")
         .unwrap();
     run.writer.flush().unwrap();
 
     wait_for(&run.output, "Running shell <shell-command>");
-    wait_for(&run.output, "first");
-    wait_for(&run.output, "1 output lines");
-    wait_for(&run.output, "00:00 / 02:00");
-    // The displayed duration is rounded down and depends on event delivery.
-    wait_for(&run.output, "Completed shell <shell-command> · 00:");
+    wait_for(&run.output, "  first-line");
+    wait_for(&run.output, "✓ shell <shell-command>");
+    run.writer.write_all(b"/details\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "Tool: exec");
+    wait_for(&run.output, "first-linesecond-line");
+    wait_for(&run.output, "q/Esc close");
+    run.writer
+        .write_all(b"q/exec printf modal-returned > modal-returned.txt\r")
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for_file(&workspace.join("modal-returned.txt"));
+    run.writer.write_all(b"/q\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_exit(&mut run.child);
+}
+
+#[test]
+#[ignore = "provider-free PTY integration test"]
+fn tui_details_scroll_and_close_back_to_the_command_pane() {
+    let root = TestRoot::new("tui-details");
+    let workspace = root.workspace();
+    let mut run = spawn_pty(&workspace, &["__nonaut_tui"], &root);
+    wait_for(&run.output, "Ask anything");
+    run.writer.write_all(b"/exec i=1; while [ $i -le 80 ]; do printf 'details-row-%s\\n' $i; i=$((i+1)); done; printf modal-bottom-marker\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "✓ shell <shell-command>");
+    run.writer.write_all(b"/details\r").unwrap();
+    run.writer.flush().unwrap();
+    wait_for(&run.output, "Tool details");
+    let offset = run.output.lock().unwrap().len();
+    run.writer.write_all(b"\x1b[F\x0c").unwrap();
+    run.writer.flush().unwrap();
+    answer_cursor_position(&mut run);
+    wait_for_after(&run.output, offset, "modal-bottom-marker");
+    let offset = run.output.lock().unwrap().len();
+    run.writer.write_all(b"\x1b").unwrap();
+    run.writer.flush().unwrap();
+    wait_for_after(&run.output, offset, "Ask anything");
+    run.writer
+        .write_all(b"/exec printf closed > details-closed.txt\r")
+        .unwrap();
+    run.writer.flush().unwrap();
+    wait_for_file(&workspace.join("details-closed.txt"));
     run.writer.write_all(b"/q\r").unwrap();
     run.writer.flush().unwrap();
     wait_for_exit(&mut run.child);
@@ -717,7 +1207,7 @@ fn first_launch_setup_saves_the_workspace_and_starts_the_tui() {
     );
     assert_eq!(config["filesystem"], serde_json::json!({"readwrite":["."]}));
     assert!(config.get("references").is_none());
-    assert_eq!(config["packs"][0], "rust");
+    assert_eq!(config["runtime"]["mode"], "auto");
 
     let shown = Command::new(binary())
         .arg("config")
@@ -729,7 +1219,7 @@ fn first_launch_setup_saves_the_workspace_and_starts_the_tui() {
     assert!(shown.status.success(), "{}", combined(&shown));
     let shown = String::from_utf8_lossy(&shown.stdout);
     assert!(shown.contains("\"workspace\""), "{shown}");
-    assert!(shown.contains("\"rust\""), "{shown}");
+    assert!(shown.contains("\"auto\""), "{shown}");
 }
 
 #[test]
@@ -921,9 +1411,11 @@ fn rust_pack_runs_real_offline_cargo_tests() {
     let root = TestRoot::new("real-cargo");
     let workspace = root.workspace();
     fs::create_dir(workspace.join("src")).unwrap();
+    // This project is nested inside Nonaut's checkout. An explicit workspace
+    // boundary keeps Cargo from probing parent manifests outside its grants.
     fs::write(
         workspace.join("Cargo.toml"),
-        "[package]\nname = 'sandbox-probe'\nversion = '0.1.0'\nedition = '2024'\n",
+        "[package]\nname = 'sandbox-probe'\nversion = '0.1.0'\nedition = '2024'\n\n[workspace]\n",
     )
     .unwrap();
     fs::write(
@@ -935,7 +1427,7 @@ fn rust_pack_runs_real_offline_cargo_tests() {
         &workspace,
         "rust",
         &serde_json::json!({
-            "packs": ["rust"], "filesystem": {"readwrite":["."]}
+            "runtime": {"mode":"auto", "packs":["rust"]}, "filesystem": {"readwrite":["."]}
         }),
     );
     let output = Command::new(binary())

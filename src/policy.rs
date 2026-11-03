@@ -43,6 +43,7 @@ pub(crate) struct Policy {
     pub command_home: PathBuf,
     pub environment: BTreeMap<String, String>,
     pub profiles: Vec<String>,
+    pub runtime: crate::runtime::Plan,
     /// Exact, read-only description of this pinned policy for sandboxed tools.
     pub capability_file: Option<PathBuf>,
 }
@@ -60,7 +61,7 @@ pub(crate) enum OperationAccess {
     Write,
 }
 
-pub(crate) const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 120;
+pub(crate) use crate::config::DEFAULT_TOOL_TIMEOUT_SECONDS;
 const MAX_TOOL_TIMEOUT_SECONDS: u64 = 3600;
 
 static PINNED: OnceLock<Mutex<HashMap<PathBuf, Arc<Policy>>>> = OnceLock::new();
@@ -90,9 +91,10 @@ pub(crate) fn load_session(session_root: &Path) -> Result<Policy> {
             |path| format!("invalid {}", path.display()),
         )
     })?;
-    crate::runtime_paths::prepare_private_directory(&policy.command_home)
-        .context("could not prepare the private command home")?;
-    crate::runtime_paths::prepare_private_directory(&policy.command_home.join("tmp"))?;
+    policy
+        .runtime
+        .prepare()
+        .context("could not prepare runtime state")?;
     prepare_capability_file(&mut policy, &home)?;
     Ok(policy)
 }
@@ -166,26 +168,28 @@ fn describe_resolved(policy: &Policy, full: bool) -> Result<String> {
     ));
     if full {
         lines.push("\nNONO RUNTIME".into());
-        for (access, paths) in [
-            ("read", &policy.read_paths),
-            ("read/write", &policy.write_paths),
-        ] {
-            for path in paths {
-                lines.push(format!("  {}  {access}", path.display()));
-            }
+        lines.push(format!("  Mode: {}", policy.runtime.mode));
+        for pack in &policy.runtime.packs {
+            lines.push(format!("  Pack {} · {}", pack.name, pack.reason));
         }
-        for (access, paths) in [
-            ("read", crate::sandbox::platform::read_paths()),
-            ("write", crate::sandbox::platform::write_paths()),
-        ] {
-            for path in paths {
-                if Path::new(path).exists() {
-                    lines.push(format!("  {path}  {access} (system)"));
-                }
-            }
+        lines.push(format!(
+            "  PATH: {}",
+            std::env::join_paths(&policy.path_entries)?.to_string_lossy()
+        ));
+        for grant in &policy.runtime.grants {
+            lines.push(format!(
+                "  {}  {} · {} · {}",
+                grant.path.display(),
+                grant.access,
+                grant.source,
+                grant.reason
+            ));
         }
-        for (name, value) in &policy.environment {
-            lines.push(format!("  {name}={value}"));
+        for (name, source) in &policy.runtime.environment_sources {
+            lines.push(format!("  {name} (from {source}; value hidden)"));
+        }
+        for diagnostic in &policy.runtime.diagnostics {
+            lines.push(format!("  {diagnostic}"));
         }
         for path in &policy.protected_paths {
             lines.push(format!("  {}  protected from writes", path.display()));
@@ -255,6 +259,15 @@ fn resolve(
                 .into_owned();
         }
     }
+    if let Some(runtime) = &project.runtime {
+        for raw in &runtime.filesystem.deny {
+            filesystem.deny.push(
+                resolve_project_path(raw, &session_root, home)?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
     let tools = project.tools.clone().unwrap_or(WorkspaceToolsConfig {
         timeout_seconds: Some(config.tools.timeout_seconds),
     });
@@ -263,7 +276,7 @@ fn resolve(
         project.network.clone().unwrap_or_default(),
         filesystem,
         tools,
-        &project.packs,
+        project.runtime.as_ref(),
         home,
     )?;
     policy.name = project.name.clone().unwrap_or_else(|| {
@@ -292,6 +305,29 @@ fn resolve(
             );
         }
     }
+    policy.runtime.validate_writes(&policy.write_paths)?;
+    for grant in policy
+        .runtime
+        .grants
+        .iter()
+        .filter(|grant| grant.access.writable())
+    {
+        let path = fs::canonicalize(&grant.path).unwrap_or_else(|_| grant.path.clone());
+        for protected in &policy.protected_paths {
+            if protected.starts_with(&path) || path.starts_with(protected) {
+                bail!(
+                    "{}runtime write grant {} overlaps protected Nonaut configuration {}",
+                    if cfg!(target_os = "linux") {
+                        "Linux "
+                    } else {
+                        ""
+                    },
+                    path.display(),
+                    protected.display()
+                );
+            }
+        }
+    }
     validate_deny_overlaps(&policy, cfg!(target_os = "linux"))?;
     Ok(policy)
 }
@@ -311,48 +347,41 @@ fn resolve_project_path(raw: &str, root: &Path, home: &Path) -> Result<PathBuf> 
     })
 }
 
+fn canonicalize_grant(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(_)
+            if path.starts_with("/dev/fd")
+                || matches!(
+                    path.to_str(),
+                    Some("/dev/stdin" | "/dev/stdout" | "/dev/stderr")
+                ) =>
+        {
+            Ok(None)
+        }
+        Err(_) => canonicalize_nearest(path).map(Some),
+    }
+}
+
 fn validate_deny_overlaps(policy: &Policy, linux: bool) -> Result<()> {
     if !linux {
         return Ok(());
     }
-    let runtime = crate::sandbox::platform::read_paths()
-        .iter()
-        .chain(crate::sandbox::platform::write_paths())
-        .map(PathBuf::from)
-        .chain(std::env::split_paths(
-            &crate::sandbox::platform::command_path(),
-        ))
-        // Match the filesystem grants installed by sandbox::allow_existing.
-        // Linux descriptor links to pipes or sockets have no canonical path.
-        .filter_map(|path| fs::canonicalize(path).ok())
-        .collect::<Vec<_>>();
     for denied in &policy.deny_paths {
         for grant in policy
             .read_paths
             .iter()
             .chain(&policy.write_paths)
-            .chain(&policy.path_entries)
-            .chain(&runtime)
+            .chain(policy.runtime.grants.iter().map(|grant| &grant.path))
         {
-            let grant = canonicalize_nearest(grant)?;
-            if denied.starts_with(&grant) {
+            let Some(grant) = canonicalize_grant(grant)? else {
+                continue;
+            };
+            if denied.starts_with(&grant) || grant.starts_with(denied) {
                 bail!(
                     "Linux Landlock cannot enforce deny {} inside allowed {}; use narrower grants",
                     denied.display(),
                     grant.display()
-                );
-            }
-        }
-    }
-    for protected in &policy.protected_paths {
-        for grant in crate::sandbox::platform::write_paths() {
-            if let Ok(grant) = fs::canonicalize(grant)
-                && (protected.starts_with(&grant) || grant.starts_with(protected))
-            {
-                bail!(
-                    "Linux runtime write grant {} overlaps protected configuration {}; place configuration outside that directory",
-                    grant.display(),
-                    protected.display()
                 );
             }
         }
@@ -365,7 +394,7 @@ fn validate(
     network: NetworkConfig,
     filesystem: FilesystemConfig,
     tools: WorkspaceToolsConfig,
-    profiles: &[String],
+    runtime: Option<&crate::runtime::RuntimeConfig>,
     home: &Path,
 ) -> Result<Policy> {
     validate_network_config(&network)?;
@@ -391,10 +420,20 @@ fn validate(
     let operation_read_paths = read_paths.clone();
     let operation_write_paths = write_paths.clone();
     let command_home = crate::runtime_paths::workspace_cache(home, &["homes"], &workspace)?;
-    write_paths.push(command_home.clone());
-    let profile = crate::profiles::resolve(profiles, home, &workspace)?;
-    read_paths.extend(profile.read_paths);
-    write_paths.extend(profile.write_paths);
+    let default_runtime = crate::runtime::RuntimeConfig::default();
+    let runtime = crate::runtime::resolve(
+        runtime.unwrap_or(&default_runtime),
+        home,
+        &workspace,
+        &command_home,
+    )?;
+    for grant in &runtime.grants {
+        match grant.access {
+            crate::runtime::requirements::Access::Read => read_paths.push(grant.path.clone()),
+            crate::runtime::requirements::Access::ReadWrite => write_paths.push(grant.path.clone()),
+            crate::runtime::requirements::Access::Write => {}
+        }
+    }
     Ok(Policy {
         command_home,
         name: String::new(),
@@ -411,9 +450,10 @@ fn validate(
         write_paths,
         operation_read_paths,
         operation_write_paths,
-        path_entries: profile.path_entries,
-        environment: profile.environment,
-        profiles: profiles.to_vec(),
+        path_entries: runtime.path_entries.clone(),
+        environment: runtime.environment.clone(),
+        profiles: runtime.packs.iter().map(|pack| pack.name.clone()).collect(),
+        runtime,
         capability_file: None,
     })
 }
@@ -518,14 +558,6 @@ impl Policy {
             .iter()
             .filter(|path| self.capability_file.as_ref() != Some(path))
             .collect::<Vec<_>>();
-        let executable_path_entries = self
-            .path_entries
-            .iter()
-            .cloned()
-            .chain(std::env::split_paths(
-                &crate::sandbox::platform::command_path(),
-            ))
-            .collect::<Vec<_>>();
         let mut environment_names = ["HOME", "LANG", "NONAUT_CAP_FILE", "PATH", "TERM", "TMPDIR"]
             .into_iter()
             .map(str::to_owned)
@@ -539,7 +571,6 @@ impl Policy {
             );
         }
         let document = json!({
-            "schema_version": 1,
             "enforced_by": "nono",
             "workspace": self.workspace,
             "source": self.source,
@@ -554,9 +585,8 @@ impl Policy {
             "runtime_support": {
                 "configured_read": runtime_read,
                 "configured_write": self.write_paths,
-                "system_read": crate::sandbox::platform::read_paths(),
-                "system_write": crate::sandbox::platform::write_paths(),
-                "executable_path_entries": executable_path_entries
+                "plan": self.runtime,
+                "executable_path_entries": self.path_entries
             },
             "capability_file": {
                 "path": self.capability_file,
@@ -603,22 +633,51 @@ fn deduplicate_paths(paths: &mut Vec<PathBuf>) {
 fn prepare_capability_file(policy: &mut Policy, home: &Path) -> Result<()> {
     let directory =
         crate::runtime_paths::workspace_cache(home, &["capabilities"], &policy.workspace)?;
+    for grant in &policy.write_paths {
+        let Some(grant) = canonicalize_grant(grant)? else {
+            continue;
+        };
+        if directory.starts_with(&grant) || grant.starts_with(&directory) {
+            bail!(
+                "write grant {} overlaps the read-only capability manifest directory {}",
+                grant.display(),
+                directory.display()
+            );
+        }
+    }
     crate::runtime_paths::prepare_private_directory(&directory)?;
-    let path = directory.join(format!("{}.json", std::process::id()));
+    static NEXT_MANIFEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = directory.join(format!(
+        "{}-{}.json",
+        std::process::id(),
+        NEXT_MANIFEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     policy.capability_file = Some(path.clone());
+    policy.protected_paths.push(path.clone());
+    policy
+        .runtime
+        .grants
+        .push(crate::runtime::requirements::Grant {
+            path: path.clone(),
+            canonical_path: Some(path.clone()),
+            access: crate::runtime::requirements::Access::Read,
+            kind: crate::runtime::requirements::GrantKind::Executor,
+            source: "executor".into(),
+            reason: "read-only pinned capability manifest".into(),
+        });
     let contents = policy.capability_manifest_json()?;
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
         .open(&path)
         .with_context(|| format!("could not create {}", path.display()))?;
     file.write_all(contents.as_bytes())
         .with_context(|| format!("could not write {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("could not sync {}", path.display()))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+    file.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("could not protect {}", path.display()))?;
     policy.read_paths.push(path.clone());
     Ok(())
@@ -843,7 +902,7 @@ mod tests {
                     ..Default::default()
                 },
                 WorkspaceToolsConfig::default(),
-                &[],
+                None,
                 &root
             )
             .is_err()
@@ -869,7 +928,7 @@ mod tests {
                     WorkspaceToolsConfig {
                         timeout_seconds: Some(timeout)
                     },
-                    &[],
+                    None,
                     &root
                 )
                 .is_err()
@@ -880,6 +939,7 @@ mod tests {
     fn manifest_and_summary_report_the_pinned_policy() {
         let (root, policy) = fixture(json!({"filesystem":{"readwrite":["."]}}));
         let manifest = policy.capability_manifest();
+        assert!(manifest.get("schema_version").is_none());
         assert_eq!(
             manifest["model_access"]["write"][0],
             root.to_string_lossy().as_ref()

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::providers::ProviderKind;
 
 const CONFIG_FILE: &str = "config.json";
-const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 120;
+pub(crate) const DEFAULT_TOOL_TIMEOUT_SECONDS: u64 = 600;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -97,8 +97,8 @@ pub(crate) struct ProjectConfig {
     pub root: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub packs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::runtime::RuntimeConfig>,
     pub filesystem: FilesystemConfig,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub references: BTreeMap<String, ReferenceConfig>,
@@ -117,6 +117,12 @@ pub(crate) struct FilesystemConfig {
     pub readwrite: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+}
+
+impl FilesystemConfig {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.readwrite.is_empty() && self.deny.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,7 +341,7 @@ mod tests {
         .unwrap();
         let value = serde_json::to_value(policy).unwrap();
         assert_eq!(value["filesystem"], serde_json::json!({"readwrite": ["."]}));
-        assert!(value.get("packs").is_none());
+        assert!(value.get("runtime").is_none());
         assert!(
             serde_json::from_value::<ProjectConfig>(serde_json::json!({
                 "references": {"docs": {"path": "../docs"}}
@@ -346,6 +352,16 @@ mod tests {
             serde_json::from_str::<ProjectConfig>(r#"{"filesystem":{"write":["."]}}"#).is_err()
         );
     }
+    #[test]
+    fn explicit_shorter_deadlines_survive_configuration_round_trips() {
+        let config: Config = serde_json::from_str(r#"{"tools":{"timeout_seconds":120}}"#).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["tools"]["timeout_seconds"], 120);
+        let restored: Config = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.tools.timeout_seconds, 120);
+        assert!(Config::default().tools.timeout_seconds > restored.tools.timeout_seconds);
+    }
+
     #[test]
     fn config_paths_follow_xdg() {
         assert_eq!(

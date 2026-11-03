@@ -85,7 +85,7 @@ pub(crate) fn render_project_setup(
         format!("    {directory}/\n    {filename}")
     };
     format!(
-        "\n{}\n{}\n\n  {}\n  {}\n\n{}\n    Project     read/write\n    Packs       {packs}\n    Network     blocked\n    References  none\n\n{}\n{location}\n\n{}\n\n{} Create policy and launch? {} ",
+        "\n{}\n{}\n\n  {}\n  {}\n\n{}\n    Project     read/write\n    Runtime     auto · installed tools and project markers\n    Detected    {packs}\n    Network     blocked\n    References  none\n\n{}\n{location}\n\n{}\n\n{} Create policy and launch? {} ",
         styled("⎔  nonaut", ACCENT, true, color),
         styled("Set up this project", MUTED, false, color),
         styled(name, ACCENT, true, color),
@@ -116,6 +116,10 @@ pub(crate) fn render_help(color: bool) -> String {
             "Run a command in the nono sandbox",
         ),
         ("config", "Show the current project configuration"),
+        (
+            "runtime [show|check|list]",
+            "Inspect runtime grants and compatibility",
+        ),
         ("ps", "List persistent sessions"),
         ("attach <session>", "Attach to a persistent session"),
         ("kill <session>", "Stop a persistent session"),
@@ -242,7 +246,8 @@ mod tests {
     #[test]
     fn project_setup_handles_no_packs_and_a_bare_policy_filename() {
         let rendered = render_project_setup("app", "/work/app", "policy.json", &[], false);
-        assert!(rendered.contains("Packs       none"));
+        assert!(rendered.contains("Detected    none"));
+        assert!(rendered.contains("Runtime     auto"));
         assert!(rendered.contains("    policy.json\n"));
         assert!(!rendered.contains("isolated caches"));
     }

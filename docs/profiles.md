@@ -1,85 +1,107 @@
-# Development packs
+# Runtime packs
 
-Packs expose installed development toolchains without exposing the real
-user home. They add only the required read-only toolchain paths, executable
-directories, environment variables, and private writable caches.
+Nonaut resolves runtime support internally before creating its Nono worker.
+Users do not need Nono profiles or a separate Nono CLI. Integrations declare
+read-only installations, executable directories, environment settings and private
+state; the resolver validates and pins one plan for enforcement and inspection.
 
-## Built-in packs
+## Selection
 
-| Pack | Toolchains and package managers |
+New policies use automatic detection:
+
+```json
+{
+  "runtime": {"mode":"auto", "exclude":["bun"]},
+  "filesystem": {"readwrite":["."]}
+}
+```
+
+Auto mode selects known host integrations and installed toolchains, then adds
+language packs suggested by root-level Cargo, Python, Node, Go and Bun markers.
+Detection reads file presence and trusted host locations; it does not parse or
+execute package scripts. An unavailable tool is reported by `runtime check`.
+
+For explicit selection use `"mode":"manual"` with a `packs` list. For no built-in
+runtime support use `"mode":"custom"` with explicit filesystem and environment
+settings. See [configuration](configuration.md#runtime-selection-and-overrides).
+Without a runtime block, selection defaults to auto. Packs are configured only
+under `runtime.packs`.
+
+## Built-in integrations
+
+| Pack | Runtime support |
 | --- | --- |
-| `rust` | Cargo and rustup |
-| `python` | Python, pyenv, uv, and pip |
-| `node` | Node.js, NVM, FNM, npm, pnpm, Yarn, and Corepack |
-| `go` | Go SDK, GOPATH tools, modules, and build cache |
-| `bun` | Bun runtime and package cache |
+| `system` | OS executables, loaders, libraries, certificates, locales and devices |
+| `homebrew` | Discovered Homebrew executables, libraries and OpenSSL config/CA files |
+| `apple-sdk` | Selected macOS developer directory and private xcrun cache |
+| `gcc` | Linux compiler helpers and public development headers |
+| `git` | Git without ambient system configuration |
+| `rust` | Cargo/rustup and private Cargo/download caches |
+| `python` | Python, pyenv, uv, pip, distro startup files and private caches |
+| `node` | Node, NVM, FNM, npm, pnpm, Yarn and Corepack |
+| `go` | Go SDK, GOPATH tools, private module/build caches |
+| `bun` | Bun installation and private package cache |
 
-## Configure packs
+Host discovery supports standard locations and trusted absolute `CARGO_HOME`,
+`RUSTUP_HOME`, `PYENV_ROOT`, `NVM_DIR`, `FNM_DIR`, `BUN_INSTALL`, `GOROOT`,
+`HOMEBREW_PREFIX` and `DEVELOPER_DIR` settings. Homebrew prefixes can also be
+recognized from the host PATH. Node prefers active version-manager paths within
+recognized installation roots. The selected Apple developer directory otherwise
+comes from the fixed system `xcode-select -p` executable.
 
-Packs are selected in the project policy:
+Automatically discovered installations must be owned by root or the user,
+not world-writable, and outside the writable project. Nonaut rejects installation
+grants overlapping writable grants. Symlink aliases retain their canonical
+bindings; the adapter checks those bindings before granting access. Other layouts
+can use explicit runtime grants without broadening automatic discovery.
 
-```json
-{
-  "packs": ["rust"],
-  "filesystem": { "readwrite": ["."] }
-}
-```
+Explicit packs take PATH priority in listed order. Automatically selected
+language installations precede host/package-manager and OS executable paths.
+Duplicate or unknown pack names and conflicting pack environment values are
+errors. Explicit environment values can override pack settings.
 
-Polyglot projects can compose packs:
+## Isolation
 
-```json
-{
-  "packs": ["python", "node", "go"]
-}
-```
-
-Pack `PATH` entries follow the listed order. Duplicate names are rejected.
-If future packs define incompatible values for the same environment
-variable, configuration fails instead of silently choosing one.
-
-## Isolation behavior
-
-Toolchain installations such as `~/.cargo/bin`, `~/.rustup`, NVM versions,
-or `~/.bun/bin` are read-only. Writable package and build caches live under:
-
-```text
-$XDG_CACHE_HOME/nonaut/profiles/<profile>/<workspace-id>
-```
-
-When `XDG_CACHE_HOME` is unset, Nonaut uses `~/.cache`.
-
-The Rust pack also points `BUNDLED_CLI_CACHE_DIR` into this cache. Build
-scripts that honor it can reuse verified downloaded tool archives across
-commands instead of downloading them for every private `HOME`.
-
-Commands also receive a private workspace-scoped `HOME` under:
+Commands keep a private workspace-scoped HOME:
 
 ```text
 $XDG_CACHE_HOME/nonaut/homes/<workspace-id>
 ```
 
-This allows workflows such as `cargo init`, Git configuration, builds, and
-package downloads without granting access to the real home or allowing one
-project to poison another project's cache.
+Selected language packs keep writable state under:
 
-Packs never enable network access. Configure the required domains in the
-workspace's [network policy](configuration.md#network). For example, Rust
-dependency downloads normally require:
-
-```json
-"network": {
-  "mode": "allowlist",
-  "domains": ["index.crates.io", "static.crates.io"]
-}
+```text
+$XDG_CACHE_HOME/nonaut/profiles/<pack>/<workspace-id>
 ```
 
-On macOS, a build script that insists on Security.framework/native-tls may
-still fail its first HTTPS download because Nonaut deliberately does not expose
-the login Keychain or security service to arbitrary commands. Do not weaken the
-sandbox to fix that. Populate a build script's verified archive cache from a
-trusted host build, then sandboxed builds reuse it. For the Rust pack, print
-the exact workspace cache destination with:
+With no XDG_CACHE_HOME, Nonaut uses `~/.cache`. Private directories are prepared
+only after policy validation, and preparation refuses symlink components.
+Toolchain installation paths remain read-only. The Rust pack points
+`BUNDLED_CLI_CACHE_DIR` to a private cache for downloaded tool archives.
+The Apple SDK pack redirects xcrun's database into private temporary state.
+
+Packs never grant credentials, other projects or network access. Configure
+network domains separately. Rust downloads usually need `index.crates.io` and
+`static.crates.io`. On macOS, native TLS builds may require services intentionally
+outside the sandbox; prefer a verified archive cache rather than exposing the
+login Keychain or granting arbitrary system services.
+
+## Inspection and checks
 
 ```sh
-nonaut exec -- 'printf %s "$BUNDLED_CLI_CACHE_DIR"'
+nonaut runtime list
+nonaut runtime show --json
+nonaut runtime check
+nonaut runtime check --config ~/policies/custom.json --json
 ```
+
+`/runtime`, `/permissions full`, `sandbox_info` and `$NONAUT_CAP_FILE` describe
+the same pinned plan: selected mode/packs, selection reasons, grants and their
+origins, executable paths, environment names/sources, and diagnostics. Environment
+values are hidden. Runtime grants remain distinct from model file-tool access.
+
+Checks execute fixed shell, version, interpreter-startup and SDK probes inside
+the selected sandbox.
+A failed or unavailable probe makes the command fail; no denial causes automatic
+grant expansion. Custom mode has no built-in probes. Check your custom tools with
+`nonaut exec --config ... -- '<command>'`. Changes require a new session.

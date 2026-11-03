@@ -19,10 +19,11 @@ routine startup status does not add messages to the conversation.
 | `/new` | Start a fresh provider session |
 | `/exec [--cwd DIR] <command>` | Run a command directly in Nono |
 | `/permissions [full]` | Show effective access; expand runtime grants with `full` |
+| `/runtime` | Inspect the selected runtime mode, packs and grant origins |
 | `/undo` | Restore files to before the previous turn |
 | `/theme` | Choose the interface theme |
 | `/clear` | Clear visible conversation output |
-| `/details` | Show the most recent tool's complete output |
+| `/details` | Inspect the most recent tool in a scrollable modal; `q` or `Esc` closes |
 | `/help` | Show commands |
 | `/detach` | Keep the session running and return to the shell |
 | `/q` | Quit |
@@ -74,10 +75,24 @@ call is authorized before the batch enters Nono.
 
 Command output is bounded by both bytes and lines. When output is too large,
 Nonaut preserves its beginning and end so diagnostics at the bottom are not
-lost. Running command cards show elapsed time, their configured deadline, and
-the latest output line. Completed cards keep the final diagnostic lines in the
-conversation; `/details` reveals the complete bounded output. A timed-out
-command also returns output captured before termination.
+lost. Tool executions update one card from running to success or failure.
+Running cards show the latest output line and a cancel hint. Elapsed time appears
+after one second and ticks in whole seconds while running; completed durations
+include milliseconds. The remaining timeout appears near the deadline. Successful
+tools put verified results first and group repeated warnings behind `/details`.
+Complete libtest, pytest, Jest, and Vitest reports have explicit totals; incomplete
+or truncated reports never produce an inferred aggregate. Other tools retain a
+short output preview. Failures show a larger diagnostic excerpt and an exit code
+when available. Silent successes
+show only the success row and green divider. `/details` reveals the most recent
+tool's complete bounded output, status, working directory, duration, timeout,
+and sandbox policy when available, including grouped file reads. Details open
+in a separate modal, preserving the conversation and its scroll position. Use
+Up/Down or the mouse wheel to scroll, PageUp/PageDown to move a page, Home/End
+to jump to either end, and Left/Right to pan long lines. Press `c` to copy the
+details or drag to copy selected text. `q` or `Esc` returns to the conversation.
+A timed-out
+command also returns output captured before termination and labels it as partial.
 
 ## Review view
 
@@ -102,6 +117,20 @@ nonaut exec --cwd crates/service -- "cargo test"
 ```
 
 This is useful for validating workspace policy and reproducing denials.
+
+## Runtime inspection
+
+```sh
+nonaut runtime list
+nonaut runtime show
+nonaut runtime show --json
+nonaut runtime check --config ~/policies/project.json
+```
+
+`show` lists the exact resolved plan and grant origins. `check` runs fixed
+compatibility probes inside the sandbox and exits unsuccessfully for a failed or
+unavailable tool. It never widens grants. Add `--json` for structured output.
+See [runtime packs](profiles.md) for detection, manual selection and custom mode.
 
 ## Project policies
 

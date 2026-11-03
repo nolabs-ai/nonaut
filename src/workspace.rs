@@ -47,7 +47,7 @@ pub(crate) fn select(launch: &Path, requested: Option<&str>) -> Result<Selection
                     config.name.as_deref().unwrap_or("project"),
                     &display_path(&root),
                     &display_path(&source),
-                    &config.packs,
+                    &crate::runtime::integrations::detect_project(&root),
                     crate::cli::color_enabled(),
                 )
             );
@@ -116,7 +116,10 @@ pub(crate) fn minimal_config(root: &Path) -> ProjectConfig {
     ProjectConfig {
         name: Some(inferred_name(root)),
         root: Some(root.to_string_lossy().into_owned()),
-        packs: crate::profiles::detect(root),
+        runtime: Some(crate::runtime::RuntimeConfig {
+            mode: Some(crate::runtime::Mode::Auto),
+            ..Default::default()
+        }),
         filesystem: FilesystemConfig {
             readwrite: vec![".".into()],
             ..Default::default()
@@ -216,9 +219,10 @@ fn merge(base: &mut ProjectConfig, next: ProjectConfig) -> Result<()> {
     if next.root.is_some() {
         base.root = next.root;
     }
-    for pack in next.packs {
-        if !base.packs.contains(&pack) {
-            base.packs.push(pack);
+    if let Some(next_runtime) = next.runtime {
+        match &mut base.runtime {
+            Some(runtime) => runtime.merge(next_runtime),
+            None => base.runtime = Some(next_runtime),
         }
     }
     for (target, values) in [
@@ -439,10 +443,10 @@ mod tests {
     fn imports_compose_and_preserve_denials() {
         let root = fixture();
         fs::create_dir(root.join("policies")).unwrap();
-        fs::write(root.join("policies/base.json"), r#"{"packs":["rust"],"filesystem":{"deny":["./secret"]},"references":{"docs":{"path":"../docs","access":"read"}},"network":{"mode":"blocked"}}"#).unwrap();
-        fs::write(root.join("project.json"), r#"{"extends":["./policies/base.json"],"packs":["rust","python"],"filesystem":{"readwrite":["."]},"network":{"mode":"open"}}"#).unwrap();
+        fs::write(root.join("policies/base.json"), r#"{"runtime":{"packs":["rust"]},"filesystem":{"deny":["./secret"]},"references":{"docs":{"path":"../docs","access":"read"}},"network":{"mode":"blocked"}}"#).unwrap();
+        fs::write(root.join("project.json"), r#"{"extends":["./policies/base.json"],"runtime":{"packs":["rust","python"]},"filesystem":{"readwrite":["."]},"network":{"mode":"open"}}"#).unwrap();
         let loaded = load_file(&root.join("project.json"), &root).unwrap();
-        assert_eq!(loaded.config.packs, ["rust", "python"]);
+        assert_eq!(loaded.config.runtime.unwrap().packs, ["rust", "python"]);
         assert_eq!(loaded.config.filesystem.deny, ["./secret"]);
         assert_eq!(loaded.config.references["docs"].path, "../docs");
         assert_eq!(
@@ -514,7 +518,7 @@ mod tests {
         let root = fixture();
         fs::write(
             root.join("base.json"),
-            r#"{"packs":["rust"],"filesystem":{"read":["src"]}}"#,
+            r#"{"runtime":{"packs":["rust"]},"filesystem":{"read":["src"]}}"#,
         )
         .unwrap();
         fs::write(root.join("left.json"), r#"{"extends":["base.json"]}"#).unwrap();
@@ -526,7 +530,7 @@ mod tests {
         .unwrap();
         let loaded = load_file(&root.join("project.json"), &root).unwrap();
         assert_eq!(loaded.sources.len(), 4);
-        assert_eq!(loaded.config.packs, ["rust"]);
+        assert_eq!(loaded.config.runtime.unwrap().packs, ["rust"]);
         assert_eq!(loaded.config.filesystem.read, ["src"]);
         fs::remove_dir_all(root).unwrap();
     }

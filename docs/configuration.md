@@ -19,9 +19,13 @@ holds provider, model, UI and default tool timeout settings:
 }
 ```
 
-The theme defaults to dark and the tool timeout to 120 seconds. Override them
+The theme defaults to dark and the tool timeout to 600 seconds. Override them
 with `ui.theme` and `tools.timeout_seconds`. Project permissions are never
-stored in this file. Unknown keys are errors; there is no legacy migration.
+stored in this file. Unknown keys are errors.
+
+The ten-minute default allows initial dependency builds to finish. Explicit
+project deadlines and shorter per-call deadlines still apply; Nonaut never
+extends them or automatically retries a timed-out command.
 
 ## First launch and saved projects
 
@@ -41,15 +45,16 @@ Later launches reuse the file without overwriting manual edits.
 {
   "name": "my-service",
   "root": "/Users/me/Work/my-service",
-  "packs": ["rust"],
+  "runtime": { "mode": "auto" },
   "filesystem": { "readwrite": ["."] },
   "network": { "mode": "blocked" }
 }
 ```
 
-Empty lists and optional sections are omitted. Detection selects only development
-packs. External references, credentials, and network permissions require manual
-configuration.
+Empty lists and optional sections are omitted. Runtime detection selects known
+OS, installed-tool and project integrations. It never executes repository scripts
+or adds external project, credential or network access. See [runtime packs](profiles.md)
+for automatic detection, manual selection and full custom overrides.
 
 Nonaut canonicalizes the project root, resolving symlinks. The filename uses a
 SHA-256-derived identifier for that absolute path, so same-named projects do not
@@ -160,7 +165,7 @@ also rejected; keep that policy outside the granted tree.
 ```json
 {
   "extends": ["./shared/base.json"],
-  "packs": ["rust"],
+  "runtime": {"packs":["rust"]},
   "filesystem": { "readwrite": ["."] }
 }
 ```
@@ -174,6 +179,68 @@ Conflicting definitions of a named reference are errors. An explicit network
 section replaces the entire inherited network section. The last specified
 name, root, and tools section wins; every declared root must match the project.
 Cycles, excessive depth, and remote imports are rejected.
+
+## Runtime selection and overrides
+
+New project policies use `"runtime": {"mode":"auto"}`. Automatic mode discovers
+known installed toolchains and project markers; `packs` adds named integrations
+and `exclude` removes them, including their environment and cache requirements:
+
+```json
+"runtime": {
+  "mode": "auto",
+  "packs": ["rust"],
+  "exclude": ["bun"]
+}
+```
+
+Manual mode selects exactly the named packs. Include `system` for ordinary
+executables, `homebrew` for discovered Homebrew installations, and `apple-sdk`
+on macOS or `gcc` on Linux when building native code:
+
+```json
+"runtime": {"mode":"manual", "packs":["rust", "homebrew", "apple-sdk", "git", "system"]}
+```
+
+Custom mode disables all built-in runtime packs, PATH additions, cache grants
+and pack environment settings. Declare runtime support explicitly:
+
+```json
+"runtime": {
+  "mode": "custom",
+  "filesystem": {
+    "read": ["/opt/company/toolchain"],
+    "readwrite": ["~/.cache/company-tools"]
+  },
+  "environment": {
+    "PATH": "/opt/company/toolchain/bin",
+    "COMPANY_CACHE": "/home/me/.cache/company-tools"
+  }
+}
+```
+
+Explicit runtime paths must exist. Relative paths resolve from the project;
+`~/` uses the real home. Runtime grants support shell execution; use top-level
+filesystem grants or references for model-addressable file access. PATH entries
+must be absolute and never create filesystem grants. In custom mode you must
+also grant any executable's loader, libraries and other dependencies yourself.
+The private executor HOME/temp/output directory and read-only capability manifest
+remain available and are separately identified as `executor` grants.
+
+Explicit environment settings override pack values. HOME, TMPDIR/TMP/TEMP,
+`NONAUT_*`, and proxy variables are reserved. Values are not shell-expanded;
+use absolute paths for environment values. Inspection redacts environment values.
+
+A runtime block with an explicit `mode` replaces inherited runtime selection,
+paths, exclusions and environment. Existing runtime denies remain active. A block
+without `mode` merges with inherited runtime settings; its environment values win.
+Top-level project denies always remain active. With no runtime block, runtime
+selection defaults to auto. Packs are configured only under `runtime.packs`.
+
+Excluding a pack removes its requirements; it is not an executable deny. Another
+selected pack may expose an installed tool. Use custom mode and narrow explicit
+grants when you need full control over runtime support. Linux rejects deny/grant
+overlaps in either direction because Landlock cannot subtract from an allow rule.
 
 ## Network
 
@@ -198,7 +265,12 @@ network permission.
 
 `/permissions` shows effective project grants, packs, networking and policy
 sources. `/permissions full` expands runtime grants and protected configuration
-paths. The agent's `sandbox_info` tool exposes the pinned capability manifest.
+paths. `/runtime` shows the same full plan. The agent's `sandbox_info` tool
+exposes the pinned capability manifest, including pack selection
+reasons, grant kinds/origins, canonical bindings and environment sources.
+`nonaut runtime show --json` provides the same data outside the TUI.
+`nonaut runtime check` runs fixed compatibility probes inside that sandbox; a failed
+or unavailable probe exits unsuccessfully without changing grants.
 
 Edit the project file manually and start a new session to apply changes.
 Running sessions retain their resolved policy even if a source file changes.

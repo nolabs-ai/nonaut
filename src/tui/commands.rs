@@ -7,7 +7,7 @@ pub(super) struct SlashCommand {
     pub visible: bool,
 }
 
-pub(super) const SLASH_COMMANDS: [SlashCommand; 15] = [
+pub(super) const SLASH_COMMANDS: [SlashCommand; 16] = [
     SlashCommand {
         name: "/provider",
         description: "choose or reconnect a provider",
@@ -39,13 +39,18 @@ pub(super) const SLASH_COMMANDS: [SlashCommand; 15] = [
         visible: true,
     },
     SlashCommand {
+        name: "/runtime",
+        description: "inspect selected runtime packs and all grants",
+        visible: true,
+    },
+    SlashCommand {
         name: "/clear",
         description: "clear the screen",
         visible: true,
     },
     SlashCommand {
         name: "/details",
-        description: "show the last tool's full output",
+        description: "inspect the last tool in a scrollable dialog",
         visible: true,
     },
     SlashCommand {

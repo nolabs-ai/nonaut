@@ -50,7 +50,7 @@ pub(crate) fn specs() -> Value {
         {
             "type": "function", "name": "run_command",
             "description": "Run a program in an explicit working directory under the session's pinned Nono policy. Always make an explicitly requested attempt and report the actual result instead of predicting a denial. No inherited secrets are exposed.",
-            "inputSchema": {"type":"object","properties":{"program":{"type":"string","description":"Executable name, such as cargo, git, or sh."},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string","description":"Working directory to attempt inside the pinned workspace scope. Relative paths start at the session directory."},"timeout_seconds":{"type":"integer","minimum":1,"description":"Optional; capped by the user's tool timeout (default 120 seconds)."}},"required":["program","args","cwd"],"additionalProperties":false}
+            "inputSchema": {"type":"object","properties":{"program":{"type":"string","description":"Executable name, such as cargo, git, or sh."},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string","description":"Working directory to attempt inside the pinned workspace scope. Relative paths start at the session directory."},"timeout_seconds":{"type":"integer","minimum":1,"description":"Optional tighter deadline, capped by the user's tool timeout (default 600 seconds). Omit for builds and installations so initial dependency compilation has time to finish."}},"required":["program","args","cwd"],"additionalProperties":false}
         }
     ])
 }

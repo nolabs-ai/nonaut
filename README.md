@@ -44,7 +44,7 @@ nonaut
 ```
 
 The first launch discovers the project root and proposes a minimal policy with
-detected development packs. After confirmation, it saves the policy under
+automatic runtime detection. After confirmation, it saves the policy under
 `~/.config/nonaut/projects/` and launches. Network stays blocked; external
 access requires manual configuration. Run `nonaut config` to find the project
 file, or `/permissions` to inspect the effective boundary.

@@ -3,9 +3,9 @@ mod config;
 mod control_plane;
 mod mcp;
 mod policy;
-mod profiles;
 mod providers;
 mod proxy;
+mod runtime;
 mod runtime_paths;
 mod sandbox;
 mod sessions;
@@ -81,6 +81,10 @@ pub fn workspace_root(requested: Option<&str>) -> Result<std::path::PathBuf> {
 
 pub fn run_project_config(requested: Option<&str>) -> Result<()> {
     workspace_setup::configure_current(requested)
+}
+
+pub async fn run_runtime(args: Vec<String>, requested: Option<&str>) -> Result<()> {
+    runtime::inspection::run(args, requested).await
 }
 
 pub async fn run_exec(

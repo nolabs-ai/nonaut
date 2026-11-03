@@ -72,6 +72,39 @@ to a provider or consume model tokens.
 all-features pass during normal iteration. `make ci` retains both configurations
 so feature-gating mistakes are still caught before merging.
 
+## Extending runtime support
+
+During the MVP, update configuration and manifest shapes directly. Do not add
+internal schema versions, migration paths or compatibility branches.
+
+The runtime engine lives in `src/runtime`. Each integration module owns one
+`DEFINITION`: its identifier, category, project markers, host detector, optional
+fixed program/argument probe, and requirement resolver. Register it in `integrations::CATALOG`.
+Resolvers return typed requirements without creating directories or executing
+repository code. They cannot change network policy or model file-tool access.
+
+```mermaid
+flowchart LR
+  P[User policy and imports] --> R[Runtime resolver]
+  H[Trusted host inventory] --> R
+  I[Integration requirements] --> R
+  R --> V[Validation and pinned plan]
+  V --> A[Single Nono filesystem adapter]
+  V --> D[Permissions and capability manifest]
+```
+
+Keep discovery within known installation roots or trusted host settings. Declare
+read-only toolchain paths separately from private writable state. The resolver
+handles auto/manual/custom selection, exclusions, environment overrides and
+origins. Policy validation checks writable installation/protected-path conflicts
+and Linux deny overlaps before private state is prepared. `sandbox::apply_filesystem`
+checks canonical bindings and applies the plan without synthesizing grants.
+
+Add fixture tests for detection, custom locations, exclusions and custom mode;
+add provider-free integration coverage for actual execution and denied access.
+Run `make ci` on macOS and Linux. Changes to runtime behavior should also exercise
+`nonaut runtime check` and an offline native build on both platforms.
+
 ## Install from main
 
 Build and install the current `main` branch with:

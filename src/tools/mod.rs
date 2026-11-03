@@ -721,11 +721,7 @@ fn output_result(name: &str, output: std::process::Output) -> Result<String> {
 fn status_result(name: &str, status: std::process::ExitStatus, output: String) -> Result<String> {
     let combined = truncate(&output);
     if status.success() {
-        if combined.trim().is_empty() {
-            Ok(format!("{name} completed successfully"))
-        } else {
-            Ok(combined)
-        }
+        Ok(combined)
     } else {
         Err(ProcessFailure {
             name: name.to_owned(),
@@ -1363,6 +1359,23 @@ mod tests {
         assert!(output.starts_with("START\n"));
         assert!(output.contains("middle omitted"));
         assert!(output.ends_with("END\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_processes_preserve_empty_output_and_real_warnings() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let success = std::process::ExitStatus::from_raw(0);
+        assert_eq!(
+            status_result("any-program", success, String::new()).unwrap(),
+            ""
+        );
+        let warning = "warning: cached data\n";
+        assert_eq!(
+            status_result("another-program", success, warning.into()).unwrap(),
+            warning
+        );
     }
 
     #[tokio::test]

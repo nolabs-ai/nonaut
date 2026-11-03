@@ -96,6 +96,12 @@ fn run() -> anyhow::Result<()> {
         }
         return nonaut::run_project_config(requested_config.as_deref());
     }
+    if mode == Some("runtime") {
+        return runtime.block_on(nonaut::run_runtime(
+            args.into_iter().skip(1).collect(),
+            requested_config.as_deref(),
+        ));
+    }
     if mode == Some("exec") {
         if matches!(
             args.get(1).map(String::as_str),
@@ -144,7 +150,7 @@ fn run() -> anyhow::Result<()> {
         }
         let output = runtime.block_on(nonaut::run_exec(session_root, cwd, command))?;
         print!("{output}");
-        if !output.ends_with('\n') {
+        if !output.is_empty() && !output.ends_with('\n') {
             println!();
         }
         return Ok(());

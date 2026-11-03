@@ -21,6 +21,7 @@ pub(crate) fn workspace_cache(
     if !root.is_absolute() {
         bail!("XDG_CACHE_HOME must be an absolute path");
     }
+    root = crate::policy::canonicalize_nearest(&root)?;
     root.push("nonaut");
     for component in components {
         if !matches!(
@@ -40,7 +41,45 @@ pub(crate) fn workspace_cache(
 }
 
 pub(crate) fn prepare_private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("could not create {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    use nix::{
+        fcntl::{OFlag, open, openat},
+        sys::stat::{Mode, mkdirat},
+    };
+    bail_if_relative(path)?;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let mut directory = open(Path::new("/"), flags, Mode::empty())?;
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        match mkdirat(&directory, name, Mode::S_IRWXU) {
+            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not create {}", path.display()));
+            }
+        }
+        directory = openat(&directory, name, flags, Mode::empty()).with_context(|| {
+            format!(
+                "private directory {} contains a symlink or inaccessible component",
+                path.display()
+            )
+        })?;
+    }
+    let file = fs::File::from(directory);
+    file.set_permissions(fs::Permissions::from_mode(0o700))
         .with_context(|| format!("could not protect {}", path.display()))
+}
+
+fn bail_if_relative(path: &Path) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!(
+            "private directory must be an absolute normalized path: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
