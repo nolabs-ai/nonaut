@@ -56,7 +56,7 @@ use crate::{
 pub(crate) use theme::init as init_theme;
 // Driven by the event loop, not the terminal, so a frozen app stops blinking.
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
-const BRAND_MARK: &str = "⎔";
+const BRAND_MARK: &str = "✦";
 // The prompt starts two lines tall and grows with newlines up to this many.
 const PROMPT_MIN_LINES: usize = 2;
 const PROMPT_MAX_LINES: usize = 10;
@@ -136,6 +136,8 @@ enum Role {
 struct Message {
     role: Role,
     content: String,
+    /// Tool output from a read-only tool, railed in the info colour.
+    read_only: bool,
     rendered_markdown: Option<(u16, Vec<Line<'static>>)>,
     markdown_job: Option<(u16, u64)>,
 }
@@ -145,6 +147,7 @@ impl Message {
         Self {
             role,
             content: content.into(),
+            read_only: false,
             rendered_markdown: None,
             markdown_job: None,
         }
@@ -215,6 +218,53 @@ enum SandboxState {
     Preparing,
     Ready(PathBuf),
     Failed,
+}
+
+fn read_only_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "list_directory" | "search_files" | "inspect_code" | "sandbox_info"
+    )
+}
+
+/// `28886` → `28,886`.
+fn grouped(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// A quiet field of dots with a few stars. Positions depend only on the width,
+/// so the stars hold still across redraws and only reflow on resize.
+fn star_line(width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    let dim = Style::new().fg(palette().border);
+    let star = Style::new().fg(palette().accent);
+    let bright = [5, 31, 58, 83];
+    let faint = [17, 44, 70, 96];
+    let spans = (0..width)
+        .map(|column| {
+            let at = |marks: &[usize]| marks.iter().any(|mark| column == mark * width / 100);
+            if column < 2 || column + 2 >= width {
+                Span::raw(" ")
+            } else if at(&bright) {
+                Span::styled("✦", star)
+            } else if at(&faint) {
+                Span::styled("✦", dim)
+            } else if column.is_multiple_of(3) {
+                Span::styled("·", dim)
+            } else {
+                Span::raw(" ")
+            }
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
 }
 
 fn provider_label(provider: ProviderKind) -> &'static str {
@@ -302,6 +352,8 @@ pub struct App {
     connection_generation: u64,
     request: Option<JoinHandle<()>>,
     request_uses_provider: bool,
+    /// Last sign of life from the provider; drives the waiting indicator.
+    waiting_since: Instant,
     audit_session: Option<crate::control_plane::AuditSession>,
     undo: Option<Arc<Mutex<Undo>>>,
     prompt_history: Vec<String>,
@@ -408,6 +460,7 @@ impl App {
             connection_generation: 0,
             request: None,
             request_uses_provider: false,
+            waiting_since: Instant::now(),
             audit_session: None,
             undo: None,
             prompt_history: Vec::new(),
@@ -501,7 +554,7 @@ impl App {
                     self.cursor_visible = !self.cursor_visible;
                 },
                 // Animate active tools independently of the slower cursor blink.
-                _ = tool_animation.tick(), if !self.running_tools.is_empty() => {
+                _ = tool_animation.tick(), if !self.running_tools.is_empty() || self.waiting_for_model() => {
                     self.refresh_running_tools();
                 },
                 _ = changes_refresh.tick() => {
@@ -602,28 +655,31 @@ impl App {
         let key = Style::new().fg(palette().foreground);
         let label = Style::new().fg(palette().muted);
         let mut hints = vec![
-            Span::styled(" Enter", key),
+            Span::styled(" enter", key),
             Span::styled(" send · ", label),
-            Span::styled("Shift+Enter", key),
+            Span::styled("shift+enter", key),
             Span::styled(" newline · ", label),
         ];
         if has_changes {
             hints.extend([
-                Span::styled("Alt+2", key),
+                Span::styled("alt+2", key),
                 Span::styled(" review · ", label),
             ]);
         }
         hints.extend([Span::styled("/q", key), Span::styled(" quit ", label)]);
         Block::new()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(BorderType::Plain)
             .border_style(Style::new().fg(palette().accent))
             .style(Style::new().bg(palette().background))
             .title_top(Line::styled(
-                " › ",
-                Style::new().fg(palette().accent).bold(),
+                " ▶ ",
+                Style::new()
+                    .fg(palette().background)
+                    .bg(palette().accent)
+                    .bold(),
             ))
-            .title_top(Line::styled(format!(" {tokens} tokens "), label).right_aligned())
+            .title_top(Line::styled(format!(" {} tok ", grouped(tokens)), label).right_aligned())
             .title_bottom(Line::from(hints))
             // Border plus padding puts typed text in the same column as message text.
             .padding(Padding::new(4, 1, 0, 0))
@@ -756,29 +812,31 @@ impl App {
             Constraint::Length(prompt_height),
         ])
         .areas(frame.area());
-        frame.render_widget(
-            Block::new()
-                .borders(Borders::BOTTOM)
-                .border_style(palette().border),
-            header,
-        );
-        let [_, header_content, _] = Layout::vertical([
+        let [_, header_content, stars] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(header);
+        frame.render_widget(Paragraph::new(star_line(stars.width)), stars);
         let [brand, tabs, status] = Layout::horizontal([
             Constraint::Length(14),
-            Constraint::Length(if self.changes_file_count > 0 { 30 } else { 14 }),
+            Constraint::Length(if self.changes_file_count > 0 { 32 } else { 14 }),
             Constraint::Min(1),
         ])
         .areas(header_content);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![Span::styled(
-                format!("  {BRAND_MARK}  nonaut"),
-                Style::new().fg(palette().accent).bold(),
-            )]))
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!(" {BRAND_MARK} nonaut "),
+                    Style::new()
+                        .fg(palette().background)
+                        .bg(palette().accent)
+                        .bold(),
+                ),
+                Span::styled("▶", Style::new().fg(palette().accent)),
+            ]))
             .style(Style::new().bg(palette().background)),
             brand,
         );
@@ -815,7 +873,7 @@ impl App {
             match message.role {
                 Role::You => {
                     for (index, line) in message.content.lines().enumerate() {
-                        let marker = if index == 0 { "›  " } else { "   " };
+                        let marker = if index == 0 { "▶  " } else { "   " };
                         lines.push(Line::from(vec![
                             Span::styled(marker, Style::new().fg(palette().accent).bold()),
                             Span::styled(
@@ -873,19 +931,23 @@ impl App {
                     lines.push(Line::default());
                 }
                 Role::System | Role::Running | Role::Success | Role::Error => {
-                    let border = match message.role {
-                        Role::Running => palette().accent,
-                        Role::Success => palette().added,
+                    // A rail down the left edge says what kind of event this is:
+                    // teal for reads, accent for edits and commands, red for
+                    // failures. The ✓/✗ marks carry status without relying on colour.
+                    let rail = match message.role {
                         Role::Error => palette().removed,
-                        _ => palette().border,
+                        Role::System => palette().border,
+                        _ if message.read_only => palette().info,
+                        _ => palette().accent,
                     };
                     let rows = message.content.lines().enumerate().map(|(index, line)| {
                         let detail = line.trim_start();
-                        let style = if message.role == Role::Error && index == 0 {
-                            Style::new().fg(palette().removed)
-                        } else if (message.role == Role::Success && index == 0)
-                            || (detail.starts_with('+') && !detail.starts_with("+++"))
-                        {
+                        let style = if index == 0 && message.role == Role::Running {
+                            Style::new().fg(rail)
+                        } else if index == 0 && message.role != Role::System {
+                            // Bold once finished, so a card visibly lands.
+                            Style::new().fg(rail).bold()
+                        } else if detail.starts_with('+') && !detail.starts_with("+++") {
                             Style::new().fg(palette().added)
                         } else if detail.starts_with('-') && !detail.starts_with("---") {
                             Style::new().fg(palette().removed)
@@ -895,15 +957,33 @@ impl App {
                         (line, style)
                     });
                     for (line, style) in rows {
-                        lines.push(Line::styled(line.to_owned(), style));
+                        lines.push(Line::from(vec![
+                            Span::styled("▎ ", Style::new().fg(rail)),
+                            Span::styled(line.to_owned(), style),
+                        ]));
                     }
-                    lines.push(Line::styled(
-                        "─".repeat(usize::from(conversation.width.saturating_sub(4))),
-                        Style::new().fg(border),
-                    ));
                     lines.push(Line::default());
                 }
             }
+        }
+        if self.waiting_for_model() {
+            let elapsed = self.waiting_since.elapsed();
+            let frames = ['◜', '◠', '◝', '◞', '◡', '◟'];
+            let frame = frames[(elapsed.as_millis() / 120 % frames.len() as u128) as usize];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{frame} plotting a course…"),
+                    Style::new().fg(palette().accent),
+                ),
+                Span::styled(
+                    format!(
+                        "  {}.{}s · esc to stop",
+                        elapsed.as_secs(),
+                        elapsed.subsec_millis() / 100
+                    ),
+                    Style::new().fg(palette().muted),
+                ),
+            ]));
         }
         let content_width = conversation.width.saturating_sub(4).max(1);
         self.copy_pending_selection(&lines, content_width);
@@ -971,8 +1051,11 @@ impl App {
     }
 
     fn render_workspace_tabs(&self, frame: &mut Frame, area: Rect) {
-        let active = Style::new().fg(palette().accent).bold();
-        let inactive = Style::new().fg(palette().muted);
+        let active = Style::new()
+            .fg(palette().accent)
+            .bg(palette().surface)
+            .bold();
+        let inactive = Style::new().fg(palette().muted).bg(palette().surface);
         let agent_style = if self.workspace_view == WorkspaceView::Agent {
             active
         } else {
@@ -983,12 +1066,12 @@ impl App {
         } else {
             inactive
         };
-        let mut tabs = vec![Span::styled("1. Agent", agent_style)];
+        let mut tabs = vec![Span::styled(" 1. Agent ", agent_style)];
         if self.changes_file_count > 0 {
             tabs.extend([
-                Span::raw("    "),
+                Span::styled("  ", inactive),
                 Span::styled(
-                    format!("2. Review ({})", self.changes_file_count),
+                    format!("2. Review ({}) ", self.changes_file_count),
                     changes_style,
                 ),
             ]);
@@ -2827,6 +2910,15 @@ impl App {
             }
         }));
         self.request_uses_provider = true;
+        self.waiting_since = Instant::now();
+    }
+
+    /// The model owes us a response and nothing else on screen is moving.
+    fn waiting_for_model(&self) -> bool {
+        self.request.is_some()
+            && self.request_uses_provider
+            && self.running_tools.is_empty()
+            && self.streaming_message.is_none()
     }
 
     fn begin_connect(&mut self, provider: ProviderKind) {
@@ -2929,6 +3021,7 @@ impl App {
         if request_id != self.request_generation {
             return;
         }
+        self.waiting_since = Instant::now();
         match event {
             ProviderEvent::Delta(delta) => {
                 if self.streaming_message.is_none() {
@@ -3137,6 +3230,7 @@ impl App {
             self.messages.len()
         };
         let compact = Self::compact_tool(&context.tool);
+        let read_only = read_only_tool(&context.tool);
         let call_id = context.call_id.clone();
         let running = RunningTool {
             message_index,
@@ -3146,8 +3240,11 @@ impl App {
             line_count: 0,
         };
         if !compact {
-            let content = running.content(self.conversation_area.width);
+            let content = running.content(self.conversation_area.width.saturating_sub(2));
             self.push(Role::Running, content);
+            if let Some(message) = self.messages.last_mut() {
+                message.read_only = read_only;
+            }
         }
         self.running_tools.insert(call_id, running);
     }
@@ -3180,7 +3277,7 @@ impl App {
             }
             content
         } else {
-            running.content(self.conversation_area.width)
+            running.content(self.conversation_area.width.saturating_sub(2))
         };
         if let Some(message) = self.messages.get_mut(running.message_index) {
             message.replace(Role::Running, content);
@@ -3198,6 +3295,9 @@ impl App {
 
         let message_index = self.messages.len();
         self.push(Role::Running, Self::running_summary(tool, 1));
+        if let Some(message) = self.messages.last_mut() {
+            message.read_only = read_only_tool(tool);
+        }
         self.tool_summaries.insert(
             tool.to_owned(),
             ToolSummary {
@@ -3747,7 +3847,11 @@ mod tests {
         let ready_style = startup_status(&ready, Some(ProviderKind::Codex), false, true).1;
         assert!(matches!(
             ready_style.fg,
-            Some(ratatui::style::Color::Rgb(62, 245, 140) | ratatui::style::Color::Rgb(0, 135, 58))
+            Some(
+                ratatui::style::Color::Rgb(62, 245, 140)
+                    | ratatui::style::Color::Rgb(0, 135, 58)
+                    | ratatui::style::Color::Rgb(143, 227, 136)
+            )
         ));
         assert!(status(&SandboxState::Failed, false, true).contains("Sandbox unavailable"));
         assert!(status(&ready, false, false).contains("/provider"));
@@ -3764,6 +3868,7 @@ mod tests {
                 Some(
                     ratatui::style::Color::Rgb(232, 115, 74)
                         | ratatui::style::Color::Rgb(196, 80, 27)
+                        | ratatui::style::Color::Rgb(255, 138, 31)
                 )
             ));
         }
@@ -3771,7 +3876,11 @@ mod tests {
         assert!(text.contains("/provider"));
         assert!(matches!(
             style.fg,
-            Some(ratatui::style::Color::Rgb(255, 69, 69) | ratatui::style::Color::Rgb(217, 0, 27))
+            Some(
+                ratatui::style::Color::Rgb(255, 69, 69)
+                    | ratatui::style::Color::Rgb(217, 0, 27)
+                    | ratatui::style::Color::Rgb(255, 77, 46)
+            )
         ));
     }
 
@@ -3882,7 +3991,7 @@ mod tests {
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
             terminal.draw(|frame| app.render(frame)).unwrap();
             let buffer = terminal.backend().buffer();
-            let top = (0..40).find(|&y| buffer[(0, y)].symbol() == "╭").unwrap();
+            let top = (0..40).find(|&y| buffer[(0, y)].symbol() == "┌").unwrap();
             40 - top
         }
         assert_eq!(prompt_rows("one line"), 4);
@@ -3899,6 +4008,68 @@ mod tests {
         );
         select_theme(Theme::Dark);
         assert_eq!(palette().background, ratatui::style::Color::Rgb(0, 0, 0));
+        select_theme(Theme::Orbit);
+        assert_eq!(palette().background, ratatui::style::Color::Rgb(21, 26, 36));
+    }
+
+    #[test]
+    fn token_counts_are_grouped_by_thousands() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(28_886), "28,886");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn star_line_is_stable_and_fits_the_width() {
+        for width in [0, 1, 10, 80, 200] {
+            let first = star_line(width);
+            assert_eq!(first.width(), usize::from(width));
+            assert_eq!(first, star_line(width));
+        }
+    }
+
+    #[test]
+    fn tool_events_get_a_rail_coloured_by_kind() {
+        let mut app = app_with_input("");
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolStarted(ToolContext::minimal("read-1", "read_file")),
+        );
+        assert!(app.messages[0].read_only);
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolStarted(ToolContext::minimal("edit-1", "edit_file")),
+        );
+        assert!(!app.messages[1].read_only);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rails = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "▎")
+            .count();
+        assert!(rails >= 2);
+    }
+
+    #[test]
+    fn waiting_indicator_only_shows_while_the_model_is_silent() {
+        let mut app = app_with_input("");
+        assert!(!app.waiting_for_model());
+        app.request_uses_provider = true;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        app.request = Some(runtime.spawn(async {}));
+        assert!(app.waiting_for_model());
+        app.handle_provider_event(
+            0,
+            ProviderEvent::ToolStarted(ToolContext::minimal("command-1", "run_command")),
+        );
+        assert!(!app.waiting_for_model());
     }
 
     #[test]

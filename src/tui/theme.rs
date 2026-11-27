@@ -13,7 +13,23 @@ pub(super) struct Palette {
     pub accent: Color,
     pub added: Color,
     pub removed: Color,
+    /// Read-only activity and safe states; cool against the warm accent.
+    pub info: Color,
 }
+
+// Deep-space navy with amber text: the accent marks the brand, edits and
+// commands; teal marks reads; red stays reserved for failures and denials.
+const ORBIT: Palette = Palette {
+    background: Color::Rgb(21, 26, 36),
+    surface: Color::Rgb(30, 37, 51),
+    foreground: Color::Rgb(255, 179, 71),
+    muted: Color::Rgb(217, 163, 94),
+    border: Color::Rgb(50, 59, 79),
+    accent: Color::Rgb(255, 138, 31),
+    added: Color::Rgb(143, 227, 136),
+    removed: Color::Rgb(255, 77, 46),
+    info: Color::Rgb(95, 215, 201),
+};
 
 const DARK: Palette = Palette {
     background: Color::Rgb(0, 0, 0),
@@ -24,6 +40,7 @@ const DARK: Palette = Palette {
     accent: Color::Rgb(232, 115, 74),
     added: Color::Rgb(62, 245, 140),
     removed: Color::Rgb(255, 69, 69),
+    info: Color::Rgb(95, 215, 201),
 };
 
 const LIGHT: Palette = Palette {
@@ -35,31 +52,36 @@ const LIGHT: Palette = Palette {
     accent: Color::Rgb(196, 80, 27),
     added: Color::Rgb(0, 135, 58),
     removed: Color::Rgb(217, 0, 27),
+    info: Color::Rgb(0, 122, 128),
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(super) enum Theme {
+    Orbit,
     Dark,
     Light,
 }
 
 impl Theme {
-    pub const ALL: [Self; 2] = [Self::Dark, Self::Light];
+    pub const ALL: [Self; 3] = [Self::Orbit, Self::Dark, Self::Light];
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Orbit => "orbit",
             Self::Dark => "dark",
             Self::Light => "light",
         }
     }
     pub const fn description(self) -> &'static str {
         match self {
+            Self::Orbit => "deep-space navy with amber text",
             Self::Dark => "dark background with light text",
             Self::Light => "light background with dark text",
         }
     }
     const fn palette(self) -> &'static Palette {
         match self {
+            Self::Orbit => &ORBIT,
             Self::Dark => &DARK,
             Self::Light => &LIGHT,
         }
@@ -71,11 +93,12 @@ impl Theme {
     }
 }
 
-const DEFAULT: Theme = Theme::Dark;
+const DEFAULT: Theme = Theme::Orbit;
 static SELECTED: AtomicU8 = AtomicU8::new(DEFAULT as u8);
 
 pub(super) fn selected() -> Theme {
     match SELECTED.load(Ordering::Relaxed) {
+        value if value == Theme::Dark as u8 => Theme::Dark,
         value if value == Theme::Light as u8 => Theme::Light,
         _ => DEFAULT,
     }
